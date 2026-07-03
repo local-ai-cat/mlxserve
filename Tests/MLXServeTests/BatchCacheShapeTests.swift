@@ -23,6 +23,13 @@ final class BatchCacheShapeTests: XCTestCase {
         XCTAssertEqual(batch.state[1].shape, [2, 3, 8])
         XCTAssertEqual(batch.extract(0).state[0].shape, [1, 1, 8])
         XCTAssertEqual(batch.extract(1).state[0].shape, [1, 3, 8])
+
+        switch (batch as any KVCache).ropeOffset {
+        case .batch(let offset):
+            XCTAssertEqual(offset.shape, [2])
+        default:
+            XCTFail("BatchKVCache must dispatch per-row RoPE offsets")
+        }
     }
 
     func testFixedStateMergePreservesConcreteCacheType() throws {
