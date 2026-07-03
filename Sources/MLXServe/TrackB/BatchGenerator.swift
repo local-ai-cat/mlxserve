@@ -6,6 +6,31 @@ public struct BatchDecodeStep {
     public let logits: MLXArray
 }
 
+public enum FinishReason: Sendable, Equatable {
+    case stop
+    case length
+    case cancelled
+}
+
+public struct Response: Sendable, Equatable {
+    public let uid: String
+    public let token: Int
+    public let finishReason: FinishReason?
+    public let logprobs: [Int: Float]?
+
+    public init(
+        uid: String,
+        token: Int,
+        finishReason: FinishReason? = nil,
+        logprobs: [Int: Float]? = nil
+    ) {
+        self.uid = uid
+        self.token = token
+        self.finishReason = finishReason
+        self.logprobs = logprobs
+    }
+}
+
 public final class StaticBatchGenerator {
     private let model: any LanguageModel
     private var cache: [BatchKVCache]
@@ -76,4 +101,154 @@ public final class StaticBatchGenerator {
             logits: returnedLogits
         )
     }
+}
+
+public final class ContinuousBatchGenerator {
+    private let model: any LanguageModel
+    private let parameters: GenerateParameters
+    private var cache: [BatchKVCache] = []
+    private var currentTokens = MLXArray([Int32]())
+    private var rowUIDs: [String] = []
+    private var samplers: [SamplingParameters] = []
+    private var state: LMOutput.State?
+
+    public init(model: any LanguageModel, parameters: GenerateParameters) {
+        self.model = model
+        self.parameters = parameters
+    }
+
+    public var isEmpty: Bool {
+        rowUIDs.isEmpty
+    }
+
+    public var count: Int {
+        rowUIDs.count
+    }
+
+    public var uids: [String] {
+        rowUIDs
+    }
+
+    public func insert(
+        uid: String,
+        input: LMInput,
+        sampling: SamplingParameters
+    ) throws {
+        let prepared = try prefillWithLastTokenWithheld(input)
+        insert(uid: uid, cache: prepared.cache, lastToken: prepared.lastToken, sampling: sampling)
+    }
+
+    public func insert(
+        uid: String,
+        cache rowCache: [any KVCache],
+        lastToken: MLXArray,
+        sampling: SamplingParameters
+    ) {
+        precondition(!rowUIDs.contains(uid), "duplicate batch uid '\(uid)'")
+        precondition(!rowCache.isEmpty, "continuous batching requires a non-empty KV cache")
+
+        if cache.isEmpty {
+            cache = (0 ..< rowCache.count).map { layer in
+                BatchKVCache.merge([rowCache[layer]])
+            }
+            currentTokens = lastToken.reshaped([1])
+        } else {
+            precondition(cache.count == rowCache.count, "inserted row cache layer count changed")
+            for layer in 0 ..< cache.count {
+                cache[layer].insert(rowCache[layer])
+            }
+            currentTokens = concatenated([currentTokens, lastToken.reshaped([1])], axis: 0)
+        }
+
+        rowUIDs.append(uid)
+        samplers.append(sampling)
+        eval(currentTokens, cache)
+    }
+
+    public func remove(uid: String) {
+        guard let row = rowUIDs.firstIndex(of: uid) else { return }
+        let keptRows = rowUIDs.indices.filter { $0 != row }
+        filter(keeping: keptRows)
+    }
+
+    public func filter(keeping rows: [Int]) {
+        guard !rows.isEmpty else {
+            cache.removeAll()
+            rowUIDs.removeAll()
+            samplers.removeAll()
+            currentTokens = MLXArray([Int32]())
+            return
+        }
+
+        for layer in cache {
+            layer.filter(keeping: rows)
+        }
+        let rowIndices = MLXArray(rows.map(Int32.init))
+        currentTokens = currentTokens.take(rowIndices, axis: 0)
+        rowUIDs = rows.map { rowUIDs[$0] }
+        samplers = rows.map { samplers[$0] }
+        eval(currentTokens, cache)
+    }
+
+    public func next() -> [Response] {
+        guard !rowUIDs.isEmpty else { return [] }
+
+        let output = model(
+            LMInput.Text(tokens: currentTokens[0..., .newAxis]),
+            cache: cache,
+            state: state
+        )
+        state = output.state
+
+        let logits = output.logits[0..., -1, 0...]
+        let logprobs = logits - logSumExp(logits, axis: -1, keepDims: true)
+        let sampledRows = (0 ..< rowUIDs.count).map { row in
+            TokenSampler.sample(logprobs: logprobs[row, 0...], parameters: samplers[row])
+        }
+        let nextTokens = concatenated(sampledRows, axis: 0)
+
+        asyncEval(nextTokens)
+        eval(currentTokens, logprobs)
+        currentTokens = nextTokens
+
+        let tokenIds = nextTokens.asArray(Int.self)
+        return rowUIDs.enumerated().map { row, uid in
+            Response(uid: uid, token: tokenIds[row])
+        }
+    }
+
+    private func prefillWithLastTokenWithheld(_ input: LMInput) throws -> (
+        cache: [any KVCache],
+        lastToken: MLXArray
+    ) {
+        let rowCache = model.newCache(parameters: parameters)
+        let remaining: LMInput.Text
+        switch try model.prepare(input, cache: rowCache, windowSize: parameters.prefillStepSize) {
+        case .tokens(let tokens):
+            remaining = tokens
+        case .logits:
+            throw BatchGeneratorError.unsupportedPreparedLogits
+        }
+
+        let tokens = remaining.tokens
+        let tokenCount = tokens.dim(0)
+        guard tokenCount > 1 else {
+            throw BatchGeneratorError.promptTooShortForExternalPrefill
+        }
+
+        let prefixTokens = tokens[..<(tokenCount - 1)]
+        let prefixInput = LMInput.Text(tokens: prefixTokens)
+        _ = model(prefixInput[text: .newAxis], cache: rowCache, state: nil)
+        eval(rowCache)
+
+        return (
+            cache: rowCache,
+            lastToken: tokens[tokenCount - 1]
+        )
+    }
+}
+
+public enum BatchGeneratorError: Error, Equatable {
+    case unsupportedPreparedLogits
+    case promptTooShortForExternalPrefill
 }

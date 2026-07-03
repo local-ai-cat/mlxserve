@@ -12,6 +12,10 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
     private var values: MLXArray?
     private let step: Int
 
+    public var batchSize: Int {
+        leftPadding.dim(0)
+    }
+
     public init(leftPadding: [Int], idx: Int = 0, step: Int = 256) {
         self.leftPadding = MLXArray(leftPadding.map(Int32.init))
         self.idx = idx
@@ -72,6 +76,78 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             values[row ..< row + 1, 0..., padding ..< idx, 0...],
         ]
         return cache
+    }
+
+    public func filter(keeping rows: [Int]) {
+        guard !rows.isEmpty else {
+            keys = nil
+            values = nil
+            leftPadding = MLXArray([Int32]())
+            idx = 0
+            return
+        }
+
+        let rowIndices = MLXArray(rows.map(Int32.init))
+        keys = keys?.take(rowIndices, axis: 0)
+        values = values?.take(rowIndices, axis: 0)
+        leftPadding = leftPadding.take(rowIndices, axis: 0)
+
+        let minLeftPadding = leftPadding.min().item(Int.self)
+        guard minLeftPadding > 0 else { return }
+
+        if let currentKeys = keys, let currentValues = values {
+            keys = currentKeys[0..., 0..., minLeftPadding ..< idx, 0...]
+            values = currentValues[0..., 0..., minLeftPadding ..< idx, 0...]
+        }
+        idx -= minLeftPadding
+        leftPadding = leftPadding - MLXArray(Int32(minLeftPadding))
+    }
+
+    public func insert(_ cache: any KVCache) {
+        extend([cache])
+    }
+
+    public func extend(_ caches: [any KVCache]) {
+        guard !caches.isEmpty else { return }
+        extend(BatchKVCache.merge(caches))
+    }
+
+    public func extend(_ other: BatchKVCache) {
+        guard other.batchSize > 0 else { return }
+        guard batchSize > 0 else {
+            state = other.state
+            leftPadding = other.leftPadding
+            idx = other.idx
+            return
+        }
+        guard let currentKeys = keys, let currentValues = values else {
+            state = other.state
+            leftPadding = other.leftPadding
+            idx = other.idx
+            return
+        }
+        guard let otherKeys = other.keys, let otherValues = other.values else { return }
+
+        let targetIdx = max(idx, other.idx)
+        let normalizedCurrent = normalize(
+            keys: currentKeys[0..., 0..., ..<idx, 0...],
+            values: currentValues[0..., 0..., ..<idx, 0...],
+            leftPadding: leftPadding,
+            from: idx,
+            to: targetIdx
+        )
+        let normalizedOther = normalize(
+            keys: otherKeys[0..., 0..., ..<other.idx, 0...],
+            values: otherValues[0..., 0..., ..<other.idx, 0...],
+            leftPadding: other.leftPadding,
+            from: other.idx,
+            to: targetIdx
+        )
+
+        keys = concatenated([normalizedCurrent.keys, normalizedOther.keys], axis: 0)
+        values = concatenated([normalizedCurrent.values, normalizedOther.values], axis: 0)
+        leftPadding = concatenated([normalizedCurrent.leftPadding, normalizedOther.leftPadding], axis: 0)
+        idx = targetIdx
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -182,5 +258,32 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         )
         keys = concatenated([currentKeys, keyExtension], axis: 2)
         values = concatenated([currentValues, valueExtension], axis: 2)
+    }
+
+    private func normalize(
+        keys inputKeys: MLXArray,
+        values inputValues: MLXArray,
+        leftPadding inputLeftPadding: MLXArray,
+        from currentIdx: Int,
+        to targetIdx: Int
+    ) -> (keys: MLXArray, values: MLXArray, leftPadding: MLXArray) {
+        let delta = targetIdx - currentIdx
+        guard delta > 0 else {
+            return (inputKeys, inputValues, inputLeftPadding)
+        }
+
+        let keyPadding = MLXArray.zeros(
+            [inputKeys.dim(0), inputKeys.dim(1), delta, inputKeys.dim(3)],
+            dtype: inputKeys.dtype
+        )
+        let valuePadding = MLXArray.zeros(
+            [inputValues.dim(0), inputValues.dim(1), delta, inputValues.dim(3)],
+            dtype: inputValues.dtype
+        )
+        return (
+            concatenated([keyPadding, inputKeys], axis: 2),
+            concatenated([valuePadding, inputValues], axis: 2),
+            inputLeftPadding + MLXArray(Int32(delta))
+        )
     }
 }

@@ -24,6 +24,14 @@ private struct BatchGateResult: Sendable {
     let mismatchedCheckedTokens: Int
 }
 
+private struct DynamicBatchGateResult: Sendable {
+    let checkedTokenCount: Int
+    let mismatchedCheckedTokens: Int
+    let responseCount: Int
+    let insertionCount: Int
+    let removalCount: Int
+}
+
 final class BatchInvarianceTests: XCTestCase {
     private static let prompts = [
         "The capital of France is",
@@ -77,6 +85,37 @@ final class BatchInvarianceTests: XCTestCase {
                 "batch size \(result.batchSize) mismatched wide-margin tokens"
             )
         }
+    }
+
+    func testContinuousBatchingSupportsInsertAndRemoveMidBatch() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run M1.5 dynamic batch-invariance.")
+        }
+        guard resolution.url.lastPathComponent == "Qwen3-0.6B-4bit" else {
+            throw XCTSkip("M1.5 dynamic batch-invariance fixture is pinned to Qwen3-0.6B-4bit.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+        let prompts = Array(Self.prompts.prefix(4))
+        let result = try await container.perform { context in
+            try await Self.evaluateDynamicBatchGate(context: context, prompts: prompts)
+        }
+
+        if ProcessInfo.processInfo.environment["MLXSERVE_DEBUG_BATCH_GATE"] == "1" {
+            print(
+                "M1.5 dynamic: responses=\(result.responseCount), inserts=\(result.insertionCount), removals=\(result.removalCount), checkedTokens=\(result.checkedTokenCount), mismatches=\(result.mismatchedCheckedTokens)"
+            )
+        }
+        XCTAssertEqual(result.insertionCount, 4)
+        XCTAssertEqual(result.removalCount, 2)
+        XCTAssertGreaterThan(result.responseCount, 0)
+        XCTAssertGreaterThan(result.checkedTokenCount, 0)
+        XCTAssertEqual(result.mismatchedCheckedTokens, 0)
     }
 
     private static func evaluateBatchGate(
@@ -162,6 +201,96 @@ final class BatchInvarianceTests: XCTestCase {
         }
 
         return results
+    }
+
+    private static func evaluateDynamicBatchGate(
+        context: ModelContext,
+        prompts: [String]
+    ) async throws -> DynamicBatchGateResult {
+        let parameters = GenerateParameters(maxTokens: 5, temperature: 0)
+        var inputs: [LMInput] = []
+        for prompt in prompts {
+            inputs.append(try await context.processor.prepare(input: UserInput(prompt: prompt)))
+        }
+        let serial = try inputs.map {
+            try Self.serialTrace(
+                model: context.model,
+                input: $0,
+                parameters: parameters,
+                steps: parameters.maxTokens ?? 5
+            )
+        }
+
+        let generator = ContinuousBatchGenerator(model: context.model, parameters: parameters)
+        var expectedStepByUID: [String: Int] = [:]
+        var checkedTokenCount = 0
+        var mismatchedCheckedTokens = 0
+        var responseCount = 0
+        var insertionCount = 0
+        var removalCount = 0
+
+        func insert(_ row: Int) throws {
+            let uid = "row-\(row)"
+            try generator.insert(
+                uid: uid,
+                input: inputs[row],
+                sampling: SamplingParameters(temperature: 0)
+            )
+            expectedStepByUID[uid] = 0
+            insertionCount += 1
+        }
+
+        func consumeStep() {
+            for response in generator.next() {
+                responseCount += 1
+                guard let promptRow = Int(response.uid.replacingOccurrences(of: "row-", with: "")),
+                    let expectedStep = expectedStepByUID[response.uid]
+                else {
+                    mismatchedCheckedTokens += 1
+                    continue
+                }
+
+                let serialStep = serial[promptRow][expectedStep]
+                let margin = Self.topOneTopTwoMargin(serialStep.logits)
+                if margin > 1.25 * 4 + 1e-3 {
+                    checkedTokenCount += 1
+                    if response.token != serialStep.tokenId {
+                        mismatchedCheckedTokens += 1
+                    }
+                }
+                expectedStepByUID[response.uid] = expectedStep + 1
+            }
+        }
+
+        try insert(0)
+        try insert(1)
+        consumeStep()
+
+        try insert(2)
+        consumeStep()
+
+        Stream.gpu.synchronize()
+        generator.remove(uid: "row-0")
+        expectedStepByUID.removeValue(forKey: "row-0")
+        removalCount += 1
+        consumeStep()
+
+        try insert(3)
+        consumeStep()
+
+        Stream.gpu.synchronize()
+        generator.remove(uid: "row-2")
+        expectedStepByUID.removeValue(forKey: "row-2")
+        removalCount += 1
+        consumeStep()
+
+        return DynamicBatchGateResult(
+            checkedTokenCount: checkedTokenCount,
+            mismatchedCheckedTokens: mismatchedCheckedTokens,
+            responseCount: responseCount,
+            insertionCount: insertionCount,
+            removalCount: removalCount
+        )
     }
 
     private static func serialTrace(

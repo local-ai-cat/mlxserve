@@ -184,6 +184,7 @@ Rotating/sliding-window family (+supersede-on-extend + boundary snapshots), MTP,
   - `B=4`: `1.1855469`, `12`, `0`
   - `B=8`: `1.1855469`, `24`, `0`
   The largest error was on a wide-margin token (`margin=13.125`) with matching serial/batch token id `198`; the committed gate keeps token equality margin-gated and uses a `1.25` logit tolerance for this local 4-bit/bfloat Qwen path.
+- **M1.5 continuous batching, 2026-07-03 on branch `impl/native`: PASS.** Added dynamic `BatchKVCache.filter`/`extend`/`insert`, `ContinuousBatchGenerator` row insert/remove/filter, per-row sampling, and `Response {uid, token, finishReason, logprobs?}`. GPU gate inserts rows mid-batch and removes finished rows after a stream sync; surviving wide-margin tokens match their solo traces. Result: `responses=12`, `inserts=4`, `removals=2`, `checkedTokens=9`, `mismatches=0`.
 
 ## Blocked
 
