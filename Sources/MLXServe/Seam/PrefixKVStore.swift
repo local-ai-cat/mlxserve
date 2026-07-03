@@ -129,6 +129,7 @@ public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
 
         let cache = KVCacheSimple()
         cache.state = layer.state
+        cache.metaState = layer.metaState
         return cache
     }
 

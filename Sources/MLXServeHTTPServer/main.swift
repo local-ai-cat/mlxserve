@@ -7,9 +7,6 @@ import MLXServe
 import MLXServeHTTP
 import Tokenizers
 
-private let defaultModelPath =
-    "/Users/timapple/Library/Caches/models/mlx-community/Qwen3-0.6B-4bit"
-
 @main
 struct MLXServeHTTPServerMain {
     static func main() async throws {
@@ -31,7 +28,7 @@ struct MLXServeHTTPServerMain {
                 port: config.port,
                 backend: backend
             )
-            server.start()
+            try await server.start()
             print("MLXServeHTTP listening on http://\(config.host):\(config.port)")
             fflush(stdout)
             server.waitForever()
@@ -44,8 +41,8 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
 
     private let context: ModelContext
     private let engine: MLXServeEngine
-    private let pump: NativeChatPump
     private let parameters: GenerateParameters
+    private let eosTokenIds: Set<Int>
 
     init(
         context: ModelContext,
@@ -59,7 +56,11 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
             parameters: parameters,
             maxConcurrentRequests: maxConcurrentRequests
         )
-        self.pump = NativeChatPump(engine: engine)
+        var eosTokenIds = context.configuration.eosTokenIds
+        if let tokenizerEosTokenId = context.tokenizer.eosTokenId {
+            eosTokenIds.insert(tokenizerEosTokenId)
+        }
+        self.eosTokenIds = eosTokenIds
         self.models = [OpenAIModelInfo(id: modelID, maxModelLength: nil)]
     }
 
@@ -71,20 +72,35 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
             uid: uid,
             input: input,
             maxTokens: request.maxTokens,
-            sampling: SamplingParameters(temperature: request.temperature)
+            sampling: SamplingParameters(temperature: request.temperature),
+            eosTokenIds: eosTokenIds
         )
 
-        let responseStream = pump.stream(mlxRequest)
+        let responseStream = engine.stream(mlxRequest)
         let chunks = AsyncThrowingStream<OpenAIChatChunk, Error> { continuation in
-            Task {
+            let task = Task {
                 do {
                     for try await response in responseStream {
-                        guard response.token >= 0 else { continue }
+                        if case .failed(let message)? = response.finishReason {
+                            throw NativeChatBackendError.generationFailed(message)
+                        }
+                        guard response.token >= 0 else {
+                            if response.finishReason != nil {
+                                break
+                            }
+                            continue
+                        }
                         let text = self.context.tokenizer.decode(
                             tokenIds: [response.token],
                             skipSpecialTokens: true
                         )
-                        continuation.yield(OpenAIChatChunk(text: text, tokenID: response.token))
+                        continuation.yield(
+                            OpenAIChatChunk(
+                                text: text,
+                                tokenID: response.token,
+                                finishReason: openAIFinishReason(response.finishReason)
+                            )
+                        )
                         if response.finishReason != nil {
                             break
                         }
@@ -93,6 +109,9 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
             }
         }
 
@@ -121,80 +140,6 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
     }
 }
 
-private actor NativeChatPump {
-    private let engine: MLXServeEngine
-    private var continuations: [String: AsyncThrowingStream<Response, Error>.Continuation] = [:]
-    private var isRunning = false
-
-    init(engine: MLXServeEngine) {
-        self.engine = engine
-    }
-
-    nonisolated func stream(_ request: Request) -> AsyncThrowingStream<Response, Error> {
-        AsyncThrowingStream { continuation in
-            Task {
-                await self.submit(request, continuation: continuation)
-            }
-        }
-    }
-
-    private func submit(
-        _ request: Request,
-        continuation: AsyncThrowingStream<Response, Error>.Continuation
-    ) async {
-        do {
-            try await engine.submit(request)
-            continuations[request.uid] = continuation
-            startIfNeeded()
-        } catch {
-            continuation.finish(throwing: error)
-        }
-    }
-
-    private func startIfNeeded() {
-        guard !isRunning else { return }
-        isRunning = true
-        Task {
-            await self.run()
-        }
-    }
-
-    private func run() async {
-        defer { isRunning = false }
-
-        do {
-            while true {
-                if await engine.isIdle {
-                    if continuations.isEmpty {
-                        return
-                    }
-                    await Task.yield()
-                    continue
-                }
-
-                let responses = try await engine.step()
-                for response in responses {
-                    guard let continuation = continuations[response.uid] else { continue }
-                    continuation.yield(response)
-                    if response.finishReason != nil {
-                        continuation.finish()
-                        continuations.removeValue(forKey: response.uid)
-                    }
-                }
-
-                if responses.isEmpty {
-                    await Task.yield()
-                }
-            }
-        } catch {
-            for continuation in continuations.values {
-                continuation.finish(throwing: error)
-            }
-            continuations.removeAll()
-        }
-    }
-}
-
 private struct ServerConfig {
     let host: String
     let port: UInt16
@@ -205,7 +150,8 @@ private struct ServerConfig {
     static func parse(_ arguments: [String]) throws -> ServerConfig {
         var host = "127.0.0.1"
         var port: UInt16 = 18181
-        var modelPath = ProcessInfo.processInfo.environment["MLXSERVE_TEST_MODEL"] ?? defaultModelPath
+        var modelPath = ProcessInfo.processInfo.environment["MLXSERVE_MODEL_DIR"]
+            ?? ProcessInfo.processInfo.environment["MLXSERVE_TEST_MODEL"]
         var modelID: String?
         var maxConcurrentRequests = 8
 
@@ -243,6 +189,10 @@ private struct ServerConfig {
             index += 1
         }
 
+        guard let modelPath else {
+            throw ServerConfigError.invalidArgument("missing --model-dir or MLXSERVE_MODEL_DIR")
+        }
+
         return ServerConfig(
             host: host,
             port: port,
@@ -267,11 +217,37 @@ private struct ServerConfig {
             Options:
               --host HOST                       Bind host. Default: 127.0.0.1
               --port PORT                       Bind port. Default: 18181
-              --model-dir PATH                  MLX model directory.
+              --model-dir PATH                  MLX model directory. Required unless MLXSERVE_MODEL_DIR is set.
               --model-id ID                     OpenAI model id. Defaults to model directory name.
               --max-concurrent-requests N       Scheduler concurrency cap. Default: 8
             """
         )
+    }
+}
+
+private enum NativeChatBackendError: Error, CustomStringConvertible {
+    case generationFailed(String)
+
+    var description: String {
+        switch self {
+        case .generationFailed(let message):
+            return message
+        }
+    }
+}
+
+private func openAIFinishReason(_ finishReason: FinishReason?) -> String? {
+    switch finishReason {
+    case .stop:
+        return "stop"
+    case .length:
+        return "length"
+    case .cancelled:
+        return "stop"
+    case .failed:
+        return "stop"
+    case nil:
+        return nil
     }
 }
 

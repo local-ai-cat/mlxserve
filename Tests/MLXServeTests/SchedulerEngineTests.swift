@@ -71,6 +71,154 @@ final class SchedulerEngineTests: XCTestCase {
         XCTAssertTrue(result.queueFullRejected)
     }
 
+    func testPoisonPillAdmissionDoesNotWedgeFollowingGoodStream() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run poison-pill recovery gate.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+
+        try await container.perform { context in
+            let engine = MLXServeEngine(
+                model: context.model,
+                parameters: GenerateParameters(maxTokens: 2, temperature: 0),
+                maxConcurrentRequests: 1
+            )
+            let badInput = LMInput(tokens: MLXArray([Int32(0)]))
+            let goodInput = try await context.processor.prepare(
+                input: UserInput(prompt: "The capital of France is")
+            )
+
+            async let badResponses = Self.collectResponses(
+                from: engine.stream(
+                    Request(
+                        uid: "bad",
+                        input: badInput,
+                        maxTokens: 2,
+                        sampling: SamplingParameters(temperature: 0)
+                    )
+                )
+            )
+            async let goodResponses = Self.collectResponses(
+                from: engine.stream(
+                    Request(
+                        uid: "good",
+                        input: goodInput,
+                        maxTokens: 2,
+                        sampling: SamplingParameters(temperature: 0)
+                    )
+                )
+            )
+
+            let (bad, good) = try await (badResponses, goodResponses)
+            XCTAssertEqual(bad.last?.uid, "bad")
+            if case .failed? = bad.last?.finishReason {
+            } else {
+                XCTFail("bad request should finish with a failed terminal response")
+            }
+            XCTAssertEqual(good.filter { $0.token >= 0 }.count, 2)
+            XCTAssertEqual(good.last?.finishReason, .length)
+        }
+    }
+
+    func testEOSFinishReasonStopsStream() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run EOS finish-reason gate.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+
+        try await container.perform { context in
+            let parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+            let input = try await context.processor.prepare(
+                input: UserInput(prompt: "The capital of France is")
+            )
+            let firstToken = try Self.serialTrace(
+                model: context.model,
+                input: input,
+                parameters: parameters,
+                steps: 1
+            )[0].tokenId
+            let engine = MLXServeEngine(
+                model: context.model,
+                parameters: parameters,
+                maxConcurrentRequests: 1
+            )
+
+            let responses = try await Self.collectResponses(
+                from: engine.stream(
+                    Request(
+                        uid: "eos",
+                        input: input,
+                        maxTokens: 4,
+                        sampling: SamplingParameters(temperature: 0),
+                        eosTokenIds: [firstToken]
+                    )
+                )
+            )
+
+            XCTAssertEqual(responses.count, 1)
+            XCTAssertEqual(responses.first?.token, firstToken)
+            XCTAssertEqual(responses.first?.finishReason, .stop)
+        }
+    }
+
+    func testConcurrentEngineStreamsStayDemuxed() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run concurrent stream gate.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+
+        try await container.perform { context in
+            let parameters = GenerateParameters(maxTokens: 2, temperature: 0)
+            let inputs = try await Array(Self.prompts.prefix(4)).mapAsync { prompt in
+                try await context.processor.prepare(input: UserInput(prompt: prompt))
+            }
+            let engine = MLXServeEngine(
+                model: context.model,
+                parameters: parameters,
+                maxConcurrentRequests: 2
+            )
+            let requests = inputs.enumerated().map { index, input in
+                Request(
+                    uid: "s\(index)",
+                    input: input,
+                    maxTokens: 2,
+                    sampling: SamplingParameters(temperature: 0)
+                )
+            }
+
+            async let responses0 = Self.collectResponses(from: engine.stream(requests[0]))
+            async let responses1 = Self.collectResponses(from: engine.stream(requests[1]))
+            async let responses2 = Self.collectResponses(from: engine.stream(requests[2]))
+            async let responses3 = Self.collectResponses(from: engine.stream(requests[3]))
+            let allResponses = try await [responses0, responses1, responses2, responses3]
+
+            for (index, responses) in allResponses.enumerated() {
+                let uid = "s\(index)"
+                XCTAssertFalse(responses.isEmpty)
+                XCTAssertTrue(responses.allSatisfy { $0.uid == uid })
+                XCTAssertEqual(responses.last?.finishReason, .length)
+            }
+        }
+    }
+
     private static func evaluateEngineGate(
         context: ModelContext,
         prompts: [String]
@@ -301,5 +449,16 @@ final class SchedulerEngineTests: XCTestCase {
         let topValues = top(logits.asType(.float32), k: 2, axis: -1).asArray(Float.self)
         let sorted = topValues.sorted(by: >)
         return sorted[0] - sorted[1]
+    }
+}
+
+private extension Array {
+    func mapAsync<T>(_ transform: (Element) async throws -> T) async throws -> [T] {
+        var result: [T] = []
+        result.reserveCapacity(count)
+        for element in self {
+            result.append(try await transform(element))
+        }
+        return result
     }
 }

@@ -43,7 +43,14 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
             return payload
         }
 
-        guard isKnownOnSSD(hash), let loaded = try? loadPayload(hash: hash) else {
+        guard isKnownOnSSD(hash) else {
+            return nil
+        }
+        let loaded: KVCacheBlockPayload
+        do {
+            loaded = try loadPayload(hash: hash)
+        } catch {
+            logSSDCacheFailure("failed to load SSD payload for \(BlockHashing.hex(hash))", error)
             return nil
         }
         setHotPayload(loaded, for: hash)
@@ -156,6 +163,7 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
                     knownSSDHashes.insert(hash)
                 }
             } catch {
+                logSSDCacheFailure("ignored invalid SSD cache file \(fileURL.path)", error)
                 continue
             }
         }
@@ -236,6 +244,11 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
         ssdLock.lock()
         defer { ssdLock.unlock() }
         return try body()
+    }
+
+    private func logSSDCacheFailure(_ message: String, _ error: Error) {
+        let line = "MLXServe SSD cache warning: \(message): \(error)\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 }
 

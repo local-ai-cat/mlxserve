@@ -102,6 +102,42 @@ final class TrackAPrefixCacheTests: XCTestCase {
         }
     }
 
+    func testSafetensorsReadThrowsOnTruncatedTensorData() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mlxserve-truncated-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let hash = Data(repeating: 0xCC, count: 32)
+        let array = MLXArray.zeros([1, 1, 2, 2], dtype: .float32)
+        let snapshot = SafetensorsBlockIO.snapshot(
+            hash: hash,
+            payload: KVCacheBlockPayload(
+                layers: [
+                    CacheLayerBlockPayload(
+                        keys: array,
+                        values: array,
+                        metaState: ["2", CacheTypeHandlers.encodeBool(false)]
+                    )
+                ]
+            ),
+            tokenCount: 2,
+            modelName: "truncated-test",
+            blockSize: 2
+        )
+        let url = directory.appendingPathComponent("truncated.safetensors")
+        try SafetensorsBlockIO.write(snapshot, to: url)
+        var data = try Data(contentsOf: url)
+        data.removeLast()
+        try data.write(to: url)
+
+        XCTAssertThrowsError(try SafetensorsBlockIO.read(from: url)) { error in
+            guard case .invalidTensorOffsets? = error as? SafetensorsBlockIOError else {
+                XCTFail("expected invalid tensor offsets, got \(error)")
+                return
+            }
+        }
+    }
+
     func testHotPrefixCacheReconstructsAndDoesNotLeakBlocks() async throws {
         try MLXMetalRuntime.requireAvailable()
 

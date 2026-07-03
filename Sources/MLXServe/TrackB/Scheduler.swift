@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLMCommon
 
@@ -65,13 +66,12 @@ public actor Scheduler {
     }
 
     public func step() throws -> [Response] {
-        applyPendingCancellation()
-        try admitWaiting()
+        var processed = applyPendingCancellation()
+        processed.append(contentsOf: admitWaiting())
 
-        guard !generator.isEmpty else { return [] }
+        guard !generator.isEmpty else { return processed }
 
         let rawResponses = generator.next()
-        var processed: [Response] = []
         var finishedUIDs: [String] = []
 
         for response in rawResponses {
@@ -112,7 +112,7 @@ public actor Scheduler {
             }
         }
 
-        try admitWaiting()
+        processed.append(contentsOf: admitWaiting())
         return processed
     }
 
@@ -124,48 +124,73 @@ public actor Scheduler {
         collector.responses(for: uid)
     }
 
-    private func admitWaiting() throws {
+    public func consumeTokens(for uid: String) -> [Int] {
+        collector.consumeTokens(for: uid)
+    }
+
+    public func tokens(for uid: String) -> [Int] {
+        collector.tokens(for: uid)
+    }
+
+    public func discardResponses(for uid: String) {
+        collector.remove(uid: uid)
+    }
+
+    private func admitWaiting() -> [Response] {
+        var failedResponses: [Response] = []
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
             let request = waiting[0]
             var prepared: PreparedBatchRow?
             do {
-                prepared = try prepareForInsert(request)
-                guard let prepared else { continue }
+                let row = try prepareForInsert(request)
+                prepared = row
                 try generator.insert(
                     uid: request.uid,
-                    cache: prepared.cache,
-                    lastToken: prepared.lastToken,
+                    cache: row.cache,
+                    lastToken: row.lastToken,
                     sampling: request.sampling
+                )
+                waiting.removeFirst()
+                running[request.uid] = RunningRequest(
+                    request: request,
+                    promptTokens: row.promptTokens,
+                    prefixHit: row.prefixHit,
+                    generatedTokenCount: 0
                 )
             } catch {
                 if let hit = prepared?.prefixHit {
                     prefixStore?.release(hit)
                 }
-                throw error
+                waiting.removeFirst()
+                let response = Response(
+                    uid: request.uid,
+                    token: -1,
+                    finishReason: .failed(String(describing: error))
+                )
+                collector.record(response)
+                failedResponses.append(response)
+                continue
             }
-            guard let prepared else { continue }
-            waiting.removeFirst()
-            running[request.uid] = RunningRequest(
-                request: request,
-                promptTokens: prepared.promptTokens,
-                prefixHit: prepared.prefixHit,
-                generatedTokenCount: 0
-            )
         }
+        return failedResponses
     }
 
-    private func applyPendingCancellation() {
-        guard !pendingCancellation.isEmpty else { return }
+    private func applyPendingCancellation() -> [Response] {
+        guard !pendingCancellation.isEmpty else { return [] }
 
         Stream.gpu.synchronize()
+        var responses: [Response] = []
         for uid in pendingCancellation {
             guard running[uid] != nil else { continue }
             clearPrefixEntry(uid: uid)
             generator.remove(uid: uid)
             running.removeValue(forKey: uid)
-            collector.record(Response(uid: uid, token: -1, finishReason: .cancelled))
+            let response = Response(uid: uid, token: -1, finishReason: .cancelled)
+            collector.record(response)
+            responses.append(response)
         }
         pendingCancellation.removeAll()
+        return responses
     }
 
     private func prepareForInsert(_ request: Request) throws -> PreparedBatchRow {
@@ -187,7 +212,6 @@ public actor Scheduler {
 
         if let prefixStore, let hit = prefixStore.fetch(tokens: promptTokens) {
             do {
-                try prefixStore.preload(hit)
                 let serialized = try prefixStore.reconstructCache(from: hit)
                 let reconstructedCache = try serialized.map {
                     try BlockAwarePrefixKVStore.cache(from: $0)
@@ -201,7 +225,7 @@ public actor Scheduler {
                 )
             } catch {
                 prefixStore.release(hit)
-                throw error
+                logCacheFailure("prefix hit reconstruction failed; falling back to cache miss", error)
             }
         }
 
@@ -286,7 +310,11 @@ public actor Scheduler {
                 className: "KVCacheSimple"
             )
         }
-        try? prefixStore.store(tokens: runningRequest.promptTokens, cache: serialized)
+        do {
+            try prefixStore.store(tokens: runningRequest.promptTokens, cache: serialized)
+        } catch {
+            logCacheFailure("prompt cache store failed", error)
+        }
     }
 
     private func releasePrefixHit(uid: String) {
@@ -297,6 +325,11 @@ public actor Scheduler {
     private func clearPrefixEntry(uid: String) {
         guard let hit = running[uid]?.prefixHit else { return }
         prefixStore?.clearEntry(hit)
+    }
+
+    private func logCacheFailure(_ message: String, _ error: Error) {
+        let line = "MLXServe cache warning: \(message): \(error)\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 }
 

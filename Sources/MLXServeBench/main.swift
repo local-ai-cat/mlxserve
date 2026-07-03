@@ -6,8 +6,6 @@ import MLXLMCommon
 import MLXServe
 import Tokenizers
 
-private let defaultModelPath =
-    "/Users/timapple/Library/Caches/models/mlx-community/Qwen3-0.6B-4bit"
 private let prefixSentence =
     "The capital of France is Paris. Swift concurrency protects shared state. GPU kernels execute matrix operations quickly. "
 private let prefixRepeatCount = 26
@@ -49,7 +47,8 @@ private struct BenchConfig {
     let outputPath: String?
 
     static func parse(_ arguments: [String]) throws -> BenchConfig {
-        var modelPath = ProcessInfo.processInfo.environment["MLXSERVE_TEST_MODEL"] ?? defaultModelPath
+        var modelPath = ProcessInfo.processInfo.environment["MLXSERVE_MODEL_DIR"]
+            ?? ProcessInfo.processInfo.environment["MLXSERVE_TEST_MODEL"]
         var runs = 5
         var warmup = 2
         var decodeTokens = 16
@@ -81,6 +80,10 @@ private struct BenchConfig {
                 throw BenchError.invalidArgument(argument)
             }
             index += 1
+        }
+
+        guard let modelPath else {
+            throw BenchError.invalidArgument("missing --model-dir or MLXSERVE_MODEL_DIR")
         }
 
         guard runs > 0 else { throw BenchError.invalidArgument("--runs must be > 0") }
@@ -116,7 +119,7 @@ private struct BenchConfig {
             Usage: swift run mlxserve-bench [options]
 
             Options:
-              --model-dir PATH       MLX model directory. Defaults to MLXSERVE_TEST_MODEL or \(defaultModelPath)
+              --model-dir PATH       MLX model directory. Required unless MLXSERVE_MODEL_DIR is set.
               --runs N               Timed runs per metric. Default: 5
               --warmup N             Warmup runs per metric. Default: 2
               --decode-tokens N      Generated tokens per throughput run. Default: 16

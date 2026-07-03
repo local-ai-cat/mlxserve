@@ -33,6 +33,7 @@ public struct SafetensorsLoadedBlock {
 
 public enum SafetensorsBlockIO {
     public static let formatVersion = "4"
+    private static let maxHeaderBytes = 16 * 1024 * 1024
 
     public static func snapshot(
         hash: Data,
@@ -149,6 +150,14 @@ public enum SafetensorsBlockIO {
 
             let bytes = data[absoluteStart ..< absoluteEnd]
             let tensorData = Data(bytes)
+            let expectedBytes = try expectedByteCount(shape: tensor.shape, dtype: tensor.dtype)
+            guard tensorData.count == expectedBytes else {
+                throw SafetensorsBlockIOError.invalidTensorByteCount(
+                    tensor.name,
+                    expected: expectedBytes,
+                    actual: tensorData.count
+                )
+            }
             rawTensorBytes[tensor.name] = tensorData
 
             let array: MLXArray
@@ -175,6 +184,11 @@ public enum SafetensorsBlockIO {
         let headerLength = data.prefix(8).withUnsafeBytes {
             $0.load(as: UInt64.self).littleEndian
         }
+        guard headerLength <= UInt64(maxHeaderBytes),
+            headerLength <= UInt64(Int.max - 8)
+        else {
+            throw SafetensorsBlockIOError.invalidHeader
+        }
         let headerStart = 8
         let headerEnd = headerStart + Int(headerLength)
         guard headerEnd <= data.count else {
@@ -194,7 +208,10 @@ public enum SafetensorsBlockIO {
                 let dtype = dtype(from: dtypeString),
                 let shape = tensor["shape"] as? [Int],
                 let offsets = tensor["data_offsets"] as? [Int],
-                offsets.count == 2
+                offsets.count == 2,
+                shape.allSatisfy({ $0 >= 0 }),
+                offsets[0] >= 0,
+                offsets[1] >= offsets[0]
             else {
                 throw SafetensorsBlockIOError.invalidTensorHeader(name)
             }
@@ -256,6 +273,34 @@ public enum SafetensorsBlockIO {
         }
     }
 
+    private static func expectedByteCount(shape: [Int], dtype: DType) throws -> Int {
+        let elementCount = try shape.reduce(1) { partial, dimension in
+            let multiplied = partial.multipliedReportingOverflow(by: dimension)
+            guard !multiplied.overflow else {
+                throw SafetensorsBlockIOError.invalidHeader
+            }
+            return multiplied.partialValue
+        }
+        let multiplied = elementCount.multipliedReportingOverflow(by: byteWidth(dtype))
+        guard !multiplied.overflow else {
+            throw SafetensorsBlockIOError.invalidHeader
+        }
+        return multiplied.partialValue
+    }
+
+    private static func byteWidth(_ dtype: DType) -> Int {
+        switch dtype {
+        case .bool, .uint8, .int8:
+            return 1
+        case .uint16, .int16, .float16, .bfloat16:
+            return 2
+        case .uint32, .int32, .float32:
+            return 4
+        case .uint64, .int64, .float64, .complex64:
+            return 8
+        }
+    }
+
     private static func appendUInt64(_ value: UInt64, to data: inout Data) {
         var littleEndian = value.littleEndian
         withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
@@ -266,6 +311,7 @@ public enum SafetensorsBlockIOError: Error, Equatable {
     case invalidHeader
     case invalidTensorHeader(String)
     case invalidTensorOffsets(String)
+    case invalidTensorByteCount(String, expected: Int, actual: Int)
     case missingTensor(String)
     case incompatibleMetadata(String)
 }

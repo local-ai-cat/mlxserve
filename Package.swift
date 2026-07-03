@@ -26,7 +26,10 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(path: "/Users/timapple/Documents/Guest/mlx-swift-lm"),
+        .package(
+            url: "https://github.com/atlas-open-sources/mlx-swift-lm.git",
+            revision: "1679b2555eb585200f8a1594e034251cf244b861"
+        ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
@@ -70,6 +73,7 @@ let package = Package(
             name: "MLXServeTests",
             dependencies: [
                 "MLXServe",
+                "MLXServeHTTP",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),

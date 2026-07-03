@@ -1,4 +1,4 @@
-public final class OutputCollector: @unchecked Sendable {
+final class OutputCollector {
     private var responsesByUID: [String: [Response]] = [:]
     private var finishReasonsByUID: [String: FinishReason] = [:]
 
@@ -19,7 +19,11 @@ public final class OutputCollector: @unchecked Sendable {
 
     public func tokens(for uid: String) -> [Int] {
         responsesByUID[uid, default: []]
-            .filter { $0.finishReason != .cancelled }
+            .filter { response in
+                if case .cancelled? = response.finishReason { return false }
+                if case .failed? = response.finishReason { return false }
+                return true
+            }
             .map(\.token)
     }
 
@@ -31,10 +35,25 @@ public final class OutputCollector: @unchecked Sendable {
         finishReasonsByUID[uid]
     }
 
+    public func consumeTokens(for uid: String) -> [Int] {
+        let result = tokens(for: uid)
+        remove(uid: uid)
+        return result
+    }
+
+    public func remove(uid: String) {
+        responsesByUID.removeValue(forKey: uid)
+        finishReasonsByUID.removeValue(forKey: uid)
+    }
+
     public var allTokens: [String: [Int]] {
         responsesByUID.mapValues { responses in
             responses
-                .filter { $0.finishReason != .cancelled }
+                .filter { response in
+                    if case .cancelled? = response.finishReason { return false }
+                    if case .failed? = response.finishReason { return false }
+                    return true
+                }
                 .map(\.token)
         }
     }

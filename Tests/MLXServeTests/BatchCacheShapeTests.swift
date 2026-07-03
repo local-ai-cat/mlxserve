@@ -62,6 +62,21 @@ final class BatchCacheShapeTests: XCTestCase {
         XCTAssertEqual(extracted.state[0].shape, [1, 3, 16])
         XCTAssertEqual(extracted.state[1].shape, [1, 4, 8, 8])
     }
+
+    func testMergeRejectsKnownRotatingCacheTypes() throws {
+        let rotating = RotatingTestCache()
+        rotating.state = [
+            MLXArray.zeros([1, 1, 2, 8], dtype: .float32),
+            MLXArray.zeros([1, 1, 2, 8], dtype: .float32),
+        ]
+
+        XCTAssertThrowsError(try BatchKVCache.merge([rotating])) { error in
+            XCTAssertEqual(
+                error as? BatchKVCacheError,
+                .rotatingCacheUnsupported(cacheType: "RotatingTestCache")
+            )
+        }
+    }
 }
 
 private final class FixedStateCache: KVCache {
@@ -100,5 +115,42 @@ private final class FixedStateCache: KVCache {
 
     func copy() -> any KVCache {
         FixedStateCache(state: state.map { $0[.ellipsis] }, metaState: metaState)
+    }
+}
+
+private final class RotatingTestCache: KVCache {
+    var state: [MLXArray] = []
+    var metaState: [String] = []
+    var offset: Int { 2 }
+    var maxSize: Int? { 4 }
+    var isTrimmable: Bool { false }
+
+    func innerState() -> [MLXArray] {
+        state
+    }
+
+    func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        state = [newKeys, newValues]
+        return (newKeys, newValues)
+    }
+
+    func makeMask(
+        n: Int,
+        windowSize: Int?,
+        returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .none
+    }
+
+    @discardableResult
+    func trim(_ n: Int) -> Int {
+        0
+    }
+
+    func copy() -> any KVCache {
+        let copy = RotatingTestCache()
+        copy.state = state.map { $0[.ellipsis] }
+        copy.metaState = metaState
+        return copy
     }
 }

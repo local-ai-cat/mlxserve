@@ -64,19 +64,26 @@ final class BatchLayerCache {
             }
             try cache.extend(otherCache)
         case .batchState:
-            let currentState = kvCache.state
-            let otherState = other.kvCache.state
-            guard currentState.count == otherState.count else {
-                throw BatchKVCacheError.inconsistentStateCount(
-                    expected: currentState.count,
-                    actual: otherState.count,
-                    cacheType: String(describing: type(of: other.kvCache))
-                )
+            if let arraysCache = kvCache as? ArraysCache,
+                let otherArraysCache = other.kvCache as? ArraysCache
+            {
+                arraysCache.extend(other: otherArraysCache)
+            } else {
+                let currentState = kvCache.state
+                let otherState = other.kvCache.state
+                guard currentState.count == otherState.count else {
+                    throw BatchKVCacheError.inconsistentStateCount(
+                        expected: currentState.count,
+                        actual: otherState.count,
+                        cacheType: String(describing: type(of: other.kvCache))
+                    )
+                }
+                kvCache.state = zip(currentState, otherState).map { concatenated([$0, $1], axis: 0) }
             }
-            kvCache.state = zip(currentState, otherState).map { concatenated([$0, $1], axis: 0) }
         }
 
         rowMetaStates.append(contentsOf: other.rowMetaStates)
+        refreshBatchedMetaState()
     }
 
     func filter(keeping rows: [Int]) {
@@ -91,11 +98,16 @@ final class BatchLayerCache {
             (kvCache as? BatchKVCache)?.filter(keeping: rows)
         case .batchState:
             let rowIndices = MLXArray(rows.map(Int32.init))
-            kvCache.state = kvCache.state.map { $0.take(rowIndices, axis: 0) }
+            if let arraysCache = kvCache as? ArraysCache {
+                arraysCache.filter(batchIndices: rowIndices)
+            } else {
+                kvCache.state = kvCache.state.map { $0.take(rowIndices, axis: 0) }
+            }
         }
-        rowMetaStates = rows.compactMap { row in
-            row < rowMetaStates.count ? rowMetaStates[row] : nil
+        rowMetaStates = rows.map { row in
+            row < rowMetaStates.count ? rowMetaStates[row] : []
         }
+        refreshBatchedMetaState()
     }
 
     func extract(_ row: Int) -> KVCacheSimple {
@@ -107,6 +119,14 @@ final class BatchLayerCache {
         guard row >= 0, row < batchSize else { return cache }
         cache.state = kvCache.state.map { Self.sliceRow($0, row: row) }
         return cache
+    }
+
+    func copyLayer() -> BatchLayerCache {
+        BatchLayerCache(
+            kvCache: kvCache.copy(),
+            layout: layout,
+            rowMetaStates: rowMetaStates
+        )
     }
 
     private static func mergeBatchState(_ caches: [any KVCache]) throws -> BatchLayerCache {
@@ -139,13 +159,69 @@ final class BatchLayerCache {
             batchState.append(concatenated(states.map { $0[stateIndex] }, axis: 0))
         }
 
+        if let firstArraysCache = firstCache as? ArraysCache {
+            let cache = firstArraysCache.copy()
+            guard let mergedCache = cache as? ArraysCache else {
+                throw BatchKVCacheError.incompatibleLayout(
+                    expected: "ArraysCache",
+                    actual: String(describing: type(of: cache))
+                )
+            }
+            for cache in caches.dropFirst() {
+                guard let arraysCache = cache as? ArraysCache else {
+                    throw BatchKVCacheError.incompatibleLayout(
+                        expected: "ArraysCache",
+                        actual: String(describing: type(of: cache))
+                    )
+                }
+                mergedCache.extend(other: arraysCache)
+            }
+            return BatchLayerCache(
+                kvCache: mergedCache,
+                layout: .batchState,
+                rowMetaStates: caches.map(\.metaState)
+            )
+        }
+
         var cache = firstCache.copy()
         cache.state = batchState
+        let rowMetaStates = caches.map(\.metaState)
+        cache.metaState = mergedMetaState(from: rowMetaStates)
         return BatchLayerCache(
             kvCache: cache,
             layout: .batchState,
-            rowMetaStates: caches.map(\.metaState)
+            rowMetaStates: rowMetaStates
         )
+    }
+
+    private func refreshBatchedMetaState() {
+        guard layout == .batchState else { return }
+        guard !(kvCache is ArraysCache) else { return }
+        kvCache.metaState = Self.mergedMetaState(from: rowMetaStates)
+    }
+
+    private static func mergedMetaState(from rows: [[String]]) -> [String] {
+        guard rows.contains(where: { !$0.isEmpty }) else { return [] }
+        let normalizedRows = rows.map { row in row.isEmpty ? ["0", ""] : row }
+        guard normalizedRows.allSatisfy({ $0.count >= 2 }),
+            normalizedRows.allSatisfy({ Int($0[0]) != nil })
+        else {
+            return normalizedRows.first ?? []
+        }
+
+        var slotBase = 0
+        var presentSlots: [String] = []
+        for row in normalizedRows {
+            let slotCount = Int(row[0]) ?? 0
+            let slots = row[1].split(separator: ",").compactMap { Int($0) }
+            presentSlots.append(contentsOf: slots.map { String($0 + slotBase) })
+            slotBase += slotCount
+        }
+
+        var merged = normalizedRows[0]
+        merged[0] = String(slotBase)
+        merged[1] = presentSlots.joined(separator: ",")
+        return merged
     }
 
     private static func isSequenceState(_ state: [MLXArray]) -> Bool {

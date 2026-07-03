@@ -10,6 +10,7 @@ public enum FinishReason: Sendable, Equatable {
     case stop
     case length
     case cancelled
+    case failed(String)
 }
 
 public struct Response: Sendable, Equatable {
@@ -148,14 +149,23 @@ public final class ContinuousBatchGenerator {
         precondition(!rowCache.isEmpty, "continuous batching requires a non-empty KV cache")
 
         if cache.isEmpty {
-            cache = try (0 ..< rowCache.count).map { layer in
+            let merged = try (0 ..< rowCache.count).map { layer in
                 try BatchLayerCache.merge([rowCache[layer]])
             }
+            cache = merged
             currentTokens = lastToken.reshaped([1])
         } else {
-            precondition(cache.count == rowCache.count, "inserted row cache layer count changed")
-            for layer in 0 ..< cache.count {
-                try cache[layer].insert(rowCache[layer])
+            guard cache.count == rowCache.count else {
+                throw BatchGeneratorError.insertedCacheLayerCountChanged(
+                    expected: cache.count,
+                    actual: rowCache.count
+                )
+            }
+            let rowLayers = try rowCache.map { try BatchLayerCache.merge([$0]) }
+            cache = try zip(cache, rowLayers).map { currentLayer, rowLayer in
+                let mergedLayer = currentLayer.copyLayer()
+                try mergedLayer.extend(rowLayer)
+                return mergedLayer
             }
             currentTokens = concatenated([currentTokens, lastToken.reshaped([1])], axis: 0)
         }
@@ -259,4 +269,5 @@ public final class ContinuousBatchGenerator {
 public enum BatchGeneratorError: Error, Equatable {
     case unsupportedPreparedLogits
     case promptTooShortForExternalPrefill
+    case insertedCacheLayerCountChanged(expected: Int, actual: Int)
 }

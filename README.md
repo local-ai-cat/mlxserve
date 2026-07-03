@@ -42,6 +42,18 @@ Sources/MLXServe/       TrackB (batched decode + scheduler), TrackA (prefix + SS
 Tests/MLXServeTests/    invariant gates (batch-invariance, cache-tier-invariance) + golden fixtures
 ```
 
+## Building
+
+Pass a local MLX model directory explicitly when running the executables:
+
+```bash
+MLXSERVE_MODEL_DIR=/path/to/mlx-model swift run mlxserve-http
+MLXSERVE_MODEL_DIR=/path/to/mlx-model swift run mlxserve-bench
+```
+
+The package pins the `mlx-swift-lm` fork used by this branch at commit
+`1679b2555eb585200f8a1594e034251cf244b861`.
+
 ## License
 
 [Apache 2.0](LICENSE). A port of Apache-2.0 oMLX; see [NOTICE](NOTICE) for attributions.

@@ -46,10 +46,12 @@ public struct OpenAIChatRequest: Sendable {
 public struct OpenAIChatChunk: Sendable {
     public let text: String
     public let tokenID: Int
+    public let finishReason: String?
 
-    public init(text: String, tokenID: Int) {
+    public init(text: String, tokenID: Int, finishReason: String? = nil) {
         self.text = text
         self.tokenID = tokenID
+        self.finishReason = finishReason
     }
 }
 
@@ -66,6 +68,30 @@ public struct OpenAIChatStream: Sendable {
 public protocol OpenAIChatBackend: Sendable {
     var models: [OpenAIModelInfo] { get }
     func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream
+}
+
+private final class ListenerStartState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    init(_ continuation: CheckedContinuation<Void, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ result: Result<Void, Error>) {
+        lock.lock()
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+
+        guard let continuation else { return }
+        switch result {
+        case .success:
+            continuation.resume(returning: ())
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+    }
 }
 
 public final class OpenAIServer: @unchecked Sendable {
@@ -88,18 +114,33 @@ public final class OpenAIServer: @unchecked Sendable {
         self.listener = try NWListener(using: .tcp, on: nwPort)
     }
 
-    public func start() {
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else {
-                connection.cancel()
-                return
+    public func start() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let startState = ListenerStartState(continuation)
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    startState.resume(.success(()))
+                case .failed(let error):
+                    startState.resume(.failure(OpenAIServerError.listenerFailed(String(describing: error))))
+                case .cancelled:
+                    startState.resume(.failure(OpenAIServerError.listenerFailed("listener cancelled")))
+                default:
+                    break
+                }
             }
-            connection.start(queue: .global(qos: .userInitiated))
-            Task {
-                await self.handle(connection)
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self else {
+                    connection.cancel()
+                    return
+                }
+                connection.start(queue: .global(qos: .userInitiated))
+                Task {
+                    await self.handle(connection)
+                }
             }
+            listener.start(queue: .global(qos: .userInitiated))
         }
-        listener.start(queue: .global(qos: .userInitiated))
     }
 
     public func waitForever() {
@@ -159,6 +200,7 @@ public final class OpenAIServer: @unchecked Sendable {
         var firstToken: UInt64?
         var lastToken: UInt64?
         var completionTokens = 0
+        var finishReason = "length"
 
         try await connection.send(
             data: Data(
@@ -189,29 +231,48 @@ public final class OpenAIServer: @unchecked Sendable {
             connection: connection
         )
 
-        for try await chunk in stream.chunks {
-            let now = DispatchTime.now().uptimeNanoseconds
-            if firstToken == nil {
-                firstToken = now
+        do {
+            for try await chunk in stream.chunks {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if firstToken == nil {
+                    firstToken = now
+                }
+                lastToken = now
+                completionTokens += 1
+                if let chunkFinishReason = chunk.finishReason {
+                    finishReason = chunkFinishReason
+                }
+                if !chunk.text.isEmpty {
+                    try await sendSSE(
+                        [
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": request.model,
+                            "choices": [
+                                [
+                                    "index": 0,
+                                    "delta": ["content": chunk.text],
+                                    "finish_reason": NSNull(),
+                                ]
+                            ],
+                        ],
+                        connection: connection
+                    )
+                }
             }
-            lastToken = now
-            completionTokens += 1
+        } catch {
             try await sendSSE(
                 [
                     "id": id,
-                    "object": "chat.completion.chunk",
+                    "object": "error",
                     "created": created,
-                    "model": request.model,
-                    "choices": [
-                        [
-                            "index": 0,
-                            "delta": ["content": chunk.text],
-                            "finish_reason": NSNull(),
-                        ]
-                    ],
+                    "error": ["message": String(describing: error)],
                 ],
                 connection: connection
             )
+            try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+            return
         }
 
         let ended = DispatchTime.now().uptimeNanoseconds
@@ -225,7 +286,7 @@ public final class OpenAIServer: @unchecked Sendable {
                     [
                         "index": 0,
                         "delta": [:],
-                        "finish_reason": "length",
+                        "finish_reason": finishReason,
                     ]
                 ],
             ],
@@ -262,6 +323,7 @@ public final class OpenAIServer: @unchecked Sendable {
         var firstToken: UInt64?
         var lastToken: UInt64?
         var completionTokens = 0
+        var finishReason = "length"
         var text = ""
 
         for try await chunk in stream.chunks {
@@ -272,6 +334,9 @@ public final class OpenAIServer: @unchecked Sendable {
             lastToken = now
             completionTokens += 1
             text += chunk.text
+            if let chunkFinishReason = chunk.finishReason {
+                finishReason = chunkFinishReason
+            }
         }
 
         let ended = DispatchTime.now().uptimeNanoseconds
@@ -285,7 +350,7 @@ public final class OpenAIServer: @unchecked Sendable {
                     [
                         "index": 0,
                         "message": ["role": "assistant", "content": text],
-                        "finish_reason": "length",
+                        "finish_reason": finishReason,
                     ]
                 ],
                 "usage": usage(
@@ -373,11 +438,14 @@ public final class OpenAIServer: @unchecked Sendable {
     }
 }
 
-public enum OpenAIServerError: Error, CustomStringConvertible {
+public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
     case invalidPort(UInt16)
     case invalidRequest
     case invalidJSON
     case unsupportedContent
+    case invalidContentLength
+    case payloadTooLarge
+    case listenerFailed(String)
 
     public var description: String {
         switch self {
@@ -389,15 +457,24 @@ public enum OpenAIServerError: Error, CustomStringConvertible {
             return "invalid JSON request body"
         case .unsupportedContent:
             return "unsupported request content"
+        case .invalidContentLength:
+            return "invalid Content-Length"
+        case .payloadTooLarge:
+            return "HTTP payload too large"
+        case .listenerFailed(let message):
+            return "listener failed: \(message)"
         }
     }
 }
 
-private struct HTTPRequest {
+struct HTTPRequest {
     let method: String
     let path: String
     let headers: [String: String]
     let body: Data
+
+    private static let maxHeaderBytes = 64 * 1024
+    private static let maxBodyBytes = 16 * 1024 * 1024
 
     static func read(from connection: NWConnection) async throws -> HTTPRequest {
         var buffer = Data()
@@ -406,10 +483,36 @@ private struct HTTPRequest {
             let chunk = try await connection.receive()
             guard !chunk.isEmpty else { throw OpenAIServerError.invalidRequest }
             buffer.append(chunk)
+            guard buffer.count <= maxHeaderBytes else {
+                throw OpenAIServerError.payloadTooLarge
+            }
             headerEnd = buffer.range(of: Data("\r\n\r\n".utf8))
         }
 
-        guard let headerRange = headerEnd else { throw OpenAIServerError.invalidRequest }
+        let request = try parseComplete(buffer)
+        var body = request.body
+        let contentLength = try parsedContentLength(request.headers)
+        while body.count < contentLength {
+            let chunk = try await connection.receive()
+            guard !chunk.isEmpty else { throw OpenAIServerError.invalidRequest }
+            body.append(chunk)
+        }
+        if body.count > contentLength {
+            body = body.prefix(contentLength)
+        }
+
+        return HTTPRequest(
+            method: request.method,
+            path: request.path,
+            headers: request.headers,
+            body: body
+        )
+    }
+
+    static func parseComplete(_ buffer: Data) throws -> HTTPRequest {
+        guard let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+            throw OpenAIServerError.invalidRequest
+        }
         let headerData = buffer[..<headerRange.lowerBound]
         guard let headerText = String(data: headerData, encoding: .utf8) else {
             throw OpenAIServerError.invalidRequest
@@ -426,14 +529,9 @@ private struct HTTPRequest {
             headers[parts[0].lowercased()] = parts[1].trimmingCharacters(in: .whitespaces)
         }
 
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        let contentLength = try parsedContentLength(headers)
         let bodyStart = headerRange.upperBound
         var body = Data(buffer[bodyStart...])
-        while body.count < contentLength {
-            let chunk = try await connection.receive()
-            guard !chunk.isEmpty else { throw OpenAIServerError.invalidRequest }
-            body.append(chunk)
-        }
         if body.count > contentLength {
             body = body.prefix(contentLength)
         }
@@ -444,6 +542,18 @@ private struct HTTPRequest {
             headers: headers,
             body: body
         )
+    }
+
+    private static func parsedContentLength(_ headers: [String: String]) throws -> Int {
+        guard let contentLength = Int(headers["content-length"] ?? "0"),
+            contentLength >= 0
+        else {
+            throw OpenAIServerError.invalidContentLength
+        }
+        guard contentLength <= maxBodyBytes else {
+            throw OpenAIServerError.payloadTooLarge
+        }
+        return contentLength
     }
 }
 

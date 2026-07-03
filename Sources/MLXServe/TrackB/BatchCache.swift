@@ -11,6 +11,7 @@ public enum BatchKVCacheError: Error, Equatable, CustomStringConvertible {
     case incompatibleLayout(expected: String, actual: String)
     case unsupportedStateMutation(layout: String, stateCount: Int)
     case invalidMetadata([String])
+    case rotatingCacheUnsupported(cacheType: String)
 
     public var description: String {
         switch self {
@@ -30,6 +31,8 @@ public enum BatchKVCacheError: Error, Equatable, CustomStringConvertible {
             return "BatchKVCache cannot set \(stateCount) state arrays on \(layout) layout."
         case .invalidMetadata(let metadata):
             return "BatchKVCache metadata is invalid: \(metadata)."
+        case .rotatingCacheUnsupported(let cacheType):
+            return "BatchKVCache cannot merge rotating cache type \(cacheType)."
         }
     }
 }
@@ -102,6 +105,18 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         }
 
         let layout = try inferLayout(cacheType: cacheTypes[0], state: firstState)
+        if case .sequence(let sequenceAxis) = layout {
+            for (state, cacheType) in zip(states, cacheTypes) {
+                if isKnownRotatingCache(cacheType) {
+                    throw BatchKVCacheError.rotatingCacheUnsupported(cacheType: cacheType)
+                }
+                _ = try sequenceLength(
+                    cacheType: cacheType,
+                    state: state,
+                    sequenceAxis: sequenceAxis
+                )
+            }
+        }
         switch layout {
         case .sequence(let sequenceAxis):
             return try mergeSequenceCaches(
@@ -149,8 +164,8 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         let rowIndices = MLXArray(rows.map(Int32.init))
         buffers = buffers.map { $0.take(rowIndices, axis: 0) }
         leftPadding = leftPadding.take(rowIndices, axis: 0)
-        rowMetaStates = rows.compactMap { row in
-            row < rowMetaStates.count ? rowMetaStates[row] : nil
+        rowMetaStates = rows.map { row in
+            row < rowMetaStates.count ? rowMetaStates[row] : []
         }
 
         guard case .sequence(let sequenceAxis) = layout else { return }
@@ -404,6 +419,11 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             return .sequence(axis: ranks[0] - 2)
         }
         return .batchState
+    }
+
+    private static func isKnownRotatingCache(_ cacheType: String) -> Bool {
+        cacheType.localizedCaseInsensitiveContains("rotating")
+            || cacheType.localizedCaseInsensitiveContains("circular")
     }
 
     private static func sequenceLength(

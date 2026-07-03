@@ -42,7 +42,11 @@ public final class MLXServeEngine: @unchecked Sendable {
             _ = try await scheduler.step()
         }
 
-        return await scheduler.collectedTokens()
+        var result: [String: [Int]] = [:]
+        for request in requests {
+            result[request.uid] = await scheduler.consumeTokens(for: request.uid)
+        }
+        return result
     }
 
     public func stream(_ request: Request) -> AsyncThrowingStream<Response, Error> {
@@ -63,7 +67,7 @@ public final class MLXServeEngine: @unchecked Sendable {
     }
 
     public func tokens(for uid: String) async -> [Int] {
-        await scheduler.collectedTokens()[uid, default: []]
+        await scheduler.tokens(for: uid)
     }
 
     public var isIdle: Bool {
@@ -76,6 +80,7 @@ public final class MLXServeEngine: @unchecked Sendable {
 private actor EngineStreamDemux {
     private let scheduler: Scheduler
     private var continuations: [String: AsyncThrowingStream<Response, Error>.Continuation] = [:]
+    private var registeringUIDs: Set<String> = []
     private var pumpTask: Task<Void, Never>?
 
     init(scheduler: Scheduler) {
@@ -86,17 +91,21 @@ private actor EngineStreamDemux {
         _ request: Request,
         continuation: AsyncThrowingStream<Response, Error>.Continuation
     ) async {
+        registeringUIDs.insert(request.uid)
         do {
             try await scheduler.submit(request)
+            registeringUIDs.remove(request.uid)
             continuations[request.uid] = continuation
             startPumpIfNeeded()
         } catch {
+            registeringUIDs.remove(request.uid)
             continuation.finish(throwing: error)
         }
     }
 
     func cancel(uid: String) async {
         continuations.removeValue(forKey: uid)
+        registeringUIDs.remove(uid)
         await scheduler.cancel(uid: uid)
     }
 
@@ -109,25 +118,41 @@ private actor EngineStreamDemux {
 
     private func pump() async {
         do {
-            while await !scheduler.isIdle {
+            while true {
                 let responses = try await scheduler.step()
                 for response in responses {
-                    deliver(response)
+                    await deliver(response)
+                }
+                if responses.isEmpty {
+                    let idle = await scheduler.isIdle
+                    if idle {
+                        if continuations.isEmpty && registeringUIDs.isEmpty {
+                            break
+                        }
+                        if registeringUIDs.isEmpty {
+                            finishRemaining()
+                            break
+                        }
+                    }
+                    await Task.yield()
                 }
             }
-            finishRemaining()
         } catch {
             finishAll(throwing: error)
         }
         pumpTask = nil
+        if !continuations.isEmpty || !registeringUIDs.isEmpty {
+            startPumpIfNeeded()
+        }
     }
 
-    private func deliver(_ response: Response) {
+    private func deliver(_ response: Response) async {
         guard let continuation = continuations[response.uid] else { return }
         continuation.yield(response)
         if response.finishReason != nil {
             continuation.finish()
             continuations.removeValue(forKey: response.uid)
+            await scheduler.discardResponses(for: response.uid)
         }
     }
 
