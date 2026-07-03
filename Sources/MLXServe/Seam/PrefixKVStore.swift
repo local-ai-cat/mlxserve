@@ -65,7 +65,7 @@ public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
             throw PrefixKVStoreError.invalidHit
         }
 
-        return prefixCache.reconstructCache(from: rawHit).map { layerCache in
+        return try prefixCache.reconstructCache(from: rawHit).map { layerCache in
             SerializedKVLayer(
                 state: layerCache.state,
                 metaState: layerCache.metaState,
@@ -78,7 +78,7 @@ public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
         let layerCaches = try cache.map { layer in
             try Self.cache(from: layer)
         }
-        prefixCache.storeCache(tokens: tokens, cache: layerCaches)
+        try prefixCache.storeCache(tokens: tokens, cache: layerCaches)
         storeCount += 1
     }
 

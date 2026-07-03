@@ -33,7 +33,7 @@ public struct Response: Sendable, Equatable {
 
 public final class StaticBatchGenerator {
     private let model: any LanguageModel
-    private var cache: [BatchKVCache]
+    private var cache: [BatchLayerCache]
     private var currentTokens: MLXArray
     private var currentLogits: MLXArray
     private var state: LMOutput.State?
@@ -72,12 +72,12 @@ public final class StaticBatchGenerator {
             rowCaches.append(cache)
         }
 
-        cache = (0 ..< rowCaches[0].count).map { layer in
-            BatchKVCache.merge(rowCaches.map { $0[layer] })
+        cache = try (0 ..< rowCaches[0].count).map { layer in
+            try BatchLayerCache.merge(rowCaches.map { $0[layer] })
         }
         currentTokens = concatenated(firstTokens, axis: 0)
         currentLogits = concatenated(firstLogits, axis: 0)
-        eval(currentTokens, currentLogits, cache)
+        eval(currentTokens, currentLogits, cache.map(\.kvCache))
     }
 
     public func next() -> BatchDecodeStep {
@@ -86,7 +86,7 @@ public final class StaticBatchGenerator {
 
         let output = model(
             LMInput.Text(tokens: currentTokens[0..., .newAxis]),
-            cache: cache,
+            cache: cache.map(\.kvCache),
             state: state
         )
         state = output.state
@@ -106,7 +106,7 @@ public final class StaticBatchGenerator {
 public final class ContinuousBatchGenerator {
     private let model: any LanguageModel
     private let parameters: GenerateParameters
-    private var cache: [BatchKVCache] = []
+    private var cache: [BatchLayerCache] = []
     private var currentTokens = MLXArray([Int32]())
     private var rowUIDs: [String] = []
     private var samplers: [SamplingParameters] = []
@@ -135,7 +135,7 @@ public final class ContinuousBatchGenerator {
         sampling: SamplingParameters
     ) throws {
         let prepared = try prefillWithLastTokenWithheld(input)
-        insert(uid: uid, cache: prepared.cache, lastToken: prepared.lastToken, sampling: sampling)
+        try insert(uid: uid, cache: prepared.cache, lastToken: prepared.lastToken, sampling: sampling)
     }
 
     public func insert(
@@ -143,26 +143,26 @@ public final class ContinuousBatchGenerator {
         cache rowCache: [any KVCache],
         lastToken: MLXArray,
         sampling: SamplingParameters
-    ) {
+    ) throws {
         precondition(!rowUIDs.contains(uid), "duplicate batch uid '\(uid)'")
         precondition(!rowCache.isEmpty, "continuous batching requires a non-empty KV cache")
 
         if cache.isEmpty {
-            cache = (0 ..< rowCache.count).map { layer in
-                BatchKVCache.merge([rowCache[layer]])
+            cache = try (0 ..< rowCache.count).map { layer in
+                try BatchLayerCache.merge([rowCache[layer]])
             }
             currentTokens = lastToken.reshaped([1])
         } else {
             precondition(cache.count == rowCache.count, "inserted row cache layer count changed")
             for layer in 0 ..< cache.count {
-                cache[layer].insert(rowCache[layer])
+                try cache[layer].insert(rowCache[layer])
             }
             currentTokens = concatenated([currentTokens, lastToken.reshaped([1])], axis: 0)
         }
 
         rowUIDs.append(uid)
         samplers.append(sampling)
-        eval(currentTokens, cache)
+        eval(currentTokens, cache.map(\.kvCache))
     }
 
     public func remove(uid: String) {
@@ -192,7 +192,7 @@ public final class ContinuousBatchGenerator {
         currentTokens = currentTokens.take(rowIndices, axis: 0)
         rowUIDs = rows.map { rowUIDs[$0] }
         samplers = rows.map { samplers[$0] }
-        eval(currentTokens, cache)
+        eval(currentTokens, cache.map(\.kvCache))
     }
 
     public func next() -> [Response] {
@@ -200,7 +200,7 @@ public final class ContinuousBatchGenerator {
 
         let output = model(
             LMInput.Text(tokens: currentTokens[0..., .newAxis]),
-            cache: cache,
+            cache: cache.map(\.kvCache),
             state: state
         )
         state = output.state

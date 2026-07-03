@@ -128,7 +128,7 @@ public actor Scheduler {
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
             let request = waiting.removeFirst()
             let prepared = try prepareForInsert(request)
-            generator.insert(
+            try generator.insert(
                 uid: request.uid,
                 cache: prepared.cache,
                 lastToken: prepared.lastToken,

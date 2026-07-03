@@ -1,15 +1,66 @@
+import Foundation
 import MLX
 import MLXLMCommon
+
+public enum BatchKVCacheError: Error, Equatable, CustomStringConvertible {
+    case emptyMerge
+    case emptyState(cacheType: String)
+    case inconsistentStateCount(expected: Int, actual: Int, cacheType: String)
+    case unsupportedSequenceState(cacheType: String, stateShapes: [[Int]])
+    case incompatibleStateShape(cacheType: String, stateIndex: Int, expected: [Int], actual: [Int])
+    case incompatibleLayout(expected: String, actual: String)
+    case unsupportedStateMutation(layout: String, stateCount: Int)
+    case invalidMetadata([String])
+
+    public var description: String {
+        switch self {
+        case .emptyMerge:
+            return "BatchKVCache.merge requires at least one cache."
+        case .emptyState(let cacheType):
+            return "BatchKVCache cannot merge empty cache state for \(cacheType)."
+        case .inconsistentStateCount(let expected, let actual, let cacheType):
+            return "BatchKVCache cannot merge \(cacheType): expected \(expected) state arrays, found \(actual)."
+        case .unsupportedSequenceState(let cacheType, let stateShapes):
+            return "BatchKVCache cannot treat \(cacheType) as sequence KV cache; state shapes are \(stateShapes)."
+        case .incompatibleStateShape(let cacheType, let stateIndex, let expected, let actual):
+            return "BatchKVCache cannot merge \(cacheType) state \(stateIndex): expected shape compatible with \(expected), found \(actual)."
+        case .incompatibleLayout(let expected, let actual):
+            return "BatchKVCache cannot combine \(actual) cache layout with existing \(expected) layout."
+        case .unsupportedStateMutation(let layout, let stateCount):
+            return "BatchKVCache cannot set \(stateCount) state arrays on \(layout) layout."
+        case .invalidMetadata(let metadata):
+            return "BatchKVCache metadata is invalid: \(metadata)."
+        }
+    }
+}
 
 public final class BatchKVCache: KVCache, BatchPositionedKVCache {
     public private(set) var leftPadding: MLXArray
     public private(set) var idx: Int
     public var offset: Int { idx }
     public var maxSize: Int? { nil }
-    public var isTrimmable: Bool { true }
+    public var isTrimmable: Bool {
+        if case .sequence = layout { return true }
+        return false
+    }
 
-    private var keys: MLXArray?
-    private var values: MLXArray?
+    private enum Layout: Equatable {
+        case sequence(axis: Int)
+        case batchState
+
+        var description: String {
+            switch self {
+            case .sequence(let axis):
+                return "sequence(axis: \(axis))"
+            case .batchState:
+                return "batchState"
+            }
+        }
+    }
+
+    private var buffers: [MLXArray] = []
+    private var rowMetaStates: [[String]] = []
+    private var layout: Layout
     private let step: Int
 
     public var batchSize: Int {
@@ -20,6 +71,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         self.leftPadding = MLXArray(leftPadding.map(Int32.init))
         self.idx = idx
         self.step = step
+        self.layout = .sequence(axis: 2)
     }
 
     public var batchOffset: MLXArray {
@@ -27,156 +79,191 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
     }
 
     public func innerState() -> [MLXArray] {
-        [keys, values].compactMap { $0 }
+        state
     }
 
-    public static func merge(_ caches: [any KVCache]) -> BatchKVCache {
-        precondition(!caches.isEmpty, "BatchKVCache.merge requires at least one cache")
+    public static func merge(_ caches: [any KVCache]) throws -> BatchKVCache {
+        guard !caches.isEmpty else {
+            throw BatchKVCacheError.emptyMerge
+        }
 
         let states = caches.map(\.state)
-        let lengths = states.map { state in
-            precondition(state.count == 2, "BatchKVCache.merge supports KVCache state only")
-            return state[0].dim(2)
-        }
-        let maxLength = lengths.max() ?? 0
-        let padding = lengths.map { maxLength - $0 }
-        let firstState = states[0]
-
-        let batchSize = caches.count
-        let keyShape = firstState[0].shape
-        let valueShape = firstState[1].shape
-        let batchKeys = MLXArray.zeros(
-            [batchSize, keyShape[1], maxLength, keyShape[3]],
-            dtype: firstState[0].dtype
-        )
-        let batchValues = MLXArray.zeros(
-            [batchSize, valueShape[1], maxLength, valueShape[3]],
-            dtype: firstState[1].dtype
-        )
-
-        for (row, state) in states.enumerated() {
-            let length = lengths[row]
-            let start = padding[row]
-            batchKeys[row ..< row + 1, 0..., start ..< start + length, 0...] = state[0]
-            batchValues[row ..< row + 1, 0..., start ..< start + length, 0...] = state[1]
+        let cacheTypes = caches.map { String(describing: type(of: $0)) }
+        guard let firstState = states.first, !firstState.isEmpty else {
+            throw BatchKVCacheError.emptyState(cacheType: cacheTypes.first ?? "unknown")
         }
 
-        let cache = BatchKVCache(leftPadding: padding, idx: maxLength)
-        cache.keys = batchKeys
-        cache.values = batchValues
-        return cache
+        for (state, cacheType) in zip(states, cacheTypes) where state.count != firstState.count {
+            throw BatchKVCacheError.inconsistentStateCount(
+                expected: firstState.count,
+                actual: state.count,
+                cacheType: cacheType
+            )
+        }
+
+        let layout = try inferLayout(cacheType: cacheTypes[0], state: firstState)
+        switch layout {
+        case .sequence(let sequenceAxis):
+            return try mergeSequenceCaches(
+                states: states,
+                cacheTypes: cacheTypes,
+                sequenceAxis: sequenceAxis,
+                rowMetaStates: caches.map(\.metaState)
+            )
+        case .batchState:
+            throw BatchKVCacheError.unsupportedSequenceState(
+                cacheType: cacheTypes[0],
+                stateShapes: firstState.map(\.shape)
+            )
+        }
     }
 
     public func extract(_ row: Int) -> KVCacheSimple {
-        let padding = leftPadding.asArray(Int.self)[row]
         let cache = KVCacheSimple()
-        guard let keys, let values else { return cache }
-        cache.state = [
-            keys[row ..< row + 1, 0..., padding ..< idx, 0...],
-            values[row ..< row + 1, 0..., padding ..< idx, 0...],
-        ]
+        guard row >= 0, row < batchSize else { return cache }
+
+        switch layout {
+        case .sequence(let sequenceAxis):
+            let padding = leftPadding.asArray(Int.self)[row]
+            cache.state = buffers.map {
+                Self.slice($0, row: row, sequenceAxis: sequenceAxis, range: padding ..< idx)
+            }
+        case .batchState:
+            cache.state = buffers.map { Self.sliceRow($0, row: row) }
+        }
+        if row < rowMetaStates.count {
+            cache.metaState = rowMetaStates[row]
+        }
         return cache
     }
 
     public func filter(keeping rows: [Int]) {
         guard !rows.isEmpty else {
-            keys = nil
-            values = nil
+            buffers.removeAll()
+            rowMetaStates.removeAll()
             leftPadding = MLXArray([Int32]())
             idx = 0
             return
         }
 
         let rowIndices = MLXArray(rows.map(Int32.init))
-        keys = keys?.take(rowIndices, axis: 0)
-        values = values?.take(rowIndices, axis: 0)
+        buffers = buffers.map { $0.take(rowIndices, axis: 0) }
         leftPadding = leftPadding.take(rowIndices, axis: 0)
+        rowMetaStates = rows.compactMap { row in
+            row < rowMetaStates.count ? rowMetaStates[row] : nil
+        }
+
+        guard case .sequence(let sequenceAxis) = layout else { return }
 
         let minLeftPadding = leftPadding.min().item(Int.self)
         guard minLeftPadding > 0 else { return }
 
-        if let currentKeys = keys, let currentValues = values {
-            keys = currentKeys[0..., 0..., minLeftPadding ..< idx, 0...]
-            values = currentValues[0..., 0..., minLeftPadding ..< idx, 0...]
+        buffers = buffers.map {
+            Self.slice($0, sequenceAxis: sequenceAxis, range: minLeftPadding ..< idx)
         }
         idx -= minLeftPadding
         leftPadding = leftPadding - MLXArray(Int32(minLeftPadding))
     }
 
-    public func insert(_ cache: any KVCache) {
-        extend([cache])
+    public func insert(_ cache: any KVCache) throws {
+        try extend([cache])
     }
 
-    public func extend(_ caches: [any KVCache]) {
+    public func extend(_ caches: [any KVCache]) throws {
         guard !caches.isEmpty else { return }
-        extend(BatchKVCache.merge(caches))
+        try extend(BatchKVCache.merge(caches))
     }
 
-    public func extend(_ other: BatchKVCache) {
+    public func extend(_ other: BatchKVCache) throws {
         guard other.batchSize > 0 else { return }
-        guard batchSize > 0 else {
+        guard layout == other.layout else {
+            throw BatchKVCacheError.incompatibleLayout(
+                expected: layout.description,
+                actual: other.layout.description
+            )
+        }
+        guard batchSize > 0, !buffers.isEmpty else {
             state = other.state
             leftPadding = other.leftPadding
+            rowMetaStates = other.rowMetaStates
             idx = other.idx
+            layout = other.layout
             return
         }
-        guard let currentKeys = keys, let currentValues = values else {
-            state = other.state
-            leftPadding = other.leftPadding
-            idx = other.idx
-            return
+
+        switch layout {
+        case .sequence(let sequenceAxis):
+            let targetIdx = max(idx, other.idx)
+            let normalizedCurrent = normalize(
+                buffers: buffers.map { Self.slice($0, sequenceAxis: sequenceAxis, range: ..<idx) },
+                leftPadding: leftPadding,
+                from: idx,
+                to: targetIdx,
+                sequenceAxis: sequenceAxis
+            )
+            let normalizedOther = normalize(
+                buffers: other.buffers.map { Self.slice($0, sequenceAxis: sequenceAxis, range: ..<other.idx) },
+                leftPadding: other.leftPadding,
+                from: other.idx,
+                to: targetIdx,
+                sequenceAxis: sequenceAxis
+            )
+
+            buffers = zip(normalizedCurrent.buffers, normalizedOther.buffers).map {
+                concatenated([$0, $1], axis: 0)
+            }
+            leftPadding = concatenated([normalizedCurrent.leftPadding, normalizedOther.leftPadding], axis: 0)
+            idx = targetIdx
+        case .batchState:
+            buffers = zip(buffers, other.buffers).map { concatenated([$0, $1], axis: 0) }
+            leftPadding = concatenated([leftPadding, other.leftPadding], axis: 0)
         }
-        guard let otherKeys = other.keys, let otherValues = other.values else { return }
 
-        let targetIdx = max(idx, other.idx)
-        let normalizedCurrent = normalize(
-            keys: currentKeys[0..., 0..., ..<idx, 0...],
-            values: currentValues[0..., 0..., ..<idx, 0...],
-            leftPadding: leftPadding,
-            from: idx,
-            to: targetIdx
-        )
-        let normalizedOther = normalize(
-            keys: otherKeys[0..., 0..., ..<other.idx, 0...],
-            values: otherValues[0..., 0..., ..<other.idx, 0...],
-            leftPadding: other.leftPadding,
-            from: other.idx,
-            to: targetIdx
-        )
-
-        keys = concatenated([normalizedCurrent.keys, normalizedOther.keys], axis: 0)
-        values = concatenated([normalizedCurrent.values, normalizedOther.values], axis: 0)
-        leftPadding = concatenated([normalizedCurrent.leftPadding, normalizedOther.leftPadding], axis: 0)
-        idx = targetIdx
+        rowMetaStates.append(contentsOf: other.rowMetaStates)
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
-        let previous = idx
-        ensureCapacity(keys: newKeys, values: newValues)
-        idx += newKeys.dim(2)
+        switch layout {
+        case .sequence(let sequenceAxis):
+            let previous = idx
+            ensureCapacity(keys: newKeys, values: newValues, sequenceAxis: sequenceAxis)
+            idx += newKeys.dim(sequenceAxis)
 
-        keys![0..., 0..., previous ..< idx, 0...] = newKeys
-        values![0..., 0..., previous ..< idx, 0...] = newValues
+            buffers[0][Self.indices(sequenceAxis: sequenceAxis, range: previous ..< idx, rank: buffers[0].shape.count)] = newKeys
+            buffers[1][Self.indices(sequenceAxis: sequenceAxis, range: previous ..< idx, rank: buffers[1].shape.count)] = newValues
 
-        return (
-            keys![0..., 0..., ..<idx, 0...],
-            values![0..., 0..., ..<idx, 0...]
-        )
+            return (
+                Self.slice(buffers[0], sequenceAxis: sequenceAxis, range: ..<idx),
+                Self.slice(buffers[1], sequenceAxis: sequenceAxis, range: ..<idx)
+            )
+        case .batchState:
+            buffers = [newKeys, newValues]
+            leftPadding = MLXArray(Array(repeating: Int32(0), count: newKeys.dim(0)))
+            return (newKeys, newValues)
+        }
     }
 
     public var state: [MLXArray] {
         get {
-            guard let keys, let values else { return [] }
-            return [
-                keys[0..., 0..., ..<idx, 0...],
-                values[0..., 0..., ..<idx, 0...],
-            ]
+            switch layout {
+            case .sequence(let sequenceAxis):
+                return buffers.map { Self.slice($0, sequenceAxis: sequenceAxis, range: ..<idx) }
+            case .batchState:
+                return buffers
+            }
         }
         set {
-            precondition(newValue.count == 2, "BatchKVCache state must contain keys and values")
-            keys = newValue[0]
-            values = newValue[1]
-            idx = newValue[0].dim(2)
+            if case .sequence(let sequenceAxis) = layout {
+                guard newValue.count == 2 else {
+                    return
+                }
+                buffers = newValue
+                idx = newValue[0].dim(sequenceAxis)
+                leftPadding = MLXArray(Array(repeating: Int32(0), count: newValue[0].dim(0)))
+            } else {
+                buffers = newValue
+                leftPadding = MLXArray(Array(repeating: Int32(0), count: newValue.first?.dim(0) ?? 0))
+            }
         }
     }
 
@@ -185,10 +272,11 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             [
                 String(idx),
                 leftPadding.asArray(Int.self).map(String.init).joined(separator: ","),
+                layout.description,
             ]
         }
         set {
-            precondition(newValue.count == 2, "BatchKVCache metaState must contain idx and leftPadding")
+            guard newValue.count >= 2 else { return }
             idx = Int(newValue[0]) ?? 0
             let padding = newValue[1].split(separator: ",").compactMap { Int($0) }
             leftPadding = MLXArray(padding.map(Int32.init))
@@ -200,6 +288,9 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         windowSize: Int?,
         returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        guard case .sequence = layout else {
+            return .none
+        }
         guard let mask = CausalMask.create(
             n: n,
             offset: idx,
@@ -209,14 +300,15 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             return .none
         }
         var additiveMask = MLX.where(mask, MLXArray(Float(0)), MLXArray(Float(-1e9)))
-        if let keys {
-            additiveMask = additiveMask.asType(keys.dtype)
+        if let dtype = buffers.first?.dtype {
+            additiveMask = additiveMask.asType(dtype)
         }
         return .array(additiveMask)
     }
 
     @discardableResult
     public func trim(_ n: Int) -> Int {
+        guard case .sequence = layout else { return 0 }
         let trimmed = min(idx, n)
         idx -= trimmed
         return trimmed
@@ -224,66 +316,222 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
 
     public func copy() -> any KVCache {
         let copy = BatchKVCache(leftPadding: leftPadding.asArray(Int.self), idx: idx, step: step)
-        let currentState = state
-        if !currentState.isEmpty {
-            copy.state = currentState.map { $0[.ellipsis] }
-        }
+        copy.layout = layout
+        copy.buffers = buffers.map { $0[.ellipsis] }
+        copy.rowMetaStates = rowMetaStates
         return copy
     }
 
-    private func ensureCapacity(keys newKeys: MLXArray, values newValues: MLXArray) {
-        guard let currentKeys = keys, let currentValues = values else {
-            let nSteps = (step + newKeys.dim(2) - 1) / step
-            keys = MLXArray.zeros(
-                [newKeys.dim(0), newKeys.dim(1), nSteps * step, newKeys.dim(3)],
-                dtype: newKeys.dtype
+    private static func mergeSequenceCaches(
+        states: [[MLXArray]],
+        cacheTypes: [String],
+        sequenceAxis: Int,
+        rowMetaStates: [[String]]
+    ) throws -> BatchKVCache {
+        let lengths = try states.map { state in
+            try sequenceLength(cacheType: cacheTypes[0], state: state, sequenceAxis: sequenceAxis)
+        }
+        let maxLength = lengths.max() ?? 0
+        let padding = lengths.map { maxLength - $0 }
+        let batchSize = states.count
+        let firstState = states[0]
+
+        var batchBuffers: [MLXArray] = []
+        for (stateIndex, firstArray) in firstState.enumerated() {
+            var batchShape = firstArray.shape
+            batchShape[0] = batchSize
+            batchShape[sequenceAxis] = maxLength
+            batchBuffers.append(MLXArray.zeros(batchShape, dtype: firstArray.dtype))
+
+            for (row, state) in states.enumerated() {
+                let array = state[stateIndex]
+                try validateCompatibleShape(
+                    cacheType: cacheTypes[row],
+                    stateIndex: stateIndex,
+                    expected: firstArray.shape,
+                    actual: array.shape,
+                    flexibleAxes: [0, sequenceAxis]
+                )
+                batchBuffers[stateIndex][indices(row: row, sequenceAxis: sequenceAxis, range: padding[row] ..< padding[row] + lengths[row], rank: array.shape.count)] = array
+            }
+        }
+
+        let cache = BatchKVCache(leftPadding: padding, idx: maxLength)
+        cache.layout = .sequence(axis: sequenceAxis)
+        cache.buffers = batchBuffers
+        cache.rowMetaStates = rowMetaStates
+        return cache
+    }
+
+    private static func mergeBatchStateCaches(
+        states: [[MLXArray]],
+        cacheTypes: [String],
+        rowMetaStates: [[String]]
+    ) throws -> BatchKVCache {
+        let firstState = states[0]
+        var batchBuffers: [MLXArray] = []
+        for stateIndex in firstState.indices {
+            let firstArray = firstState[stateIndex]
+            for row in states.indices {
+                try validateCompatibleShape(
+                    cacheType: cacheTypes[row],
+                    stateIndex: stateIndex,
+                    expected: firstArray.shape,
+                    actual: states[row][stateIndex].shape,
+                    flexibleAxes: [0]
+                )
+            }
+            batchBuffers.append(concatenated(states.map { $0[stateIndex] }, axis: 0))
+        }
+
+        let cache = BatchKVCache(leftPadding: Array(repeating: 0, count: states.count), idx: 0)
+        cache.layout = .batchState
+        cache.buffers = batchBuffers
+        cache.rowMetaStates = rowMetaStates
+        return cache
+    }
+
+    private static func inferLayout(cacheType: String, state: [MLXArray]) throws -> Layout {
+        guard state.count == 2 else {
+            throw BatchKVCacheError.unsupportedSequenceState(
+                cacheType: cacheType,
+                stateShapes: state.map(\.shape)
             )
-            values = MLXArray.zeros(
-                [newValues.dim(0), newValues.dim(1), nSteps * step, newValues.dim(3)],
-                dtype: newValues.dtype
+        }
+
+        let ranks = state.map { $0.shape.count }
+        if ranks[0] == ranks[1], ranks[0] >= 3 {
+            return .sequence(axis: ranks[0] - 2)
+        }
+        return .batchState
+    }
+
+    private static func sequenceLength(
+        cacheType: String,
+        state: [MLXArray],
+        sequenceAxis: Int
+    ) throws -> Int {
+        let lengths = state.map { $0.dim(sequenceAxis) }
+        guard let firstLength = lengths.first, lengths.allSatisfy({ $0 == firstLength }) else {
+            throw BatchKVCacheError.unsupportedSequenceState(
+                cacheType: cacheType,
+                stateShapes: state.map(\.shape)
             )
+        }
+        return firstLength
+    }
+
+    private static func validateCompatibleShape(
+        cacheType: String,
+        stateIndex: Int,
+        expected: [Int],
+        actual: [Int],
+        flexibleAxes: Set<Int>
+    ) throws {
+        guard expected.count == actual.count else {
+            throw BatchKVCacheError.incompatibleStateShape(
+                cacheType: cacheType,
+                stateIndex: stateIndex,
+                expected: expected,
+                actual: actual
+            )
+        }
+        for axis in expected.indices where !flexibleAxes.contains(axis) && expected[axis] != actual[axis] {
+            throw BatchKVCacheError.incompatibleStateShape(
+                cacheType: cacheType,
+                stateIndex: stateIndex,
+                expected: expected,
+                actual: actual
+            )
+        }
+    }
+
+    private func ensureCapacity(keys newKeys: MLXArray, values newValues: MLXArray, sequenceAxis: Int) {
+        guard !buffers.isEmpty else {
+            buffers = [
+                Self.capacityBuffer(for: newKeys, sequenceAxis: sequenceAxis, step: step),
+                Self.capacityBuffer(for: newValues, sequenceAxis: sequenceAxis, step: step),
+            ]
             return
         }
 
-        guard idx + newKeys.dim(2) > currentKeys.dim(2) else { return }
+        guard idx + newKeys.dim(sequenceAxis) > buffers[0].dim(sequenceAxis) else { return }
 
-        let nSteps = (step + newKeys.dim(2) - 1) / step
-        let keyExtension = MLXArray.zeros(
-            [newKeys.dim(0), newKeys.dim(1), nSteps * step, newKeys.dim(3)],
-            dtype: newKeys.dtype
-        )
-        let valueExtension = MLXArray.zeros(
-            [newValues.dim(0), newValues.dim(1), nSteps * step, newValues.dim(3)],
-            dtype: newValues.dtype
-        )
-        keys = concatenated([currentKeys, keyExtension], axis: 2)
-        values = concatenated([currentValues, valueExtension], axis: 2)
+        let keyExtension = Self.capacityBuffer(for: newKeys, sequenceAxis: sequenceAxis, step: step)
+        let valueExtension = Self.capacityBuffer(for: newValues, sequenceAxis: sequenceAxis, step: step)
+        buffers[0] = concatenated([buffers[0], keyExtension], axis: sequenceAxis)
+        buffers[1] = concatenated([buffers[1], valueExtension], axis: sequenceAxis)
+    }
+
+    private static func capacityBuffer(for array: MLXArray, sequenceAxis: Int, step: Int) -> MLXArray {
+        let nSteps = (step + array.dim(sequenceAxis) - 1) / step
+        var shape = array.shape
+        shape[sequenceAxis] = nSteps * step
+        return MLXArray.zeros(shape, dtype: array.dtype)
     }
 
     private func normalize(
-        keys inputKeys: MLXArray,
-        values inputValues: MLXArray,
+        buffers inputBuffers: [MLXArray],
         leftPadding inputLeftPadding: MLXArray,
         from currentIdx: Int,
-        to targetIdx: Int
-    ) -> (keys: MLXArray, values: MLXArray, leftPadding: MLXArray) {
+        to targetIdx: Int,
+        sequenceAxis: Int
+    ) -> (buffers: [MLXArray], leftPadding: MLXArray) {
         let delta = targetIdx - currentIdx
         guard delta > 0 else {
-            return (inputKeys, inputValues, inputLeftPadding)
+            return (inputBuffers, inputLeftPadding)
         }
 
-        let keyPadding = MLXArray.zeros(
-            [inputKeys.dim(0), inputKeys.dim(1), delta, inputKeys.dim(3)],
-            dtype: inputKeys.dtype
-        )
-        let valuePadding = MLXArray.zeros(
-            [inputValues.dim(0), inputValues.dim(1), delta, inputValues.dim(3)],
-            dtype: inputValues.dtype
-        )
+        let normalizedBuffers = inputBuffers.map { input in
+            var shape = input.shape
+            shape[sequenceAxis] = delta
+            let padding = MLXArray.zeros(shape, dtype: input.dtype)
+            return concatenated([padding, input], axis: sequenceAxis)
+        }
         return (
-            concatenated([keyPadding, inputKeys], axis: 2),
-            concatenated([valuePadding, inputValues], axis: 2),
+            normalizedBuffers,
             inputLeftPadding + MLXArray(Int32(delta))
         )
+    }
+
+    private static func sliceRow(_ array: MLXArray, row: Int) -> MLXArray {
+        array[indices(row: row, rank: array.shape.count)]
+    }
+
+    private static func slice(_ array: MLXArray, row: Int, sequenceAxis: Int, range: Range<Int>) -> MLXArray {
+        array[indices(row: row, sequenceAxis: sequenceAxis, range: range, rank: array.shape.count)]
+    }
+
+    private static func slice(_ array: MLXArray, sequenceAxis: Int, range: Range<Int>) -> MLXArray {
+        array[indices(sequenceAxis: sequenceAxis, range: range, rank: array.shape.count)]
+    }
+
+    private static func slice(_ array: MLXArray, sequenceAxis: Int, range: PartialRangeUpTo<Int>) -> MLXArray {
+        array[indices(sequenceAxis: sequenceAxis, range: range, rank: array.shape.count)]
+    }
+
+    private static func indices(row: Int, rank: Int) -> [any MLXArrayIndex] {
+        var result: [any MLXArrayIndex] = Array(repeating: 0..., count: rank)
+        result[0] = row ..< row + 1
+        return result
+    }
+
+    private static func indices(sequenceAxis: Int, range: Range<Int>, rank: Int) -> [any MLXArrayIndex] {
+        var result: [any MLXArrayIndex] = Array(repeating: 0..., count: rank)
+        result[sequenceAxis] = range
+        return result
+    }
+
+    private static func indices(sequenceAxis: Int, range: PartialRangeUpTo<Int>, rank: Int) -> [any MLXArrayIndex] {
+        var result: [any MLXArrayIndex] = Array(repeating: 0..., count: rank)
+        result[sequenceAxis] = range
+        return result
+    }
+
+    private static func indices(row: Int, sequenceAxis: Int, range: Range<Int>, rank: Int) -> [any MLXArrayIndex] {
+        var result: [any MLXArrayIndex] = Array(repeating: 0..., count: rank)
+        result[0] = row ..< row + 1
+        result[sequenceAxis] = range
+        return result
     }
 }

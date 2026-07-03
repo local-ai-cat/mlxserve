@@ -51,13 +51,18 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
         )
     }
 
-    public func reconstructCache(from hit: PrefixCacheHit) -> [KVCacheSimple] {
+    public func reconstructCache(from hit: PrefixCacheHit) throws -> [KVCacheSimple] {
         let payloads = hit.table.blockIDs.compactMap { manager.payload(for: $0) }
         guard let firstPayload = payloads.first else { return [] }
 
-        return (0 ..< firstPayload.layers.count).map { layerIndex in
-            let keys = concatenated(payloads.map { $0.layers[layerIndex].keys }, axis: 2)
-            let values = concatenated(payloads.map { $0.layers[layerIndex].values }, axis: 2)
+        return try (0 ..< firstPayload.layers.count).map { layerIndex in
+            let firstLayer = firstPayload.layers[layerIndex]
+            let sequenceAxis = try Self.sequenceAxis(
+                cacheType: firstLayer.className,
+                state: [firstLayer.keys, firstLayer.values]
+            )
+            let keys = concatenated(payloads.map { $0.layers[layerIndex].keys }, axis: sequenceAxis)
+            let values = concatenated(payloads.map { $0.layers[layerIndex].values }, axis: sequenceAxis)
             let cache = KVCacheSimple()
             cache.state = [keys, values]
             return cache
@@ -65,7 +70,7 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
     }
 
     @discardableResult
-    public func storeCache(tokens: [Int], cache: [any KVCache]) -> BlockTable {
+    public func storeCache(tokens: [Int], cache: [any KVCache]) throws -> BlockTable {
         let fullBlockCount = tokens.count / blockSize
         guard fullBlockCount > 0 else { return BlockTable() }
 
@@ -85,7 +90,7 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
                 continue
             }
 
-            let payload = payloadForBlock(
+            let payload = try payloadForBlock(
                 cache: cache,
                 tokenStart: blockIndex * blockSize,
                 tokenEnd: (blockIndex + 1) * blockSize
@@ -113,12 +118,15 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
         cache: [any KVCache],
         tokenStart: Int,
         tokenEnd: Int
-    ) -> KVCacheBlockPayload {
-        let layers = cache.enumerated().map { _, layerCache in
+    ) throws -> KVCacheBlockPayload {
+        let layers = try cache.enumerated().map { _, layerCache in
             let state = layerCache.state
-            precondition(state.count == 2, "M3 supports KVCache family only")
-            let keys = state[0][0..., 0..., tokenStart ..< tokenEnd, 0...]
-            let values = state[1][0..., 0..., tokenStart ..< tokenEnd, 0...]
+            let sequenceAxis = try Self.sequenceAxis(
+                cacheType: String(describing: type(of: layerCache)),
+                state: state
+            )
+            let keys = state[0][Self.indices(sequenceAxis: sequenceAxis, range: tokenStart ..< tokenEnd, rank: state[0].shape.count)]
+            let values = state[1][Self.indices(sequenceAxis: sequenceAxis, range: tokenStart ..< tokenEnd, rank: state[1].shape.count)]
             return CacheLayerBlockPayload(
                 keys: keys,
                 values: values,
@@ -129,5 +137,46 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
             )
         }
         return KVCacheBlockPayload(layers: layers)
+    }
+
+    private static func sequenceAxis(cacheType: String, state: [MLXArray]) throws -> Int {
+        guard state.count == 2 else {
+            throw PrefixCacheError.unsupportedCacheLayout(
+                cacheType: cacheType,
+                stateShapes: state.map(\.shape)
+            )
+        }
+        let ranks = state.map { $0.shape.count }
+        guard ranks[0] == ranks[1], ranks[0] >= 3 else {
+            throw PrefixCacheError.unsupportedCacheLayout(
+                cacheType: cacheType,
+                stateShapes: state.map(\.shape)
+            )
+        }
+        let sequenceAxis = ranks[0] - 2
+        guard state[0].dim(sequenceAxis) == state[1].dim(sequenceAxis) else {
+            throw PrefixCacheError.unsupportedCacheLayout(
+                cacheType: cacheType,
+                stateShapes: state.map(\.shape)
+            )
+        }
+        return sequenceAxis
+    }
+
+    private static func indices(sequenceAxis: Int, range: Range<Int>, rank: Int) -> [any MLXArrayIndex] {
+        var result: [any MLXArrayIndex] = Array(repeating: 0..., count: rank)
+        result[sequenceAxis] = range
+        return result
+    }
+}
+
+public enum PrefixCacheError: Error, Equatable, CustomStringConvertible {
+    case unsupportedCacheLayout(cacheType: String, stateShapes: [[Int]])
+
+    public var description: String {
+        switch self {
+        case .unsupportedCacheLayout(let cacheType, let stateShapes):
+            return "Prefix cache supports sequence KV state only; \(cacheType) has state shapes \(stateShapes)."
+        }
     }
 }

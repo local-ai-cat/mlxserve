@@ -137,7 +137,7 @@ final class TrackAPrefixCacheTests: XCTestCase {
 
         let prefix = prefill(model: model, tokens: prefixTokens, parameters: parameters)
         let prefixCache = BlockAwarePrefixCache(modelName: "Qwen3-0.6B-4bit", blockSize: blockSize)
-        let storedTable = prefixCache.storeCache(tokens: prefixTokens, cache: prefix.cache)
+        let storedTable = try prefixCache.storeCache(tokens: prefixTokens, cache: prefix.cache)
         XCTAssertEqual(storedTable.count, 1)
 
         let allocatedBaseline = prefixCache.manager.allocatedBlocks
@@ -268,7 +268,7 @@ final class TrackAPrefixCacheTests: XCTestCase {
             manager: warmManager
         )
         let prefix = prefill(model: model, tokens: prefixTokens, parameters: parameters)
-        let storedTable = warmCache.storeCache(tokens: prefixTokens, cache: prefix.cache)
+        let storedTable = try warmCache.storeCache(tokens: prefixTokens, cache: prefix.cache)
         XCTAssertEqual(storedTable.count, 1)
         try await warmManager.flushPendingWrites()
 
@@ -325,7 +325,7 @@ final class TrackAPrefixCacheTests: XCTestCase {
         }
         defer { prefixCache.release(hit) }
 
-        let reconstructedCache = prefixCache.reconstructCache(from: hit)
+        let reconstructedCache = try prefixCache.reconstructCache(from: hit)
         let reconstructedOutput = model(
             LMInput.Text(tokens: MLXArray(suffixTokens.map(Int32.init)))[text: .newAxis],
             cache: reconstructedCache,
