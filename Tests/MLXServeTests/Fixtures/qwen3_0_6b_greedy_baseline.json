@@ -1,0 +1,6 @@
+{
+  "model": "mlx-community/Qwen3-0.6B-4bit",
+  "prompt": "The capital of France is",
+  "maxTokens": 8,
+  "tokenIds": [151667, 198, 32313, 11, 279, 1196, 374, 10161]
+}

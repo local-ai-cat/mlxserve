@@ -5,7 +5,7 @@ import XCTest
 
 final class GateProbeTests: XCTestCase {
     func testG1BFloat16UInt16BitReinterpretRoundTrip() throws {
-        try requireMetalDevice()
+        try MLXMetalRuntime.requireAvailable()
 
         Device.withDefaultDevice(.cpu) {
             let raw = MLXArray([UInt16(0x3f80), UInt16(0x4000), UInt16(0xbf80)])
@@ -18,7 +18,7 @@ final class GateProbeTests: XCTestCase {
     }
 
     func testG2SafetensorsMetadataRoundTrip() throws {
-        try requireMetalDevice()
+        try MLXMetalRuntime.requireAvailable()
 
         try Device.withDefaultDevice(.cpu) {
             let url = FileManager.default.temporaryDirectory
@@ -41,12 +41,6 @@ final class GateProbeTests: XCTestCase {
             XCTAssertEqual(arrays["tensor"]?.asArray(Int32.self), [1, 2, 3])
             XCTAssertEqual(metadata["omlx_cache_format_version"], "3")
             XCTAssertEqual(metadata["block_hash"], "abc123")
-        }
-    }
-
-    private func requireMetalDevice() throws {
-        guard MTLCreateSystemDefaultDevice() != nil else {
-            throw XCTSkip("MLX probe skipped because no Metal device is visible to this process.")
         }
     }
 }

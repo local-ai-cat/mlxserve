@@ -173,17 +173,15 @@ Rotating/sliding-window family (+supersede-on-extend + boundary snapshots), MTP,
 
 ## Gate results
 
-Recorded 2026-07-03 during M0 scaffold work on branch `impl/native`.
-
-- **G1 — bf16 bit-reinterpret view: API FOUND, runtime probe SKIPPED in this process.** Exact mlx-swift API: `MLXArray.view(dtype:stream:)`, e.g. `rawUInt16.view(dtype: .bfloat16, stream: .cpu)` and `bfloat.view(dtype: .uint16, stream: .cpu)`. The committed probe is `GateProbeTests.testG1BFloat16UInt16BitReinterpretRoundTrip`.
-- **G2 — safetensors metadata: API FOUND, runtime probe SKIPPED in this process.** Exact mlx-swift API: `save(arrays:metadata:url:stream:)` and `loadArraysAndMetadata(url:stream:) -> ([String: MLXArray], [String: String])`. `MLXLMCommon.loadWeights` also uses `loadArraysAndMetadata(url:)` and passes the first safetensors metadata dictionary to `model.sanitize(weights:metadata:)`. The committed probe is `GateProbeTests.testG2SafetensorsMetadataRoundTrip`.
-- **Why skipped:** this managed test process exposes no Metal device (`MTLCreateSystemDefaultDevice() == nil`). Touching MLX before that guard aborts inside `mlx/backend/metal/device.cpp:38` with `NSRangeException`, even when CPU streams are requested. The tests now skip before touching MLX if Metal is unavailable.
+- **M0 validation, 2026-07-03 on branch `impl/native`: PASS.** `swift test` with `MLXSERVE_TEST_MODEL=/Users/timapple/Library/Caches/models/mlx-community/Qwen3-0.6B-4bit` executes 4 tests with 0 failures on GPU. The test harness generates/copies the missing `mlx.metallib` into the SwiftPM XCTest bundle before the first MLX operation so command-line `swift test` can load MLX Metal shaders.
+- **G1 — bf16 bit-reinterpret view: PASS.** Runtime probe confirms `MLXArray.view(dtype:stream:)` round-trips `uint16 -> bfloat16 -> uint16` byte-exact for `[0x3f80, 0x4000, 0xbf80]`.
+- **G2 — safetensors metadata: PASS.** Runtime probe confirms `save(arrays:metadata:url:stream:)` and `loadArraysAndMetadata(url:stream:)` round-trip tensor payloads and string metadata exactly.
+- **Model-dependent greedy baseline: PASS.** Local Qwen fixture `qwen3_0_6b_greedy_baseline.json` pins prompt `"The capital of France is"`, `maxTokens=8`, temperature 0, and token IDs `[151667, 198, 32313, 11, 279, 1196, 374, 10161]`.
 - **Verify-first for M1:** `mlx-swift-lm` has reusable prompt-cache serialization (`savePromptCache`, `loadPromptCache`) and some left-padding metadata helpers on `ArraysCache`/`MambaCache`, but no reusable `BatchKVCache`, `GenerationBatch`, or `BatchGenerator` equivalent was found in Swift. M1 still needs a Swift batch decode/cache layer, reusing existing serialization/mask helpers where appropriate.
 
 ## Blocked
 
-- **Pinned local test model absent.** Searched local candidates under `~/Documents/Guest`, `~/models`, and bundled-model style paths for `mlc-chat-SmolLM-135M-4bit`; no pinned small MLX-format model was found. A non-pinned large candidate exists at `/Users/timapple/Documents/huggingface/models/mlx-community/gemma-4-e4b-it-4bit`, but M0 tests do not use it because the plan calls for a small pinned full-attention fixture. Model-dependent tests skip cleanly unless `MLXSERVE_TEST_MODEL` points at a local MLX model directory.
-- **Runtime MLX probes blocked by no visible Metal device in this process.** The probe source compiles against the exact mlx-swift APIs listed above, but execution is skipped in this environment to keep `swift test` green instead of crashing in MLX Metal initialization.
+- No active M0 blockers after GPU validation.
 
 ---
 

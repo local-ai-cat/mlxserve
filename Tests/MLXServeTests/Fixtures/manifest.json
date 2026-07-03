@@ -1,4 +1,6 @@
 {
-  "fixtures": [],
-  "note": "Model-dependent golden fixtures are added once a pinned local MLX test model is available."
+  "fixtures": [
+    "qwen3_0_6b_greedy_baseline.json"
+  ],
+  "note": "Model-dependent golden fixtures run only when MLXSERVE_TEST_MODEL points at the matching local MLX model."
 }

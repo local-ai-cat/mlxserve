@@ -16,6 +16,7 @@ let package = Package(
     dependencies: [
         .package(path: "/Users/timapple/Documents/Guest/mlx-swift-lm"),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
     targets: [
         .target(
@@ -30,8 +31,10 @@ let package = Package(
             dependencies: [
                 "MLXServe",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             resources: [
                 .process("Fixtures")
