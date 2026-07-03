@@ -6,7 +6,8 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
     public let maxHotBlocks: Int
 
     private let writer = SSDWriter()
-    private var pendingWrites: [Task<Void, Error>] = []
+    private let ssdLock = NSRecursiveLock()
+    private var pendingWrites: [Data: Task<Void, Error>] = [:]
     private var hotLRU: [Data] = []
     private var knownSSDHashes: Set<Data> = []
 
@@ -41,12 +42,12 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
             return payload
         }
 
-        guard knownSSDHashes.contains(hash), let loaded = try? loadPayload(hash: hash) else {
+        guard isKnownOnSSD(hash), let loaded = try? loadPayload(hash: hash) else {
             return nil
         }
         setHotPayload(loaded, for: hash)
         markHot(hash)
-        enforceHotLimit(protectedHash: hash)
+        enforceHotLimit(protectedHash: nil)
         return loaded
     }
 
@@ -56,8 +57,9 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
     }
 
     public func flushPendingWrites() async throws {
-        let writes = pendingWrites
-        pendingWrites.removeAll()
+        let writes = withSSDLock {
+            Array(pendingWrites.values)
+        }
         for write in writes {
             try await write.value
         }
@@ -80,10 +82,18 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
             blockSize: blockSize
         )
         let destination = fileURL(for: hash)
-        knownSSDHashes.insert(hash)
-        pendingWrites.append(Task {
-            try await writer.write(snapshot, to: destination)
-        })
+        let write = Task { [weak self, writer] in
+            do {
+                try await writer.write(snapshot, to: destination)
+                self?.completeWrite(hash: hash, succeeded: true)
+            } catch {
+                self?.completeWrite(hash: hash, succeeded: false)
+                throw error
+            }
+        }
+        withSSDLock {
+            pendingWrites[hash] = write
+        }
     }
 
     private func loadPayload(hash: Data) throws -> KVCacheBlockPayload {
@@ -131,16 +141,22 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
         }
 
         for case let fileURL as URL in enumerator where fileURL.pathExtension == "safetensors" {
-            let metadata = try SafetensorsBlockIO.readMetadata(from: fileURL)
-            guard let hashHex = metadata["blockHash"],
-                let hash = Data(hexString: hashHex)
-            else {
+            do {
+                let metadata = try SafetensorsBlockIO.readMetadata(from: fileURL)
+                guard let hashHex = metadata["blockHash"],
+                    let hash = Data(hexString: hashHex)
+                else {
+                    continue
+                }
+                try validate(metadata: metadata, expectedHash: hash)
+                let tokenCount = Int(metadata["tokenCount"] ?? "") ?? blockSize
+                registerBlockMetadata(hash: hash, tokenCount: tokenCount)
+                _ = withSSDLock {
+                    knownSSDHashes.insert(hash)
+                }
+            } catch {
                 continue
             }
-            try validate(metadata: metadata, expectedHash: hash)
-            let tokenCount = Int(metadata["tokenCount"] ?? "") ?? blockSize
-            registerBlockMetadata(hash: hash, tokenCount: tokenCount)
-            knownSSDHashes.insert(hash)
         }
     }
 
@@ -163,19 +179,49 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
     }
 
     private func markHot(_ hash: Data) {
-        hotLRU.removeAll { $0 == hash }
-        hotLRU.append(hash)
+        withSSDLock {
+            hotLRU.removeAll { $0 == hash }
+            hotLRU.append(hash)
+        }
     }
 
     private func enforceHotLimit(protectedHash: Data?) {
-        while hotPayloadCount > maxHotBlocks, let victim = hotLRU.first {
-            hotLRU.removeFirst()
-            if victim == protectedHash, hotPayloadCount > 1 {
-                hotLRU.append(victim)
-                continue
+        while hotPayloadCount > maxHotBlocks {
+            let victim = withSSDLock {
+                hotLRU.first { hash in
+                    hash != protectedHash && knownSSDHashes.contains(hash)
+                }
+            }
+            guard let victim else { return }
+            withSSDLock {
+                hotLRU.removeAll { $0 == victim }
             }
             removeHotPayload(for: victim)
         }
+    }
+
+    private func isKnownOnSSD(_ hash: Data) -> Bool {
+        withSSDLock {
+            knownSSDHashes.contains(hash)
+        }
+    }
+
+    private func completeWrite(hash: Data, succeeded: Bool) {
+        withSSDLock {
+            pendingWrites.removeValue(forKey: hash)
+            if succeeded {
+                knownSSDHashes.insert(hash)
+            }
+        }
+        if succeeded {
+            enforceHotLimit(protectedHash: nil)
+        }
+    }
+
+    private func withSSDLock<T>(_ body: () throws -> T) rethrows -> T {
+        ssdLock.lock()
+        defer { ssdLock.unlock() }
+        return try body()
     }
 }
 
