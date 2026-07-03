@@ -12,9 +12,17 @@ let package = Package(
             name: "MLXServe",
             targets: ["MLXServe"]
         ),
+        .library(
+            name: "MLXServeHTTP",
+            targets: ["MLXServeHTTP"]
+        ),
         .executable(
             name: "mlxserve-bench",
             targets: ["MLXServeBench"]
+        ),
+        .executable(
+            name: "mlxserve-http",
+            targets: ["MLXServeHTTPServer"]
         )
     ],
     dependencies: [
@@ -35,6 +43,22 @@ let package = Package(
             name: "MLXServeBench",
             dependencies: [
                 "MLXServe",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ]
+        ),
+        .target(
+            name: "MLXServeHTTP",
+            dependencies: []
+        ),
+        .executableTarget(
+            name: "MLXServeHTTPServer",
+            dependencies: [
+                "MLXServe",
+                "MLXServeHTTP",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),

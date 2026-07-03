@@ -10,7 +10,7 @@ private let defaultModelPath =
     "/Users/timapple/Library/Caches/models/mlx-community/Qwen3-0.6B-4bit"
 private let prefixSentence =
     "The capital of France is Paris. Swift concurrency protects shared state. GPU kernels execute matrix operations quickly. "
-private let prefixRepeatCount = 20
+private let prefixRepeatCount = 26
 
 @main
 struct MLXServeBench {
@@ -140,13 +140,12 @@ private final class NativeBenchmark {
         let model = context.model
         let parameters = GenerateParameters(maxTokens: config.decodeTokens, temperature: 0)
         let prefixText = String(repeating: prefixSentence, count: prefixRepeatCount)
-        let prefixTokens = try await tokenIDs(for: prefixText, context: context, parameters: parameters)
-        let shortPrompt = try await tokenIDs(
+        let prefixTokens = tokenIDs(for: prefixText, context: context)
+        let shortPrompt = tokenIDs(
             for: "The capital of France is",
-            context: context,
-            parameters: parameters
+            context: context
         )
-        let suffixes = try await [
+        let suffixes = [
             " The answer is",
             " Therefore",
             " In summary",
@@ -155,8 +154,12 @@ private final class NativeBenchmark {
             " Swift concurrency",
             " The next step",
             " Prefix caching",
-        ].asyncMap { text in
-            try await tokenIDs(for: text, context: context, parameters: parameters)
+        ].map { text in
+            tokenIDs(
+                for: text,
+                context: context,
+                addSpecialTokens: false
+            )
         }
 
         let prefillPrompt = prefixTokens
@@ -168,9 +171,14 @@ private final class NativeBenchmark {
         }
         let prefillTPS = Double(prefillPrompt.count) / median(prefillSeconds)
 
-        let decodeSeconds = try measureMany {
-            try decode(model: model, tokens: decodePrompt, parameters: parameters, decodeTokens: config.decodeTokens)
-        }
+        let decodeSeconds = try measureDecodeMany(
+            prepare: {
+                try prepareDecodeState(model: model, tokens: decodePrompt, parameters: parameters)
+            },
+            run: { state in
+                try decode(model: model, state: &state, decodeTokens: config.decodeTokens)
+            }
+        )
         let decodeTPS = Double(config.decodeTokens) / median(decodeSeconds)
 
         let ttftSeconds = try await measureManyAsync {
@@ -240,6 +248,24 @@ private final class NativeBenchmark {
         }
     }
 
+    private func measureDecodeMany<State>(
+        prepare: () throws -> State,
+        run: (inout State) throws -> Void
+    ) throws -> [Double] {
+        for _ in 0 ..< config.warmup {
+            var state = try prepare()
+            try run(&state)
+        }
+
+        return try (0 ..< config.runs).map { _ in
+            var state = try prepare()
+            let start = DispatchTime.now().uptimeNanoseconds
+            try run(&state)
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000_000
+        }
+    }
+
     private func measureManyAsync(_ body: () async throws -> Void) async throws -> [Double] {
         for _ in 0 ..< config.warmup {
             try await body()
@@ -266,36 +292,50 @@ private final class NativeBenchmark {
         let output = model(input[text: .newAxis], cache: cache, state: nil)
         eval(output.logits, cache)
         Stream.gpu.synchronize()
+        _ = output.logits[0, -1, 0].item(Float.self)
     }
 
-    private func decode(
+    private func prepareDecodeState(
         model: any LanguageModel,
         tokens: [Int],
-        parameters: GenerateParameters,
-        decodeTokens: Int
-    ) throws {
+        parameters: GenerateParameters
+    ) throws -> DecodeState {
         let cache = model.newCache(parameters: parameters)
         var state: LMOutput.State?
         let input = LMInput.Text(tokens: MLXArray(tokens.map { Int32($0) }))
         let output = model(input[text: .newAxis], cache: cache, state: state)
         state = output.state
-        var currentLogits = output.logits[0..., -1, 0...]
-        var currentToken = argMax(currentLogits, axis: -1)
+        let currentLogits = output.logits[0..., -1, 0...]
+        let currentToken = argMax(currentLogits, axis: -1)
         eval(currentToken, currentLogits, cache)
         Stream.gpu.synchronize()
+        _ = currentToken.item(Int.self)
+        return DecodeState(
+            cache: cache,
+            state: state,
+            currentToken: currentToken,
+            currentLogits: currentLogits
+        )
+    }
 
+    private func decode(
+        model: any LanguageModel,
+        state: inout DecodeState,
+        decodeTokens: Int
+    ) throws {
         for _ in 0 ..< decodeTokens {
             let stepOutput = model(
-                LMInput.Text(tokens: currentToken[.newAxis, 0...]),
-                cache: cache,
-                state: state
+                LMInput.Text(tokens: state.currentToken[.newAxis, 0...]),
+                cache: state.cache,
+                state: state.state
             )
-            state = stepOutput.state
-            currentLogits = stepOutput.logits[0..., -1, 0...]
-            currentToken = argMax(currentLogits, axis: -1)
-            eval(currentToken, currentLogits, cache)
+            state.state = stepOutput.state
+            state.currentLogits = stepOutput.logits[0..., -1, 0...]
+            state.currentToken = argMax(state.currentLogits, axis: -1)
+            eval(state.currentToken, state.currentLogits, state.cache)
         }
         Stream.gpu.synchronize()
+        _ = state.currentToken.item(Int.self)
     }
 
     private func ttft(
@@ -401,16 +441,9 @@ private final class NativeBenchmark {
     private func tokenIDs(
         for text: String,
         context: ModelContext,
-        parameters: GenerateParameters
-    ) async throws -> [Int] {
-        let input = try await context.processor.prepare(input: UserInput(prompt: text))
-        let cache = context.model.newCache(parameters: parameters)
-        switch try context.model.prepare(input, cache: cache, windowSize: parameters.prefillStepSize) {
-        case .tokens(let tokens):
-            return tokens.tokens.asArray(Int.self)
-        case .logits:
-            throw BenchError.unexpectedPreparedLogits
-        }
+        addSpecialTokens: Bool = true
+    ) -> [Int] {
+        context.tokenizer.encode(text: text, addSpecialTokens: addSpecialTokens)
     }
 
     private func input(_ tokens: [Int]) -> LMInput {
@@ -481,6 +514,13 @@ private struct CacheBenchmarkResult {
     let warmMedianSeconds: Double
     let speedup: Double
     let fetchHits: Int
+}
+
+private struct DecodeState {
+    var cache: [any KVCache]
+    var state: LMOutput.State?
+    var currentToken: MLXArray
+    var currentLogits: MLXArray
 }
 
 private enum BenchError: Error, CustomStringConvertible {
