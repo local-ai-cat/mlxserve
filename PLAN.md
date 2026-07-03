@@ -178,6 +178,12 @@ Rotating/sliding-window family (+supersede-on-extend + boundary snapshots), MTP,
 - **G2 — safetensors metadata: PASS.** Runtime probe confirms `save(arrays:metadata:url:stream:)` and `loadArraysAndMetadata(url:stream:)` round-trip tensor payloads and string metadata exactly.
 - **Model-dependent greedy baseline: PASS.** Local Qwen fixture `qwen3_0_6b_greedy_baseline.json` pins prompt `"The capital of France is"`, `maxTokens=8`, temperature 0, and token IDs `[151667, 198, 32313, 11, 279, 1196, 374, 10161]`.
 - **Verify-first for M1:** `mlx-swift-lm` has reusable prompt-cache serialization (`savePromptCache`, `loadPromptCache`) and some left-padding metadata helpers on `ArraysCache`/`MambaCache`, but no reusable `BatchKVCache`, `GenerationBatch`, or `BatchGenerator` equivalent was found in Swift. M1 still needs a Swift batch decode/cache layer, reusing existing serialization/mask helpers where appropriate.
+- **M1 static batched decode, 2026-07-03 on branch `impl/native`: PASS.** Implemented `CausalMask`, `BatchKVCache`, and `StaticBatchGenerator` with serial per-row prefill then merged decode-only batching. `swift test` with the Qwen model executes 5 tests with 0 failures.
+- **M1 batch-invariance gate: PASS.** Batch sizes `{2,4,8}`, `maxTokens=4`, ragged prompt lengths. Logit max-abs error / checked wide-margin tokens / mismatches:
+  - `B=2`: `0.0`, `6`, `0`
+  - `B=4`: `1.1855469`, `12`, `0`
+  - `B=8`: `1.1855469`, `24`, `0`
+  The largest error was on a wide-margin token (`margin=13.125`) with matching serial/batch token id `198`; the committed gate keeps token equality margin-gated and uses a `1.25` logit tolerance for this local 4-bit/bfloat Qwen path.
 
 ## Blocked
 

@@ -22,6 +22,7 @@ let package = Package(
         .target(
             name: "MLXServe",
             dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
             ]
