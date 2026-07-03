@@ -52,11 +52,22 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
     }
 
     public func reconstructCache(from hit: PrefixCacheHit) throws -> [KVCacheSimple] {
-        let payloads = hit.table.blockIDs.compactMap { manager.payload(for: $0) }
+        let payloads = try hit.table.blockIDs.map { blockID in
+            guard let payload = manager.payload(for: blockID) else {
+                throw PrefixCacheError.missingBlockPayload(
+                    blockID: blockID,
+                    hash: manager.blockHash(for: blockID)
+                )
+            }
+            return payload
+        }
         guard let firstPayload = payloads.first else { return [] }
 
         return try (0 ..< firstPayload.layers.count).map { layerIndex in
             let firstLayer = firstPayload.layers[layerIndex]
+            for payload in payloads where payload.layers.indices.contains(layerIndex) == false {
+                throw PrefixCacheError.inconsistentLayerCount
+            }
             let sequenceAxis = try Self.sequenceAxis(
                 cacheType: firstLayer.className,
                 state: [firstLayer.keys, firstLayer.values]
@@ -73,6 +84,7 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
     public func storeCache(tokens: [Int], cache: [any KVCache]) throws -> BlockTable {
         let fullBlockCount = tokens.count / blockSize
         guard fullBlockCount > 0 else { return BlockTable() }
+        try preflightCacheForStorage(cache)
 
         let hashes = BlockHashing.chainHashes(
             modelName: modelName,
@@ -139,6 +151,18 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
         return KVCacheBlockPayload(layers: layers)
     }
 
+    private func preflightCacheForStorage(_ cache: [any KVCache]) throws {
+        guard !cache.isEmpty else {
+            throw PrefixCacheError.unsupportedCacheLayout(cacheType: "empty", stateShapes: [])
+        }
+        for layerCache in cache {
+            _ = try Self.sequenceAxis(
+                cacheType: String(describing: type(of: layerCache)),
+                state: layerCache.state
+            )
+        }
+    }
+
     private static func sequenceAxis(cacheType: String, state: [MLXArray]) throws -> Int {
         guard state.count == 2 else {
             throw PrefixCacheError.unsupportedCacheLayout(
@@ -172,11 +196,18 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
 
 public enum PrefixCacheError: Error, Equatable, CustomStringConvertible {
     case unsupportedCacheLayout(cacheType: String, stateShapes: [[Int]])
+    case missingBlockPayload(blockID: Int, hash: Data?)
+    case inconsistentLayerCount
 
     public var description: String {
         switch self {
         case .unsupportedCacheLayout(let cacheType, let stateShapes):
             return "Prefix cache supports sequence KV state only; \(cacheType) has state shapes \(stateShapes)."
+        case .missingBlockPayload(let blockID, let hash):
+            let hashDescription = hash.map(BlockHashing.hex) ?? "nil"
+            return "Prefix cache block \(blockID) with hash \(hashDescription) has metadata but no loaded payload."
+        case .inconsistentLayerCount:
+            return "Prefix cache block payloads have inconsistent layer counts."
         }
     }
 }

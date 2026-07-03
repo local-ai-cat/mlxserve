@@ -27,6 +27,45 @@ private struct SSDCacheGateResult: Sendable {
 }
 
 final class TrackAPrefixCacheTests: XCTestCase {
+    func testReconstructThrowsWhenRetainedBlockPayloadIsMissing() throws {
+        let prefixCache = BlockAwarePrefixCache(modelName: "unit-test", blockSize: 2)
+        let tokens = [1, 2]
+        let hash = try XCTUnwrap(BlockHashing.chainHashes(
+            modelName: "unit-test",
+            tokens: tokens,
+            blockSize: 2
+        ).first)
+        let blockID = prefixCache.manager.registerBlockMetadata(hash: hash, tokenCount: 2)
+        let hit = try XCTUnwrap(prefixCache.fetchCache(tokens: tokens))
+        defer { prefixCache.release(hit) }
+
+        XCTAssertThrowsError(try prefixCache.reconstructCache(from: hit)) { error in
+            XCTAssertEqual(
+                error as? PrefixCacheError,
+                .missingBlockPayload(blockID: blockID, hash: hash)
+            )
+        }
+    }
+
+    func testStoreCacheThrowsForUnsupportedFixedStateCache() throws {
+        let prefixCache = BlockAwarePrefixCache(modelName: "unit-test", blockSize: 2)
+        let fixedStateCache = UnsupportedPrefixTestCache(
+            state: [
+                MLXArray.zeros([1, 3, 16], dtype: .bfloat16),
+                MLXArray.zeros([1, 4, 8, 8], dtype: .float32),
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try prefixCache.storeCache(tokens: [1, 2], cache: [fixedStateCache])
+        ) { error in
+            guard case .unsupportedCacheLayout = error as? PrefixCacheError else {
+                XCTFail("expected unsupported cache layout, got \(error)")
+                return
+            }
+        }
+    }
+
     func testHotPrefixCacheReconstructsAndDoesNotLeakBlocks() async throws {
         try MLXMetalRuntime.requireAvailable()
 
@@ -436,6 +475,44 @@ final class TrackAPrefixCacheTests: XCTestCase {
 
 private enum PrefixCacheTestError: Error {
     case missingPrefixHit
+}
+
+private final class UnsupportedPrefixTestCache: KVCache {
+    var state: [MLXArray]
+    var metaState: [String] = []
+    var offset: Int { 0 }
+    var maxSize: Int? { nil }
+    var isTrimmable: Bool { false }
+
+    init(state: [MLXArray]) {
+        self.state = state
+    }
+
+    func innerState() -> [MLXArray] {
+        state
+    }
+
+    func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        state = [newKeys, newValues]
+        return (newKeys, newValues)
+    }
+
+    func makeMask(
+        n: Int,
+        windowSize: Int?,
+        returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .none
+    }
+
+    @discardableResult
+    func trim(_ n: Int) -> Int {
+        0
+    }
+
+    func copy() -> any KVCache {
+        UnsupportedPrefixTestCache(state: state.map { $0[.ellipsis] })
+    }
 }
 
 private extension Array {
