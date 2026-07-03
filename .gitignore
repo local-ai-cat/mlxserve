@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+Package.resolved
+# test model + generated artifacts (fixtures are committed; models are not)
+Tests/MLXServeTests/Models/
+*.safetensors
+!Tests/MLXServeTests/Fixtures/*.safetensors
