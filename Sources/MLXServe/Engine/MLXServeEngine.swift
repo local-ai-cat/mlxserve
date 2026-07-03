@@ -6,12 +6,14 @@ public final class MLXServeEngine: @unchecked Sendable {
     public init(
         model: any LanguageModel,
         parameters: GenerateParameters = GenerateParameters(),
-        maxConcurrentRequests: Int
+        maxConcurrentRequests: Int,
+        prefixStore: (any PrefixKVStore)? = nil
     ) {
         self.scheduler = Scheduler(
             modelBox: LanguageModelBox(model),
             parameters: parameters,
-            maxConcurrentRequests: maxConcurrentRequests
+            maxConcurrentRequests: maxConcurrentRequests,
+            prefixStore: prefixStore
         )
     }
 

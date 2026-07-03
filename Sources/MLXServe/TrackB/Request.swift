@@ -24,10 +24,13 @@ public struct Request: @unchecked Sendable {
 
 struct RunningRequest {
     let request: Request
+    let promptTokens: [Int]
+    let prefixHit: PrefixKVStoreHit?
     var generatedTokenCount: Int
 }
 
 public enum SchedulerError: Error, Equatable {
     case queueFull(retryAfterSteps: Int)
     case duplicateRequest(String)
+    case invalidPrefixHit
 }

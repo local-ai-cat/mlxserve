@@ -10,9 +10,12 @@ public final class LanguageModelBox: @unchecked Sendable {
 }
 
 public actor Scheduler {
+    private let model: any LanguageModel
+    private let parameters: GenerateParameters
     private let generator: ContinuousBatchGenerator
     private let maxConcurrentRequests: Int
     private let queueLimit: Int
+    private let prefixStore: (any PrefixKVStore)?
     private var waiting: [Request] = []
     private var running: [String: RunningRequest] = [:]
     private var pendingCancellation: Set<String> = []
@@ -21,11 +24,15 @@ public actor Scheduler {
     public init(
         modelBox: LanguageModelBox,
         parameters: GenerateParameters,
-        maxConcurrentRequests: Int
+        maxConcurrentRequests: Int,
+        prefixStore: (any PrefixKVStore)? = nil
     ) {
+        self.model = modelBox.model
+        self.parameters = parameters
         self.generator = ContinuousBatchGenerator(model: modelBox.model, parameters: parameters)
         self.maxConcurrentRequests = maxConcurrentRequests
         self.queueLimit = max(maxConcurrentRequests * 4, 32)
+        self.prefixStore = prefixStore
     }
 
     public var isIdle: Bool {
@@ -98,7 +105,9 @@ public actor Scheduler {
         if !finishedUIDs.isEmpty {
             Stream.gpu.synchronize()
             for uid in finishedUIDs {
+                storeFinishedPromptCache(uid: uid)
                 generator.remove(uid: uid)
+                releasePrefixHit(uid: uid)
                 running.removeValue(forKey: uid)
             }
         }
@@ -118,12 +127,19 @@ public actor Scheduler {
     private func admitWaiting() throws {
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
             let request = waiting.removeFirst()
-            try generator.insert(
+            let prepared = try prepareForInsert(request)
+            generator.insert(
                 uid: request.uid,
-                input: request.input,
+                cache: prepared.cache,
+                lastToken: prepared.lastToken,
                 sampling: request.sampling
             )
-            running[request.uid] = RunningRequest(request: request, generatedTokenCount: 0)
+            running[request.uid] = RunningRequest(
+                request: request,
+                promptTokens: prepared.promptTokens,
+                prefixHit: prepared.prefixHit,
+                generatedTokenCount: 0
+            )
         }
     }
 
@@ -133,10 +149,149 @@ public actor Scheduler {
         Stream.gpu.synchronize()
         for uid in pendingCancellation {
             guard running[uid] != nil else { continue }
+            clearPrefixEntry(uid: uid)
             generator.remove(uid: uid)
             running.removeValue(forKey: uid)
             collector.record(Response(uid: uid, token: -1, finishReason: .cancelled))
         }
         pendingCancellation.removeAll()
     }
+
+    private func prepareForInsert(_ request: Request) throws -> PreparedBatchRow {
+        let rowCache = model.newCache(parameters: parameters)
+        let promptText: LMInput.Text
+        switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
+        case .tokens(let tokens):
+            promptText = tokens
+        case .logits:
+            throw BatchGeneratorError.unsupportedPreparedLogits
+        }
+
+        let promptTokensArray = promptText.tokens
+        let promptTokenCount = promptTokensArray.dim(0)
+        guard promptTokenCount > 1 else {
+            throw BatchGeneratorError.promptTooShortForExternalPrefill
+        }
+        let promptTokens = promptTokensArray.asArray(Int.self)
+
+        if let prefixStore, let hit = prefixStore.fetch(tokens: promptTokens) {
+            do {
+                try prefixStore.preload(hit)
+                let serialized = try prefixStore.reconstructCache(from: hit)
+                let reconstructedCache = try serialized.map {
+                    try BlockAwarePrefixKVStore.cache(from: $0)
+                }
+                return try prepareHitRow(
+                    request: request,
+                    promptTokens: promptTokens,
+                    promptTokensArray: promptTokensArray,
+                    hit: hit,
+                    reconstructedCache: reconstructedCache
+                )
+            } catch {
+                prefixStore.release(hit)
+                throw error
+            }
+        }
+
+        return prefillMissRow(
+            request: request,
+            promptTokens: promptTokens,
+            promptTokensArray: promptTokensArray,
+            rowCache: rowCache
+        )
+    }
+
+    private func prepareHitRow(
+        request: Request,
+        promptTokens: [Int],
+        promptTokensArray: MLXArray,
+        hit: PrefixKVStoreHit,
+        reconstructedCache: [KVCacheSimple]
+    ) throws -> PreparedBatchRow {
+        let matched = hit.matchedTokenCount
+        guard matched <= promptTokens.count else {
+            throw SchedulerError.invalidPrefixHit
+        }
+
+        if matched == promptTokens.count {
+            for layerCache in reconstructedCache {
+                _ = layerCache.trim(1)
+            }
+            return PreparedBatchRow(
+                cache: reconstructedCache,
+                lastToken: promptTokensArray[promptTokens.count - 1],
+                promptTokens: promptTokens,
+                prefixHit: hit
+            )
+        }
+
+        let remainingCount = promptTokens.count - matched
+        if remainingCount > 1 {
+            let suffixPrefix = LMInput.Text(
+                tokens: promptTokensArray[matched ..< (promptTokens.count - 1)]
+            )
+            _ = model(suffixPrefix[text: .newAxis], cache: reconstructedCache, state: nil)
+            eval(reconstructedCache)
+        }
+
+        return PreparedBatchRow(
+            cache: reconstructedCache,
+            lastToken: promptTokensArray[promptTokens.count - 1],
+            promptTokens: promptTokens,
+            prefixHit: hit
+        )
+    }
+
+    private func prefillMissRow(
+        request: Request,
+        promptTokens: [Int],
+        promptTokensArray: MLXArray,
+        rowCache: [any KVCache]
+    ) -> PreparedBatchRow {
+        let prefixInput = LMInput.Text(tokens: promptTokensArray[..<(promptTokens.count - 1)])
+        _ = model(prefixInput[text: .newAxis], cache: rowCache, state: nil)
+        eval(rowCache)
+
+        return PreparedBatchRow(
+            cache: rowCache,
+            lastToken: promptTokensArray[promptTokens.count - 1],
+            promptTokens: promptTokens,
+            prefixHit: nil
+        )
+    }
+
+    private func storeFinishedPromptCache(uid: String) {
+        guard let prefixStore, let runningRequest = running[uid],
+            let cache = generator.extractCache(uid: uid)
+        else {
+            return
+        }
+
+        let serialized = cache.map {
+            SerializedKVLayer(
+                state: $0.state,
+                metaState: $0.metaState,
+                className: "KVCacheSimple"
+            )
+        }
+        try? prefixStore.store(tokens: runningRequest.promptTokens, cache: serialized)
+    }
+
+    private func releasePrefixHit(uid: String) {
+        guard let hit = running[uid]?.prefixHit else { return }
+        prefixStore?.release(hit)
+    }
+
+    private func clearPrefixEntry(uid: String) {
+        guard let hit = running[uid]?.prefixHit else { return }
+        prefixStore?.clearEntry(hit)
+    }
+}
+
+private struct PreparedBatchRow {
+    let cache: [any KVCache]
+    let lastToken: MLXArray
+    let promptTokens: [Int]
+    let prefixHit: PrefixKVStoreHit?
 }

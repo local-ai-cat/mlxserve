@@ -171,6 +171,11 @@ public final class ContinuousBatchGenerator {
         filter(keeping: keptRows)
     }
 
+    public func extractCache(uid: String) -> [KVCacheSimple]? {
+        guard let row = rowUIDs.firstIndex(of: uid) else { return nil }
+        return cache.map { $0.extract(row) }
+    }
+
     public func filter(keeping rows: [Int]) {
         guard !rows.isEmpty else {
             cache.removeAll()
