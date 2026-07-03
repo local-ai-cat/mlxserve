@@ -185,6 +185,7 @@ Rotating/sliding-window family (+supersede-on-extend + boundary snapshots), MTP,
   - `B=8`: `1.1855469`, `24`, `0`
   The largest error was on a wide-margin token (`margin=13.125`) with matching serial/batch token id `198`; the committed gate keeps token equality margin-gated and uses a `1.25` logit tolerance for this local 4-bit/bfloat Qwen path.
 - **M1.5 continuous batching, 2026-07-03 on branch `impl/native`: PASS.** Added dynamic `BatchKVCache.filter`/`extend`/`insert`, `ContinuousBatchGenerator` row insert/remove/filter, per-row sampling, and `Response {uid, token, finishReason, logprobs?}`. GPU gate inserts rows mid-batch and removes finished rows after a stream sync; surviving wide-margin tokens match their solo traces. Result: `responses=12`, `inserts=4`, `removals=2`, `checkedTokens=9`, `mismatches=0`.
+- **M2 scheduler + engine, 2026-07-03 on branch `impl/native`: PASS.** Added `Request`, `OutputCollector`, `Scheduler`, and `MLXServeEngine` with FCFS admission, `maxConcurrentRequests`, external prefill via last-token-withheld insert, serial step ownership, finish cleanup, cancellation with `Stream.gpu.synchronize()` before row removal, and queue-depth backpressure at `max(cap*4,32)`. GPU gate submits `{1,4,8}` concurrent generations through the engine and compares wide-margin tokens against solo traces: `batchChecked=39`, `batchMismatches=0`; mid-flight cancel: `cancelChecked=6`, `cancelMismatches=0`, `cancelledResponses=1`; queue-full rejection: `true`.
 
 ## Blocked
 
