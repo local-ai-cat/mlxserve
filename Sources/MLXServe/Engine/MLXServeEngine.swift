@@ -2,6 +2,7 @@ import MLXLMCommon
 
 public final class MLXServeEngine: @unchecked Sendable {
     private let scheduler: Scheduler
+    private let streamDemux: EngineStreamDemux
 
     public init(
         model: any LanguageModel,
@@ -9,12 +10,14 @@ public final class MLXServeEngine: @unchecked Sendable {
         maxConcurrentRequests: Int,
         prefixStore: (any PrefixKVStore)? = nil
     ) {
-        self.scheduler = Scheduler(
+        let scheduler = Scheduler(
             modelBox: LanguageModelBox(model),
             parameters: parameters,
             maxConcurrentRequests: maxConcurrentRequests,
             prefixStore: prefixStore
         )
+        self.scheduler = scheduler
+        self.streamDemux = EngineStreamDemux(scheduler: scheduler)
     }
 
     public func submit(_ request: Request) async throws {
@@ -44,23 +47,13 @@ public final class MLXServeEngine: @unchecked Sendable {
 
     public func stream(_ request: Request) -> AsyncThrowingStream<Response, Error> {
         AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    try await scheduler.submit(request)
-                    while await !scheduler.isIdle {
-                        let responses = try await scheduler.step()
-                        for response in responses where response.uid == request.uid {
-                            continuation.yield(response)
-                            if response.finishReason != nil {
-                                continuation.finish()
-                                return
-                            }
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+            continuation.onTermination = { [streamDemux] _ in
+                Task {
+                    await streamDemux.cancel(uid: request.uid)
                 }
+            }
+            Task { [streamDemux] in
+                await streamDemux.add(request, continuation: continuation)
             }
         }
     }
@@ -77,5 +70,78 @@ public final class MLXServeEngine: @unchecked Sendable {
         get async {
             await scheduler.isIdle
         }
+    }
+}
+
+private actor EngineStreamDemux {
+    private let scheduler: Scheduler
+    private var continuations: [String: AsyncThrowingStream<Response, Error>.Continuation] = [:]
+    private var pumpTask: Task<Void, Never>?
+
+    init(scheduler: Scheduler) {
+        self.scheduler = scheduler
+    }
+
+    func add(
+        _ request: Request,
+        continuation: AsyncThrowingStream<Response, Error>.Continuation
+    ) async {
+        do {
+            try await scheduler.submit(request)
+            continuations[request.uid] = continuation
+            startPumpIfNeeded()
+        } catch {
+            continuation.finish(throwing: error)
+        }
+    }
+
+    func cancel(uid: String) async {
+        continuations.removeValue(forKey: uid)
+        await scheduler.cancel(uid: uid)
+    }
+
+    private func startPumpIfNeeded() {
+        guard pumpTask == nil else { return }
+        pumpTask = Task { [weak self] in
+            await self?.pump()
+        }
+    }
+
+    private func pump() async {
+        do {
+            while await !scheduler.isIdle {
+                let responses = try await scheduler.step()
+                for response in responses {
+                    deliver(response)
+                }
+            }
+            finishRemaining()
+        } catch {
+            finishAll(throwing: error)
+        }
+        pumpTask = nil
+    }
+
+    private func deliver(_ response: Response) {
+        guard let continuation = continuations[response.uid] else { return }
+        continuation.yield(response)
+        if response.finishReason != nil {
+            continuation.finish()
+            continuations.removeValue(forKey: response.uid)
+        }
+    }
+
+    private func finishRemaining() {
+        for continuation in continuations.values {
+            continuation.finish()
+        }
+        continuations.removeAll()
+    }
+
+    private func finishAll(throwing error: Error) {
+        for continuation in continuations.values {
+            continuation.finish(throwing: error)
+        }
+        continuations.removeAll()
     }
 }

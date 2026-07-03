@@ -162,6 +162,7 @@ public final class ContinuousBatchGenerator {
 
         rowUIDs.append(uid)
         samplers.append(sampling)
+        state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
 
@@ -182,6 +183,7 @@ public final class ContinuousBatchGenerator {
             rowUIDs.removeAll()
             samplers.removeAll()
             currentTokens = MLXArray([Int32]())
+            state = nil
             return
         }
 
@@ -192,6 +194,7 @@ public final class ContinuousBatchGenerator {
         currentTokens = currentTokens.take(rowIndices, axis: 0)
         rowUIDs = rows.map { rowUIDs[$0] }
         samplers = rows.map { samplers[$0] }
+        state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
 

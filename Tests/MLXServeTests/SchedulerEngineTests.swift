@@ -18,6 +18,9 @@ private struct EngineGateResult: Sendable {
     let cancelMismatches: Int
     let cancelledResponses: Int
     let queueFullRejected: Bool
+    let streamCheckedTokens: Int
+    let streamMismatches: Int
+    let streamMisroutedResponses: Int
 }
 
 final class SchedulerEngineTests: XCTestCase {
@@ -53,7 +56,7 @@ final class SchedulerEngineTests: XCTestCase {
 
         if ProcessInfo.processInfo.environment["MLXSERVE_DEBUG_ENGINE_GATE"] == "1" {
             print(
-                "M2 engine: batchChecked=\(result.batchCheckedTokens), batchMismatches=\(result.batchMismatches), cancelChecked=\(result.cancelCheckedTokens), cancelMismatches=\(result.cancelMismatches), cancelledResponses=\(result.cancelledResponses), queueFullRejected=\(result.queueFullRejected)"
+                "M2 engine: batchChecked=\(result.batchCheckedTokens), batchMismatches=\(result.batchMismatches), cancelChecked=\(result.cancelCheckedTokens), cancelMismatches=\(result.cancelMismatches), cancelledResponses=\(result.cancelledResponses), streamChecked=\(result.streamCheckedTokens), streamMismatches=\(result.streamMismatches), streamMisroutes=\(result.streamMisroutedResponses), queueFullRejected=\(result.queueFullRejected)"
             )
         }
 
@@ -62,6 +65,9 @@ final class SchedulerEngineTests: XCTestCase {
         XCTAssertGreaterThan(result.cancelCheckedTokens, 0)
         XCTAssertEqual(result.cancelMismatches, 0)
         XCTAssertEqual(result.cancelledResponses, 1)
+        XCTAssertGreaterThan(result.streamCheckedTokens, 0)
+        XCTAssertEqual(result.streamMismatches, 0)
+        XCTAssertEqual(result.streamMisroutedResponses, 0)
         XCTAssertTrue(result.queueFullRejected)
     }
 
@@ -144,6 +150,42 @@ final class SchedulerEngineTests: XCTestCase {
             .filter { $0.finishReason == .cancelled }
             .count
 
+        let streamEngine = MLXServeEngine(
+            model: context.model,
+            parameters: parameters,
+            maxConcurrentRequests: 2
+        )
+        let stream0 = streamEngine.stream(
+            Request(
+                uid: "stream-0",
+                input: inputs[0],
+                maxTokens: parameters.maxTokens ?? 4,
+                sampling: SamplingParameters(temperature: 0)
+            )
+        )
+        let stream1 = streamEngine.stream(
+            Request(
+                uid: "stream-1",
+                input: inputs[1],
+                maxTokens: parameters.maxTokens ?? 4,
+                sampling: SamplingParameters(temperature: 0)
+            )
+        )
+        let streamResponses0 = try await collectResponses(from: stream0)
+        let streamResponses1 = try await collectResponses(from: stream1)
+        let streamMisroutedResponses = streamResponses0.filter { $0.uid != "stream-0" }.count
+            + streamResponses1.filter { $0.uid != "stream-1" }.count
+        let streamComparison0 = compareWideMarginTokens(
+            generated: streamResponses0.map(\.token),
+            serial: serial[0]
+        )
+        let streamComparison1 = compareWideMarginTokens(
+            generated: streamResponses1.map(\.token),
+            serial: serial[1]
+        )
+        let streamCheckedTokens = streamComparison0.checked + streamComparison1.checked
+        let streamMismatches = streamComparison0.mismatches + streamComparison1.mismatches
+
         var queueFullRejected = false
         for index in 0 ..< 32 {
             try await engine.submit(
@@ -174,8 +216,21 @@ final class SchedulerEngineTests: XCTestCase {
             cancelCheckedTokens: cancelCheckedTokens,
             cancelMismatches: cancelMismatches,
             cancelledResponses: cancelledResponses,
-            queueFullRejected: queueFullRejected
+            queueFullRejected: queueFullRejected,
+            streamCheckedTokens: streamCheckedTokens,
+            streamMismatches: streamMismatches,
+            streamMisroutedResponses: streamMisroutedResponses
         )
+    }
+
+    private static func collectResponses(
+        from stream: AsyncThrowingStream<Response, Error>
+    ) async throws -> [Response] {
+        var responses: [Response] = []
+        for try await response in stream {
+            responses.append(response)
+        }
+        return responses
     }
 
     private static func compareWideMarginTokens(

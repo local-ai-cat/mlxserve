@@ -126,14 +126,25 @@ public actor Scheduler {
 
     private func admitWaiting() throws {
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
-            let request = waiting.removeFirst()
-            let prepared = try prepareForInsert(request)
-            try generator.insert(
-                uid: request.uid,
-                cache: prepared.cache,
-                lastToken: prepared.lastToken,
-                sampling: request.sampling
-            )
+            let request = waiting[0]
+            var prepared: PreparedBatchRow?
+            do {
+                prepared = try prepareForInsert(request)
+                guard let prepared else { continue }
+                try generator.insert(
+                    uid: request.uid,
+                    cache: prepared.cache,
+                    lastToken: prepared.lastToken,
+                    sampling: request.sampling
+                )
+            } catch {
+                if let hit = prepared?.prefixHit {
+                    prefixStore?.release(hit)
+                }
+                throw error
+            }
+            guard let prepared else { continue }
+            waiting.removeFirst()
             running[request.uid] = RunningRequest(
                 request: request,
                 promptTokens: prepared.promptTokens,
