@@ -17,6 +17,15 @@ private struct PrefixCacheGateResult: Sendable {
     let totalRefAfterRequests: Int
 }
 
+private struct SSDCacheGateResult: Sendable {
+    let byteRoundTripExact: Bool
+    let maxLogitError: Float
+    let checkedTokens: Int
+    let mismatches: Int
+    let scannedBlocks: Int
+    let hotPayloadsAfterScan: Int
+}
+
 final class TrackAPrefixCacheTests: XCTestCase {
     func testHotPrefixCacheReconstructsAndDoesNotLeakBlocks() async throws {
         try MLXMetalRuntime.requireAvailable()
@@ -48,6 +57,51 @@ final class TrackAPrefixCacheTests: XCTestCase {
         XCTAssertEqual(result.sharedBlockCount, 1)
         XCTAssertEqual(result.allocatedAfterRequests, result.allocatedBaseline)
         XCTAssertEqual(result.totalRefAfterRequests, result.totalRefBaseline)
+    }
+
+    func testSSDColdTierRestartsAndRoundTripsBytesExactly() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run M4 SSD prefix-cache gate.")
+        }
+        guard resolution.url.lastPathComponent == "Qwen3-0.6B-4bit" else {
+            throw XCTSkip("M4 SSD prefix-cache fixture is pinned to Qwen3-0.6B-4bit.")
+        }
+
+        let cacheDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mlxserve-m4-\(UUID().uuidString)", isDirectory: true)
+        let byteDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mlxserve-m4-bytes-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        defer { try? FileManager.default.removeItem(at: byteDirectory) }
+
+        let byteRoundTripExact = try Self.exactBF16RoundTrip(in: byteDirectory)
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+        let result = try await container.perform { context in
+            try await Self.evaluateSSDCacheGate(
+                context: context,
+                cacheDirectory: cacheDirectory,
+                byteRoundTripExact: byteRoundTripExact
+            )
+        }
+
+        if ProcessInfo.processInfo.environment["MLXSERVE_DEBUG_PREFIX_GATE"] == "1" {
+            print(
+                "M4 SSD: byteExact=\(result.byteRoundTripExact), maxLogitError=\(result.maxLogitError), checkedTokens=\(result.checkedTokens), mismatches=\(result.mismatches), scannedBlocks=\(result.scannedBlocks), hotPayloadsAfterScan=\(result.hotPayloadsAfterScan)"
+            )
+        }
+
+        XCTAssertTrue(result.byteRoundTripExact)
+        XCTAssertLessThan(result.maxLogitError, 1.25)
+        XCTAssertGreaterThan(result.checkedTokens, 0)
+        XCTAssertEqual(result.mismatches, 0)
+        XCTAssertEqual(result.scannedBlocks, 1)
+        XCTAssertEqual(result.hotPayloadsAfterScan, 0)
     }
 
     private static func evaluatePrefixCacheGate(
@@ -172,6 +226,93 @@ final class TrackAPrefixCacheTests: XCTestCase {
         )
     }
 
+    private static func evaluateSSDCacheGate(
+        context: ModelContext,
+        cacheDirectory: URL,
+        byteRoundTripExact: Bool
+    ) async throws -> SSDCacheGateResult {
+        let model = context.model
+        let blockSize = 256
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+        let seedText = String(
+            repeating: "The capital of France is Paris. Swift concurrency protects shared state. GPU kernels execute matrix operations quickly. ",
+            count: 128
+        )
+        let seedTokens = try await tokenIDs(for: seedText, context: context, parameters: parameters)
+        var prefixTokens: [Int] = []
+        while prefixTokens.count < blockSize {
+            prefixTokens.append(contentsOf: seedTokens)
+        }
+        prefixTokens = Array(prefixTokens.prefix(blockSize))
+
+        let candidateSuffixes = try await [
+            " The answer is",
+            " Therefore",
+            " In summary",
+            " Paris",
+            " Swift",
+            " The next",
+        ].mapAsync { text in
+            try await tokenIDs(for: text, context: context, parameters: parameters)
+        }
+
+        let warmManager = try PagedSSDCacheManager(
+            cacheDirectory: cacheDirectory,
+            modelName: "Qwen3-0.6B-4bit",
+            blockSize: blockSize,
+            maxHotBlocks: 0
+        )
+        let warmCache = BlockAwarePrefixCache(
+            modelName: "Qwen3-0.6B-4bit",
+            blockSize: blockSize,
+            manager: warmManager
+        )
+        let prefix = prefill(model: model, tokens: prefixTokens, parameters: parameters)
+        let storedTable = warmCache.storeCache(tokens: prefixTokens, cache: prefix.cache)
+        XCTAssertEqual(storedTable.count, 1)
+        try await warmManager.flushPendingWrites()
+
+        let restartedManager = try PagedSSDCacheManager(
+            cacheDirectory: cacheDirectory,
+            modelName: "Qwen3-0.6B-4bit",
+            blockSize: blockSize,
+            maxHotBlocks: 0
+        )
+        let restartedCache = BlockAwarePrefixCache(
+            modelName: "Qwen3-0.6B-4bit",
+            blockSize: blockSize,
+            manager: restartedManager
+        )
+
+        var maxLogitError: Float = 0
+        var checkedTokens = 0
+        var mismatches = 0
+        for suffix in candidateSuffixes {
+            let branch = try compareBranch(
+                model: model,
+                prefixCache: restartedCache,
+                prefixTokens: prefixTokens,
+                suffixTokens: suffix,
+                parameters: parameters
+            )
+            maxLogitError = max(maxLogitError, branch.logitError)
+            checkedTokens += branch.checkedTokens
+            mismatches += branch.mismatches
+            if checkedTokens > 0 {
+                break
+            }
+        }
+
+        return SSDCacheGateResult(
+            byteRoundTripExact: byteRoundTripExact,
+            maxLogitError: maxLogitError,
+            checkedTokens: checkedTokens,
+            mismatches: mismatches,
+            scannedBlocks: restartedManager.allocatedBlocks,
+            hotPayloadsAfterScan: restartedManager.hotPayloadCount
+        )
+    }
+
     private static func compareBranch(
         model: any LanguageModel,
         prefixCache: BlockAwarePrefixCache,
@@ -246,6 +387,50 @@ final class TrackAPrefixCacheTests: XCTestCase {
         case .logits:
             throw PrefixCacheTestError.missingPrefixHit
         }
+    }
+
+    private static func exactBF16RoundTrip(in cacheDirectory: URL) throws -> Bool {
+        let hash = Data(repeating: 0xAB, count: 32)
+        let raw = MLXArray([UInt16(0x3f80), UInt16(0x4000), UInt16(0xbf80)], [1, 1, 3, 1])
+        let bf16 = raw.view(dtype: .bfloat16)
+        let payload = KVCacheBlockPayload(
+            layers: [
+                CacheLayerBlockPayload(
+                    keys: bf16,
+                    values: bf16,
+                    metaState: ["3", CacheTypeHandlers.encodeBool(false)]
+                )
+            ]
+        )
+        let snapshot = SafetensorsBlockIO.snapshot(
+            hash: hash,
+            payload: payload,
+            tokenCount: 3,
+            modelName: "byte-test",
+            blockSize: 3
+        )
+        let url = cacheDirectory
+            .appendingPathComponent("byte", isDirectory: true)
+            .appendingPathComponent("roundtrip.safetensors")
+        try SafetensorsBlockIO.write(snapshot, to: url)
+        let loaded = try SafetensorsBlockIO.read(from: url)
+        let (mlxLoaded, mlxMetadata) = try loadArraysAndMetadata(url: url, stream: .cpu)
+
+        let originalBytes = raw.asData(access: .copy).data
+        guard loaded.rawTensorBytes["layer.0.keys"] == originalBytes,
+            loaded.rawTensorBytes["layer.0.values"] == originalBytes,
+            loaded.metadata["isRotating"] == CacheTypeHandlers.encodeBool(false),
+            mlxMetadata["isRotating"] == CacheTypeHandlers.encodeBool(false),
+            let loadedKeys = loaded.arrays["layer.0.keys"],
+            let loadedValues = loaded.arrays["layer.0.values"],
+            let mlxLoadedKeys = mlxLoaded["layer.0.keys"]
+        else {
+            return false
+        }
+
+        return loadedKeys.view(dtype: .uint16).asArray(UInt16.self) == raw.asArray(UInt16.self)
+            && loadedValues.view(dtype: .uint16).asArray(UInt16.self) == raw.asArray(UInt16.self)
+            && mlxLoadedKeys.view(dtype: .uint16).asArray(UInt16.self) == raw.asArray(UInt16.self)
     }
 }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-public final class PagedCacheManager: @unchecked Sendable {
+public class PagedCacheManager: @unchecked Sendable {
     public let blockSize: Int
 
     private var blocks: [KVCacheBlock]
@@ -26,7 +26,15 @@ public final class PagedCacheManager: @unchecked Sendable {
     }
 
     public func contains(hash: Data) -> Bool {
-        hashIndex.blockID(for: hash) != nil && payloadsByHash[hash] != nil
+        hashIndex.blockID(for: hash) != nil
+    }
+
+    public var hotPayloadCount: Int {
+        payloadsByHash.count
+    }
+
+    public var hotPayloadHashes: [Data] {
+        Array(payloadsByHash.keys)
     }
 
     public func blockHash(for blockID: Int) -> Data? {
@@ -45,6 +53,19 @@ public final class PagedCacheManager: @unchecked Sendable {
     public func payload(for blockID: Int) -> KVCacheBlockPayload? {
         guard let hash = blockHash(for: blockID) else { return nil }
         return payload(for: hash)
+    }
+
+    public func setHotPayload(_ payload: KVCacheBlockPayload, for hash: Data) {
+        payloadsByHash[hash] = payload
+    }
+
+    public func removeHotPayload(for hash: Data) {
+        payloadsByHash.removeValue(forKey: hash)
+    }
+
+    public func tokenCount(for hash: Data) -> Int? {
+        guard let blockID = hashIndex.blockID(for: hash) else { return nil }
+        return blocks[blockID].tokenCount
     }
 
     @discardableResult
@@ -67,6 +88,26 @@ public final class PagedCacheManager: @unchecked Sendable {
         block.lastAccessTick = nextTick()
         hashIndex.insert(blockID: blockID, hash: hash)
         payloadsByHash[hash] = payload
+        return blockID
+    }
+
+    @discardableResult
+    public func registerBlockMetadata(
+        hash: Data,
+        tokenCount: Int,
+        refCount: Int = 1
+    ) -> Int {
+        if let blockID = hashIndex.blockID(for: hash) {
+            return blockID
+        }
+
+        let blockID = allocateBlockID()
+        let block = blocks[blockID]
+        block.refCount = refCount
+        block.blockHash = hash
+        block.tokenCount = tokenCount
+        block.lastAccessTick = nextTick()
+        hashIndex.insert(blockID: blockID, hash: hash)
         return blockID
     }
 

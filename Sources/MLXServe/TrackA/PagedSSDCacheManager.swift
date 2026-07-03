@@ -1,0 +1,204 @@
+import Foundation
+
+public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable {
+    public let cacheDirectory: URL
+    public let modelName: String
+    public let maxHotBlocks: Int
+
+    private let writer = SSDWriter()
+    private var pendingWrites: [Task<Void, Error>] = []
+    private var hotLRU: [Data] = []
+    private var knownSSDHashes: Set<Data> = []
+
+    public init(
+        cacheDirectory: URL,
+        modelName: String,
+        blockSize: Int = 256,
+        maxHotBlocks: Int = 1
+    ) throws {
+        self.cacheDirectory = cacheDirectory
+        self.modelName = modelName
+        self.maxHotBlocks = maxHotBlocks
+        super.init(blockSize: blockSize)
+        try scanOnStart()
+    }
+
+    public override func storeBlock(
+        hash: Data,
+        tokenCount: Int,
+        payload: KVCacheBlockPayload
+    ) -> Int {
+        let blockID = super.storeBlock(hash: hash, tokenCount: tokenCount, payload: payload)
+        markHot(hash)
+        enqueueWrite(hash: hash, tokenCount: tokenCount, payload: payload)
+        enforceHotLimit(protectedHash: hash)
+        return blockID
+    }
+
+    public override func payload(for hash: Data) -> KVCacheBlockPayload? {
+        if let payload = super.payload(for: hash) {
+            markHot(hash)
+            return payload
+        }
+
+        guard knownSSDHashes.contains(hash), let loaded = try? loadPayload(hash: hash) else {
+            return nil
+        }
+        setHotPayload(loaded, for: hash)
+        markHot(hash)
+        enforceHotLimit(protectedHash: hash)
+        return loaded
+    }
+
+    public override func payload(for blockID: Int) -> KVCacheBlockPayload? {
+        guard let hash = blockHash(for: blockID) else { return nil }
+        return payload(for: hash)
+    }
+
+    public func flushPendingWrites() async throws {
+        let writes = pendingWrites
+        pendingWrites.removeAll()
+        for write in writes {
+            try await write.value
+        }
+    }
+
+    public func fileURL(for hash: Data) -> URL {
+        let hex = BlockHashing.hex(hash)
+        let subdirectory = String(hex.prefix(1))
+        return cacheDirectory
+            .appendingPathComponent(subdirectory, isDirectory: true)
+            .appendingPathComponent("\(hex).safetensors")
+    }
+
+    private func enqueueWrite(hash: Data, tokenCount: Int, payload: KVCacheBlockPayload) {
+        let snapshot = SafetensorsBlockIO.snapshot(
+            hash: hash,
+            payload: payload,
+            tokenCount: tokenCount,
+            modelName: modelName,
+            blockSize: blockSize
+        )
+        let destination = fileURL(for: hash)
+        knownSSDHashes.insert(hash)
+        pendingWrites.append(Task {
+            try await writer.write(snapshot, to: destination)
+        })
+    }
+
+    private func loadPayload(hash: Data) throws -> KVCacheBlockPayload {
+        let loaded = try SafetensorsBlockIO.read(from: fileURL(for: hash))
+        try validate(metadata: loaded.metadata, expectedHash: hash)
+
+        guard let layerCount = Int(loaded.metadata["numLayers"] ?? "") else {
+            throw SafetensorsBlockIOError.incompatibleMetadata("numLayers")
+        }
+
+        var layers: [CacheLayerBlockPayload] = []
+        for layerIndex in 0 ..< layerCount {
+            let keysName = "layer.\(layerIndex).keys"
+            let valuesName = "layer.\(layerIndex).values"
+            guard let keys = loaded.arrays[keysName] else {
+                throw SafetensorsBlockIOError.missingTensor(keysName)
+            }
+            guard let values = loaded.arrays[valuesName] else {
+                throw SafetensorsBlockIOError.missingTensor(valuesName)
+            }
+            layers.append(
+                CacheLayerBlockPayload(
+                    keys: keys,
+                    values: values,
+                    metaState: [
+                        loaded.metadata["tokenCount"] ?? String(blockSize),
+                        CacheTypeHandlers.encodeBool(false),
+                    ]
+                )
+            )
+        }
+        return KVCacheBlockPayload(layers: layers)
+    }
+
+    private func scanOnStart() throws {
+        try FileManager.default.createDirectory(
+            at: cacheDirectory,
+            withIntermediateDirectories: true
+        )
+        guard let enumerator = FileManager.default.enumerator(
+            at: cacheDirectory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "safetensors" {
+            let metadata = try SafetensorsBlockIO.readMetadata(from: fileURL)
+            guard let hashHex = metadata["blockHash"],
+                let hash = Data(hexString: hashHex)
+            else {
+                continue
+            }
+            try validate(metadata: metadata, expectedHash: hash)
+            let tokenCount = Int(metadata["tokenCount"] ?? "") ?? blockSize
+            registerBlockMetadata(hash: hash, tokenCount: tokenCount)
+            knownSSDHashes.insert(hash)
+        }
+    }
+
+    private func validate(metadata: [String: String], expectedHash: Data) throws {
+        guard metadata["formatVersion"] == SafetensorsBlockIO.formatVersion else {
+            throw SafetensorsBlockIOError.incompatibleMetadata("formatVersion")
+        }
+        guard metadata["modelName"] == modelName else {
+            throw SafetensorsBlockIOError.incompatibleMetadata("modelName")
+        }
+        guard metadata["blockSize"] == String(blockSize) else {
+            throw SafetensorsBlockIOError.incompatibleMetadata("blockSize")
+        }
+        guard metadata["blockHash"] == BlockHashing.hex(expectedHash) else {
+            throw SafetensorsBlockIOError.incompatibleMetadata("blockHash")
+        }
+        guard CacheTypeHandlers.decodeBool(metadata["isRotating"] ?? "") == false else {
+            throw SafetensorsBlockIOError.incompatibleMetadata("isRotating")
+        }
+    }
+
+    private func markHot(_ hash: Data) {
+        hotLRU.removeAll { $0 == hash }
+        hotLRU.append(hash)
+    }
+
+    private func enforceHotLimit(protectedHash: Data?) {
+        while hotPayloadCount > maxHotBlocks, let victim = hotLRU.first {
+            hotLRU.removeFirst()
+            if victim == protectedHash, hotPayloadCount > 1 {
+                hotLRU.append(victim)
+                continue
+            }
+            removeHotPayload(for: victim)
+        }
+    }
+}
+
+private actor SSDWriter {
+    func write(_ snapshot: SafetensorsBlockFile, to url: URL) throws {
+        try SafetensorsBlockIO.write(snapshot, to: url)
+    }
+}
+
+private extension Data {
+    init?(hexString: String) {
+        guard hexString.count.isMultiple(of: 2) else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(hexString.count / 2)
+        var index = hexString.startIndex
+        while index < hexString.endIndex {
+            let next = hexString.index(index, offsetBy: 2)
+            guard let byte = UInt8(hexString[index ..< next], radix: 16) else {
+                return nil
+            }
+            bytes.append(byte)
+            index = next
+        }
+        self = Data(bytes)
+    }
+}
