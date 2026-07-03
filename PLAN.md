@@ -171,6 +171,20 @@ Rotating/sliding-window family (+supersede-on-extend + boundary snapshots), MTP,
 - **Golden fixtures vs Python omlx/mlx-lm**: fixed (prompt, seed, model) → snapshot logits + token ids to `Tests/Fixtures/*.json` (committed). Assert: exact match on greedy token ids for well-separated logits; tolerance (max-abs-diff/cosine) on raw logit vectors. A fixture-generation script (`scripts/gen_fixtures.py`, runs against `~/Documents/Guest/omlx` or mlx-lm) is committed but fixtures are pre-generated so `swift test` needs no Python.
 - **Performance** (M6): separate, statistical, not CI-gated.
 
+## Gate results
+
+Recorded 2026-07-03 during M0 scaffold work on branch `impl/native`.
+
+- **G1 — bf16 bit-reinterpret view: API FOUND, runtime probe SKIPPED in this process.** Exact mlx-swift API: `MLXArray.view(dtype:stream:)`, e.g. `rawUInt16.view(dtype: .bfloat16, stream: .cpu)` and `bfloat.view(dtype: .uint16, stream: .cpu)`. The committed probe is `GateProbeTests.testG1BFloat16UInt16BitReinterpretRoundTrip`.
+- **G2 — safetensors metadata: API FOUND, runtime probe SKIPPED in this process.** Exact mlx-swift API: `save(arrays:metadata:url:stream:)` and `loadArraysAndMetadata(url:stream:) -> ([String: MLXArray], [String: String])`. `MLXLMCommon.loadWeights` also uses `loadArraysAndMetadata(url:)` and passes the first safetensors metadata dictionary to `model.sanitize(weights:metadata:)`. The committed probe is `GateProbeTests.testG2SafetensorsMetadataRoundTrip`.
+- **Why skipped:** this managed test process exposes no Metal device (`MTLCreateSystemDefaultDevice() == nil`). Touching MLX before that guard aborts inside `mlx/backend/metal/device.cpp:38` with `NSRangeException`, even when CPU streams are requested. The tests now skip before touching MLX if Metal is unavailable.
+- **Verify-first for M1:** `mlx-swift-lm` has reusable prompt-cache serialization (`savePromptCache`, `loadPromptCache`) and some left-padding metadata helpers on `ArraysCache`/`MambaCache`, but no reusable `BatchKVCache`, `GenerationBatch`, or `BatchGenerator` equivalent was found in Swift. M1 still needs a Swift batch decode/cache layer, reusing existing serialization/mask helpers where appropriate.
+
+## Blocked
+
+- **Pinned local test model absent.** Searched local candidates under `~/Documents/Guest`, `~/models`, and bundled-model style paths for `mlc-chat-SmolLM-135M-4bit`; no pinned small MLX-format model was found. A non-pinned large candidate exists at `/Users/timapple/Documents/huggingface/models/mlx-community/gemma-4-e4b-it-4bit`, but M0 tests do not use it because the plan calls for a small pinned full-attention fixture. Model-dependent tests skip cleanly unless `MLXSERVE_TEST_MODEL` points at a local MLX model directory.
+- **Runtime MLX probes blocked by no visible Metal device in this process.** The probe source compiles against the exact mlx-swift APIs listed above, but execution is skipped in this environment to keep `swift test` green instead of crashing in MLX Metal initialization.
+
 ---
 
 ## Appendix A — Track A porting map (prefix + SSD cache)  [omlx file:line preserved]
