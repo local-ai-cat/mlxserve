@@ -57,6 +57,10 @@ final class BatchCacheShapeTests: XCTestCase {
         XCTAssertTrue(batch.kvCache is FixedStateCache)
         XCTAssertEqual(batch.kvCache.state[0].shape, [1, 3, 16])
         XCTAssertEqual(batch.kvCache.state[1].shape, [1, 4, 8, 8])
+
+        let extracted = batch.extract(0)
+        XCTAssertEqual(extracted.state[0].shape, [1, 3, 16])
+        XCTAssertEqual(extracted.state[1].shape, [1, 4, 8, 8])
     }
 }
 

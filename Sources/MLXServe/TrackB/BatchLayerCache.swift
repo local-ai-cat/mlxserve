@@ -106,9 +106,6 @@ final class BatchLayerCache {
         let cache = KVCacheSimple()
         guard row >= 0, row < batchSize else { return cache }
         cache.state = kvCache.state.map { Self.sliceRow($0, row: row) }
-        if row < rowMetaStates.count {
-            cache.metaState = rowMetaStates[row]
-        }
         return cache
     }
 
