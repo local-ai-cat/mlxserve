@@ -27,6 +27,42 @@ private struct SSDCacheGateResult: Sendable {
 }
 
 final class TrackAPrefixCacheTests: XCTestCase {
+    func testPagedCacheManagerEvictsUnusedBlocksAtCapacity() throws {
+        let manager = PagedCacheManager(blockSize: 1, maxStoredBlocks: 2)
+        let hashes = (0 ..< 3).map { Data(repeating: UInt8($0), count: 32) }
+
+        for hash in hashes {
+            manager.storeBlock(hash: hash, tokenCount: 1, payload: Self.unitPayload())
+        }
+
+        XCTAssertEqual(manager.allocatedBlocks, 2)
+        XCTAssertFalse(manager.contains(hash: hashes[0]))
+        XCTAssertTrue(manager.contains(hash: hashes[1]))
+        XCTAssertTrue(manager.contains(hash: hashes[2]))
+    }
+
+    func testPagedCacheManagerKeepsRetainedBlocksUntilReleased() throws {
+        let manager = PagedCacheManager(blockSize: 1, maxStoredBlocks: 1)
+        let retainedHash = Data(repeating: 0xA1, count: 32)
+        let newerHash = Data(repeating: 0xB2, count: 32)
+
+        let retainedBlockID = manager.storeBlock(
+            hash: retainedHash,
+            tokenCount: 1,
+            payload: Self.unitPayload()
+        )
+        manager.retain(blockID: retainedBlockID)
+        manager.storeBlock(hash: newerHash, tokenCount: 1, payload: Self.unitPayload())
+
+        XCTAssertEqual(manager.allocatedBlocks, 2)
+        XCTAssertTrue(manager.contains(hash: retainedHash))
+        XCTAssertTrue(manager.contains(hash: newerHash))
+
+        manager.release(BlockTable(blockIDs: [retainedBlockID]))
+
+        XCTAssertEqual(manager.allocatedBlocks, 1)
+    }
+
     func testReconstructThrowsWhenRetainedBlockPayloadIsMissing() throws {
         let prefixCache = BlockAwarePrefixCache(modelName: "unit-test", blockSize: 2)
         let tokens = [1, 2]
@@ -470,6 +506,18 @@ final class TrackAPrefixCacheTests: XCTestCase {
         return loadedKeys.view(dtype: .uint16).asArray(UInt16.self) == raw.asArray(UInt16.self)
             && loadedValues.view(dtype: .uint16).asArray(UInt16.self) == raw.asArray(UInt16.self)
             && mlxLoadedKeys.view(dtype: .uint16).asArray(UInt16.self) == raw.asArray(UInt16.self)
+    }
+
+    private static func unitPayload() -> KVCacheBlockPayload {
+        KVCacheBlockPayload(
+            layers: [
+                CacheLayerBlockPayload(
+                    keys: MLXArray.zeros([1, 1, 1], dtype: .float32),
+                    values: MLXArray.zeros([1, 1, 1], dtype: .float32),
+                    metaState: ["1", CacheTypeHandlers.encodeBool(false)]
+                )
+            ]
+        )
     }
 }
 

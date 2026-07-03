@@ -15,12 +15,13 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
         cacheDirectory: URL,
         modelName: String,
         blockSize: Int = 256,
-        maxHotBlocks: Int = 1
+        maxHotBlocks: Int = 1,
+        maxStoredBlocks: Int = 4096
     ) throws {
         self.cacheDirectory = cacheDirectory
         self.modelName = modelName
         self.maxHotBlocks = maxHotBlocks
-        super.init(blockSize: blockSize)
+        super.init(blockSize: blockSize, maxStoredBlocks: maxStoredBlocks)
         try scanOnStart()
     }
 
@@ -214,7 +215,20 @@ public final class PagedSSDCacheManager: PagedCacheManager, @unchecked Sendable 
             }
         }
         if succeeded {
+            enforceCapacityLimit()
             enforceHotLimit(protectedHash: nil)
+        }
+    }
+
+    override func canEvictBlock(hash: Data) -> Bool {
+        isKnownOnSSD(hash)
+    }
+
+    override func didEvictBlock(hash: Data) {
+        withSSDLock {
+            hotLRU.removeAll { $0 == hash }
+            knownSSDHashes.remove(hash)
+            pendingWrites.removeValue(forKey: hash)?.cancel()
         }
     }
 

@@ -16,6 +16,7 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
     public let modelName: String
     public let blockSize: Int
     public let manager: PagedCacheManager
+    private let lock = NSRecursiveLock()
 
     public init(
         modelName: String,
@@ -28,102 +29,112 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
     }
 
     public func fetchCache(tokens: [Int]) -> PrefixCacheHit? {
-        let candidateHashes = BlockHashing.chainHashes(
-            modelName: modelName,
-            tokens: tokens,
-            blockSize: blockSize
-        )
-        guard !candidateHashes.isEmpty else { return nil }
+        withLock {
+            let candidateHashes = BlockHashing.chainHashes(
+                modelName: modelName,
+                tokens: tokens,
+                blockSize: blockSize
+            )
+            guard !candidateHashes.isEmpty else { return nil }
 
-        var retainedBlockIDs: [Int] = []
-        var retainedHashes: [Data] = []
-        for hash in candidateHashes {
-            guard let blockID = manager.retain(hash: hash) else { break }
-            retainedBlockIDs.append(blockID)
-            retainedHashes.append(hash)
+            var retainedBlockIDs: [Int] = []
+            var retainedHashes: [Data] = []
+            for hash in candidateHashes {
+                guard let blockID = manager.retain(hash: hash) else { break }
+                retainedBlockIDs.append(blockID)
+                retainedHashes.append(hash)
+            }
+
+            guard !retainedBlockIDs.isEmpty else { return nil }
+            return PrefixCacheHit(
+                matchedTokenCount: retainedBlockIDs.count * blockSize,
+                table: BlockTable(blockIDs: retainedBlockIDs),
+                blockHashes: retainedHashes
+            )
         }
-
-        guard !retainedBlockIDs.isEmpty else { return nil }
-        return PrefixCacheHit(
-            matchedTokenCount: retainedBlockIDs.count * blockSize,
-            table: BlockTable(blockIDs: retainedBlockIDs),
-            blockHashes: retainedHashes
-        )
     }
 
     public func reconstructCache(from hit: PrefixCacheHit) throws -> [KVCacheSimple] {
-        let payloads = try hit.table.blockIDs.map { blockID in
-            guard let payload = manager.payload(for: blockID) else {
-                throw PrefixCacheError.missingBlockPayload(
-                    blockID: blockID,
-                    hash: manager.blockHash(for: blockID)
-                )
+        try withLock {
+            let payloads = try hit.table.blockIDs.map { blockID in
+                guard let payload = manager.payload(for: blockID) else {
+                    throw PrefixCacheError.missingBlockPayload(
+                        blockID: blockID,
+                        hash: manager.blockHash(for: blockID)
+                    )
+                }
+                return payload
             }
-            return payload
-        }
-        guard let firstPayload = payloads.first else { return [] }
+            guard let firstPayload = payloads.first else { return [] }
 
-        return try (0 ..< firstPayload.layers.count).map { layerIndex in
-            let firstLayer = firstPayload.layers[layerIndex]
-            for payload in payloads where payload.layers.indices.contains(layerIndex) == false {
-                throw PrefixCacheError.inconsistentLayerCount
+            return try (0 ..< firstPayload.layers.count).map { layerIndex in
+                let firstLayer = firstPayload.layers[layerIndex]
+                for payload in payloads where payload.layers.indices.contains(layerIndex) == false {
+                    throw PrefixCacheError.inconsistentLayerCount
+                }
+                let sequenceAxis = try Self.sequenceAxis(
+                    cacheType: firstLayer.className,
+                    state: [firstLayer.keys, firstLayer.values]
+                )
+                let keys = concatenated(payloads.map { $0.layers[layerIndex].keys }, axis: sequenceAxis)
+                let values = concatenated(payloads.map { $0.layers[layerIndex].values }, axis: sequenceAxis)
+                let cache = KVCacheSimple()
+                cache.state = [keys, values]
+                return cache
             }
-            let sequenceAxis = try Self.sequenceAxis(
-                cacheType: firstLayer.className,
-                state: [firstLayer.keys, firstLayer.values]
-            )
-            let keys = concatenated(payloads.map { $0.layers[layerIndex].keys }, axis: sequenceAxis)
-            let values = concatenated(payloads.map { $0.layers[layerIndex].values }, axis: sequenceAxis)
-            let cache = KVCacheSimple()
-            cache.state = [keys, values]
-            return cache
         }
     }
 
     @discardableResult
     public func storeCache(tokens: [Int], cache: [any KVCache]) throws -> BlockTable {
-        let fullBlockCount = tokens.count / blockSize
-        guard fullBlockCount > 0 else { return BlockTable() }
-        try preflightCacheForStorage(cache)
+        try withLock {
+            let fullBlockCount = tokens.count / blockSize
+            guard fullBlockCount > 0 else { return BlockTable() }
+            try preflightCacheForStorage(cache)
 
-        let hashes = BlockHashing.chainHashes(
-            modelName: modelName,
-            tokens: tokens,
-            blockSize: blockSize
-        )
-        precondition(hashes.count == fullBlockCount)
+            let hashes = BlockHashing.chainHashes(
+                modelName: modelName,
+                tokens: tokens,
+                blockSize: blockSize
+            )
+            precondition(hashes.count == fullBlockCount)
 
-        var blockIDs: [Int] = []
-        for blockIndex in 0 ..< fullBlockCount {
-            let hash = hashes[blockIndex]
-            if manager.contains(hash: hash), let blockID = manager.retain(hash: hash) {
-                manager.release(BlockTable(blockIDs: [blockID]))
+            var blockIDs: [Int] = []
+            for blockIndex in 0 ..< fullBlockCount {
+                let hash = hashes[blockIndex]
+                if manager.contains(hash: hash), let blockID = manager.retain(hash: hash) {
+                    manager.release(BlockTable(blockIDs: [blockID]))
+                    blockIDs.append(blockID)
+                    continue
+                }
+
+                let payload = try payloadForBlock(
+                    cache: cache,
+                    tokenStart: blockIndex * blockSize,
+                    tokenEnd: (blockIndex + 1) * blockSize
+                )
+                let blockID = manager.storeBlock(
+                    hash: hash,
+                    tokenCount: blockSize,
+                    payload: payload
+                )
                 blockIDs.append(blockID)
-                continue
             }
 
-            let payload = try payloadForBlock(
-                cache: cache,
-                tokenStart: blockIndex * blockSize,
-                tokenEnd: (blockIndex + 1) * blockSize
-            )
-            let blockID = manager.storeBlock(
-                hash: hash,
-                tokenCount: blockSize,
-                payload: payload
-            )
-            blockIDs.append(blockID)
+            return BlockTable(blockIDs: blockIDs)
         }
-
-        return BlockTable(blockIDs: blockIDs)
     }
 
     public func release(_ hit: PrefixCacheHit) {
-        manager.release(hit.table)
+        withLock {
+            manager.release(hit.table)
+        }
     }
 
     public func release(_ table: BlockTable) {
-        manager.release(table)
+        withLock {
+            manager.release(table)
+        }
     }
 
     private func payloadForBlock(
@@ -191,6 +202,12 @@ public final class BlockAwarePrefixCache: @unchecked Sendable {
         var result: [any MLXArrayIndex] = Array(repeating: 0..., count: rank)
         result[sequenceAxis] = range
         return result
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 }
 
