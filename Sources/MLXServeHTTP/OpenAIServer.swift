@@ -252,6 +252,7 @@ public final class OpenAIServer: @unchecked Sendable {
     private let port: NWEndpoint.Port
     private let backend: any OpenAIChatBackend
     private let listener: NWListener
+    private let responsesStore: ResponsesStore
 
     public init(
         host: String = "127.0.0.1",
@@ -265,6 +266,7 @@ public final class OpenAIServer: @unchecked Sendable {
         self.port = nwPort
         self.backend = backend
         self.listener = try NWListener(using: .tcp, on: nwPort)
+        self.responsesStore = ResponsesStore()
     }
 
     public func start() async throws {
@@ -308,7 +310,21 @@ public final class OpenAIServer: @unchecked Sendable {
                 try await sendJSON(modelsResponse(), status: 200, connection: connection)
             case ("POST", "/v1/chat/completions"):
                 try await handleChatCompletion(request, connection: connection)
+            case ("POST", "/v1/messages"):
+                try await AnthropicMessagesHandler(backend: backend).handleMessages(request, connection: connection)
+            case ("POST", "/v1/messages/count_tokens"):
+                try await AnthropicMessagesHandler(backend: backend).handleCountTokens(request, connection: connection)
+            case ("POST", "/v1/responses"):
+                try await ResponsesHandler(backend: backend, store: responsesStore).handleCreate(request, connection: connection)
             default:
+                if request.method == "GET", let id = responseID(from: request.path) {
+                    try await ResponsesHandler(backend: backend, store: responsesStore).handleGet(id: id, connection: connection)
+                    return
+                }
+                if request.method == "DELETE", let id = responseID(from: request.path) {
+                    try await ResponsesHandler(backend: backend, store: responsesStore).handleDelete(id: id, connection: connection)
+                    return
+                }
                 try await sendJSON(openAIErrorBody(message: "not found", status: 404), status: 404, connection: connection)
             }
         } catch {
@@ -318,6 +334,13 @@ public final class OpenAIServer: @unchecked Sendable {
                 connection: connection
             )
         }
+    }
+
+    private func responseID(from path: String) -> String? {
+        let prefix = "/v1/responses/"
+        guard path.hasPrefix(prefix) else { return nil }
+        let id = String(path.dropFirst(prefix.count))
+        return id.isEmpty ? nil : id
     }
 
     private func handleChatCompletion(_ request: HTTPRequest, connection: NWConnection) async throws {
@@ -984,7 +1007,9 @@ private extension NWConnection {
             }
         }
     }
+}
 
+extension NWConnection {
     func send(data: Data) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             send(content: data, completion: .contentProcessed { error in
