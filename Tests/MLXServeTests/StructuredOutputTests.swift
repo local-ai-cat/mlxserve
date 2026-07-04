@@ -250,6 +250,27 @@ final class StructuredOutputTests: XCTestCase {
         XCTAssertNil(allowed)
     }
 
+    func testAllowedNextTokenIDsForcesEOSAfterChoiceTextWhenSequencesAreEOSTerminated() {
+        let eosTokenID = 999
+        let afterChoiceText = TokenSampler.allowedNextTokenIDs(
+            allowedSequences: [
+                [10, 20, eosTokenID],
+                [30, 40, eosTokenID],
+            ],
+            generatedTokens: [10, 20]
+        )
+        let afterChoiceAndEOS = TokenSampler.allowedNextTokenIDs(
+            allowedSequences: [
+                [10, 20, eosTokenID],
+                [30, 40, eosTokenID],
+            ],
+            generatedTokens: [10, 20, eosTokenID]
+        )
+
+        XCTAssertEqual(afterChoiceText, [eosTokenID])
+        XCTAssertNil(afterChoiceAndEOS)
+    }
+
     func testAllowedNextTokenIDsReturnsNilForEmptyOrNoMatchingSequences() {
         XCTAssertNil(
             TokenSampler.allowedNextTokenIDs(

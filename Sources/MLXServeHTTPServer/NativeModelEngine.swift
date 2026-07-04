@@ -166,9 +166,22 @@ final class NativeModelEngine: @unchecked Sendable {
 
     private func allowedSequences(from structuredOutput: StructuredOutputSpec) -> [[Int]]? {
         guard case .choice(let choices) = structuredOutput else { return nil }
-        return choices.map { choice in
-            context.tokenizer.encode(text: choice, addSpecialTokens: false)
+        let eosTokenId = canonicalEOSTokenId()
+        let sequences = choices.compactMap { choice -> [Int]? in
+            var sequence = context.tokenizer.encode(text: choice, addSpecialTokens: false)
+            guard !sequence.isEmpty else { return nil }
+            if let eosTokenId {
+                sequence.append(eosTokenId)
+            }
+            return sequence
         }
+        return sequences.isEmpty ? nil : sequences
+    }
+
+    private func canonicalEOSTokenId() -> Int? {
+        // Choice constraints are terminal only when the choice trie includes EOS.
+        // If a model exposes no EOS id, fall back to bare choices and let maxTokens stop.
+        context.tokenizer.eosTokenId ?? eosTokenIds.first
     }
 
     private func injectedMessages(from request: OpenAIChatRequest) throws -> [OpenAIChatMessage] {
