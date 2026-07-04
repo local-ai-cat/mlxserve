@@ -231,7 +231,7 @@ public final class ContinuousBatchGenerator {
         let logits = output.logits[0..., -1, 0...]
         let sampledRows = (0 ..< rowUIDs.count).map { row in
             TokenSampler.sample(
-                logprobs: logits[row, 0...],
+                logits: logits[row, 0...],
                 parameters: samplers[row],
                 generatedTokens: generatedTokenHistory[row]
             )

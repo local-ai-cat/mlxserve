@@ -54,8 +54,9 @@ public struct SamplingParameters: Sendable, Equatable {
 }
 
 public enum TokenSampler {
+    /// Samples from raw pre-softmax logits; penalties must be applied in logit space.
     public static func sample(
-        logprobs logits: MLXArray,
+        logits: MLXArray,
         parameters: SamplingParameters,
         generatedTokens: [Int] = []
     ) -> MLXArray {
