@@ -515,6 +515,38 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertFalse(request.includeUsage)
     }
 
+    func testChatStreamOpeningChunksStartWithKeepaliveThenRoleAndDoneFrame() throws {
+        let chunks = chatStreamOpeningChunks(id: "chatcmpl-test", created: 123, model: "test-model")
+
+        XCTAssertEqual(chunks.count, 2)
+
+        let keepalive = chunks[0]
+        XCTAssertEqual(keepalive["id"] as? String, "chatcmpl-test")
+        XCTAssertEqual(keepalive["object"] as? String, "chat.completion.chunk")
+        XCTAssertEqual(keepalive["created"] as? Int, 0)
+        XCTAssertEqual(keepalive["model"] as? String, "keepalive")
+        let keepaliveChoices = try XCTUnwrap(keepalive["choices"] as? [[String: Any]])
+        XCTAssertEqual(keepaliveChoices.count, 1)
+        XCTAssertEqual(keepaliveChoices[0]["index"] as? Int, 0)
+        let keepaliveDelta = try XCTUnwrap(keepaliveChoices[0]["delta"] as? [String: String])
+        XCTAssertEqual(keepaliveDelta["content"], "")
+        XCTAssertTrue(keepaliveChoices[0]["finish_reason"] is NSNull)
+
+        let role = chunks[1]
+        XCTAssertEqual(role["id"] as? String, "chatcmpl-test")
+        XCTAssertEqual(role["object"] as? String, "chat.completion.chunk")
+        XCTAssertEqual(role["created"] as? Int, 123)
+        XCTAssertEqual(role["model"] as? String, "test-model")
+        let roleChoices = try XCTUnwrap(role["choices"] as? [[String: Any]])
+        XCTAssertEqual(roleChoices.count, 1)
+        XCTAssertEqual(roleChoices[0]["index"] as? Int, 0)
+        let roleDelta = try XCTUnwrap(roleChoices[0]["delta"] as? [String: String])
+        XCTAssertEqual(roleDelta["role"], "assistant")
+        XCTAssertTrue(roleChoices[0]["finish_reason"] is NSNull)
+
+        XCTAssertEqual(chatStreamingDoneFrame, "data: [DONE]\n\n")
+    }
+
     func testTruncateAtStopRemovesStopSequence() {
         let result = truncateAtStop("hello STOP hidden", stopSequences: ["STOP"])
 

@@ -544,22 +544,9 @@ public final class OpenAIServer: @unchecked Sendable {
         try await connection.send(
             data: Data(header.utf8)
         )
-        try await sendSSE(
-            [
-                "id": id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": request.model,
-                "choices": [
-                    [
-                        "index": 0,
-                        "delta": ["role": "assistant"],
-                        "finish_reason": NSNull(),
-                    ]
-                ],
-            ],
-            connection: connection
-        )
+        for chunk in chatStreamOpeningChunks(id: id, created: created, model: request.model) {
+            try await sendSSE(chunk, connection: connection)
+        }
 
         do {
             for try await chunk in stream.chunks {
@@ -600,7 +587,8 @@ public final class OpenAIServer: @unchecked Sendable {
                 ],
                 connection: connection
             )
-            try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+            try await connection.sendFinal(data: Data(chatStreamingDoneFrame.utf8))
+            connection.cancel()
             return
         }
 
@@ -665,7 +653,8 @@ public final class OpenAIServer: @unchecked Sendable {
                 connection: connection
             )
         }
-        try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+        try await connection.sendFinal(data: Data(chatStreamingDoneFrame.utf8))
+        connection.cancel()
     }
 
     private func sendStreamingChatWithTools(
@@ -698,22 +687,9 @@ public final class OpenAIServer: @unchecked Sendable {
                 ).utf8
             )
         )
-        try await sendSSE(
-            [
-                "id": id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": request.model,
-                "choices": [
-                    [
-                        "index": 0,
-                        "delta": ["role": "assistant"],
-                        "finish_reason": NSNull(),
-                    ]
-                ],
-            ],
-            connection: connection
-        )
+        for chunk in chatStreamOpeningChunks(id: id, created: created, model: request.model) {
+            try await sendSSE(chunk, connection: connection)
+        }
 
         do {
             for try await chunk in stream.chunks {
@@ -746,7 +722,8 @@ public final class OpenAIServer: @unchecked Sendable {
                 ],
                 connection: connection
             )
-            try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+            try await connection.sendFinal(data: Data(chatStreamingDoneFrame.utf8))
+            connection.cancel()
             return
         }
 
@@ -846,7 +823,8 @@ public final class OpenAIServer: @unchecked Sendable {
                 connection: connection
             )
         }
-        try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+        try await connection.sendFinal(data: Data(chatStreamingDoneFrame.utf8))
+        connection.cancel()
     }
 
     private func sendBufferedChat(
@@ -1095,6 +1073,43 @@ struct HTTPJSONResponse {
         self.body = body
         self.headers = headers
     }
+}
+
+let chatStreamingDoneFrame = "data: [DONE]\n\n"
+
+func chatStreamOpeningChunks(id: String, created: Int, model: String) -> [[String: Any]] {
+    [
+        chatKeepalivePrimingChunk(id: id),
+        [
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                [
+                    "index": 0,
+                    "delta": ["role": "assistant"],
+                    "finish_reason": NSNull(),
+                ]
+            ],
+        ],
+    ]
+}
+
+func chatKeepalivePrimingChunk(id: String) -> [String: Any] {
+    [
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "keepalive",
+        "choices": [
+            [
+                "index": 0,
+                "delta": ["content": ""],
+                "finish_reason": NSNull(),
+            ]
+        ],
+    ]
 }
 
 private func modelStatusBody(_ status: OpenAIModelPoolStatus) -> [String: Any] {
