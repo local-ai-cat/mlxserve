@@ -265,7 +265,9 @@ final class StructuredOutputTests: XCTestCase {
         )
     }
 
-    func testChoiceLogitsMaskConstrainsGreedyArgmax() {
+    func testChoiceLogitsMaskConstrainsGreedyArgmax() throws {
+        try MLXMetalRuntime.requireAvailable()
+
         let logits = MLXArray([0.1, 99.0, 0.2, 0.3, 0.4, 0.5].map(Float.init))
         let sampled = TokenSampler.sample(
             logits: logits,
