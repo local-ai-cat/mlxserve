@@ -8,13 +8,15 @@ public final class MLXServeEngine: @unchecked Sendable {
         model: any LanguageModel,
         parameters: GenerateParameters = GenerateParameters(),
         maxConcurrentRequests: Int,
-        prefixStore: (any PrefixKVStore)? = nil
+        prefixStore: (any PrefixKVStore)? = nil,
+        serializedDecode: Bool = false
     ) {
         let scheduler = Scheduler(
             modelBox: LanguageModelBox(model),
             parameters: parameters,
             maxConcurrentRequests: maxConcurrentRequests,
-            prefixStore: prefixStore
+            prefixStore: prefixStore,
+            serializedDecode: serializedDecode
         )
         self.scheduler = scheduler
         self.streamDemux = EngineStreamDemux(scheduler: scheduler)

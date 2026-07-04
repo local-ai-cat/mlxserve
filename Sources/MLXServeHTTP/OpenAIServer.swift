@@ -11,15 +11,35 @@ public struct OpenAIModelInfo: Sendable {
     }
 }
 
+public struct OpenAIChatImageReference: Sendable, Equatable {
+    public enum Source: Sendable, Equatable {
+        case dataURI(String)
+        case url(String)
+    }
+
+    public let source: Source
+
+    public init(source: Source) {
+        self.source = source
+    }
+}
+
 public struct OpenAIChatMessage: Sendable {
     public let role: String
     public let content: String
     public let reasoningContent: String?
+    public let imageReferences: [OpenAIChatImageReference]
 
-    public init(role: String, content: String, reasoningContent: String? = nil) {
+    public init(
+        role: String,
+        content: String,
+        reasoningContent: String? = nil,
+        imageReferences: [OpenAIChatImageReference] = []
+    ) {
         self.role = role
         self.content = content
         self.reasoningContent = reasoningContent
+        self.imageReferences = imageReferences
     }
 }
 
@@ -1099,7 +1119,13 @@ public extension OpenAIChatRequest {
                 let text = parts.compactMap { part in
                     part["type"] as? String == "text" ? part["text"] as? String : nil
                 }.joined()
-                return OpenAIChatMessage(role: role, content: text, reasoningContent: reasoningContent)
+                let imageReferences = parts.compactMap(Self.imageReference)
+                return OpenAIChatMessage(
+                    role: role,
+                    content: text,
+                    reasoningContent: reasoningContent,
+                    imageReferences: imageReferences
+                )
             }
             return nil
         }
@@ -1127,6 +1153,21 @@ public extension OpenAIChatRequest {
             enableThinking: object["enable_thinking"] as? Bool,
             chatTemplateKwargs: chatTemplateKwargs
         )
+    }
+
+    private static func imageReference(from part: [String: Any]) -> OpenAIChatImageReference? {
+        guard part["type"] as? String == "image_url",
+            let imageURL = part["image_url"] as? [String: Any],
+            let url = imageURL["url"] as? String,
+            !url.isEmpty
+        else {
+            return nil
+        }
+
+        if url.lowercased().hasPrefix("data:") {
+            return OpenAIChatImageReference(source: .dataURI(url))
+        }
+        return OpenAIChatImageReference(source: .url(url))
     }
 
     private static func floatValue(_ value: Any?) -> Float? {

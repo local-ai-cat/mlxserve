@@ -131,20 +131,38 @@ public final class ContinuousBatchGenerator {
         rowUIDs
     }
 
+    @discardableResult
     public func insert(
         uid: String,
         input: LMInput,
         sampling: SamplingParameters
-    ) throws {
-        let prepared = try prefillWithLastTokenWithheld(input)
-        try insert(uid: uid, cache: prepared.cache, lastToken: prepared.lastToken, sampling: sampling)
+    ) throws -> Response? {
+        let rowCache = model.newCache(parameters: parameters)
+        switch try model.prepare(input, cache: rowCache, windowSize: parameters.prefillStepSize) {
+        case .tokens(let tokens):
+            let lastToken = try prefillWithLastTokenWithheld(tokens, cache: rowCache)
+            try insert(uid: uid, cache: rowCache, lastToken: lastToken, sampling: sampling)
+            return nil
+        case .logits(let output):
+            let firstToken = sampledToken(from: output.logits, sampling: sampling)
+            let tokenID = firstToken.item(Int.self)
+            try insert(
+                uid: uid,
+                cache: rowCache,
+                lastToken: firstToken,
+                sampling: sampling,
+                generatedTokens: [tokenID]
+            )
+            return Response(uid: uid, token: tokenID)
+        }
     }
 
     public func insert(
         uid: String,
         cache rowCache: [any KVCache],
         lastToken: MLXArray,
-        sampling: SamplingParameters
+        sampling: SamplingParameters,
+        generatedTokens: [Int] = []
     ) throws {
         precondition(!rowUIDs.contains(uid), "duplicate batch uid '\(uid)'")
         precondition(!rowCache.isEmpty, "continuous batching requires a non-empty KV cache")
@@ -179,7 +197,7 @@ public final class ContinuousBatchGenerator {
 
         rowUIDs.append(uid)
         samplers.append(sampling)
-        generatedTokenHistory.append([])
+        generatedTokenHistory.append(generatedTokens)
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
@@ -251,20 +269,11 @@ public final class ContinuousBatchGenerator {
         }
     }
 
-    private func prefillWithLastTokenWithheld(_ input: LMInput) throws -> (
-        cache: [any KVCache],
-        lastToken: MLXArray
-    ) {
-        let rowCache = model.newCache(parameters: parameters)
-        let remaining: LMInput.Text
-        switch try model.prepare(input, cache: rowCache, windowSize: parameters.prefillStepSize) {
-        case .tokens(let tokens):
-            remaining = tokens
-        case .logits:
-            throw BatchGeneratorError.unsupportedPreparedLogits
-        }
-
-        let tokens = remaining.tokens
+    private func prefillWithLastTokenWithheld(
+        _ text: LMInput.Text,
+        cache rowCache: [any KVCache]
+    ) throws -> MLXArray {
+        let tokens = text.tokens
         let tokenCount = tokens.dim(0)
         guard tokenCount > 1 else {
             throw BatchGeneratorError.promptTooShortForExternalPrefill
@@ -275,9 +284,15 @@ public final class ContinuousBatchGenerator {
         _ = model(prefixInput[text: .newAxis], cache: rowCache, state: nil)
         eval(rowCache)
 
-        return (
-            cache: rowCache,
-            lastToken: tokens[tokenCount - 1]
+        return tokens[tokenCount - 1]
+    }
+
+    private func sampledToken(from logits: MLXArray, sampling: SamplingParameters) -> MLXArray {
+        let nextTokenLogits = logits[0..., -1, 0...]
+        return TokenSampler.sample(
+            logits: nextTokenLogits[0, 0...],
+            parameters: sampling,
+            generatedTokens: []
         )
     }
 }
