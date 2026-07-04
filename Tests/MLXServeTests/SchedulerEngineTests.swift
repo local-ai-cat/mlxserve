@@ -1,8 +1,10 @@
+import CoreImage
 import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 import MLXServe
+import MLXVLM
 import Tokenizers
 import XCTest
 
@@ -215,6 +217,107 @@ final class SchedulerEngineTests: XCTestCase {
                 XCTAssertFalse(responses.isEmpty)
                 XCTAssertTrue(responses.allSatisfy { $0.uid == uid })
                 XCTAssertEqual(responses.last?.finishReason, .length)
+            }
+        }
+    }
+
+    func testVLMImageDescribeProducesTokens() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolveVLM() else {
+            throw XCTSkip("Set MLXSERVE_VLM_TEST_MODEL to run VLM engine gate.")
+        }
+
+        let container = try await VLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+
+        try await container.perform { context in
+            let input = try await context.processor.prepare(
+                input: UserInput(
+                    prompt: "Describe the image briefly.",
+                    images: [Self.testImage(width: 96, height: 96)]
+                )
+            )
+            let engine = MLXServeEngine(
+                model: context.model,
+                parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+                maxConcurrentRequests: 1
+            )
+
+            let responses = try await Self.collectResponses(
+                from: engine.stream(
+                    Request(
+                        uid: "vlm-single",
+                        input: input,
+                        maxTokens: 4,
+                        sampling: SamplingParameters(temperature: 0)
+                    )
+                )
+            )
+            let tokens = responses.filter { $0.token >= 0 }
+
+            XCTAssertGreaterThan(tokens.count, 0)
+            XCTAssertNotNil(responses.last?.finishReason)
+        }
+    }
+
+    func testVLMConcurrentImageRequestsBothComplete() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolveVLM() else {
+            throw XCTSkip("Set MLXSERVE_VLM_TEST_MODEL to run VLM concurrent engine gate.")
+        }
+
+        let container = try await VLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+
+        try await container.perform { context in
+            let inputs = try await [
+                Self.testImage(width: 96, height: 96),
+                Self.testImage(width: 160, height: 112),
+            ].mapAsync { image in
+                try await context.processor.prepare(
+                    input: UserInput(
+                        prompt: "Describe the image briefly.",
+                        images: [image]
+                    )
+                )
+            }
+            let engine = MLXServeEngine(
+                model: context.model,
+                parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+                maxConcurrentRequests: 2
+            )
+            let request0 = Request(
+                uid: "vlm-0",
+                input: inputs[0],
+                maxTokens: 4,
+                sampling: SamplingParameters(temperature: 0)
+            )
+            let request1 = Request(
+                uid: "vlm-1",
+                input: inputs[1],
+                maxTokens: 4,
+                sampling: SamplingParameters(temperature: 0)
+            )
+
+            async let responses0 = Self.collectResponses(
+                from: engine.stream(request0)
+            )
+            async let responses1 = Self.collectResponses(
+                from: engine.stream(request1)
+            )
+
+            let allResponses = try await [responses0, responses1]
+            for (index, responses) in allResponses.enumerated() {
+                let uid = "vlm-\(index)"
+                XCTAssertGreaterThan(responses.filter { $0.token >= 0 }.count, 0)
+                XCTAssertTrue(responses.allSatisfy { $0.uid == uid })
+                XCTAssertNotNil(responses.last?.finishReason)
             }
         }
     }
@@ -443,6 +546,13 @@ final class SchedulerEngineTests: XCTestCase {
 
         eval(currentToken, currentLogits)
         return trace
+    }
+
+    private static func testImage(width: Int, height: Int) -> UserInput.Image {
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+        let image = CIImage(color: CIColor(red: 0.2, green: 0.6, blue: 0.9))
+            .cropped(to: extent)
+        return .ciImage(image)
     }
 
     private static func topOneTopTwoMargin(_ logits: MLXArray) -> Float {

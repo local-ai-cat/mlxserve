@@ -140,30 +140,57 @@ public actor Scheduler {
     }
 
     private func admitWaiting() -> [Response] {
-        var failedResponses: [Response] = []
+        var admittedResponses: [Response] = []
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
             let request = waiting[0]
             var prepared: PreparedBatchRow?
             do {
-                let row = try prepareForInsert(request)
-                prepared = row
                 var sampling = request.sampling
                 if !request.eosTokenIds.isEmpty {
                     sampling.xtcSpecialTokens = Array(Set(sampling.xtcSpecialTokens).union(request.eosTokenIds))
                 }
-                try generator.insert(
-                    uid: request.uid,
-                    cache: row.cache,
-                    lastToken: row.lastToken,
-                    sampling: sampling
-                )
+
+                let row = try prepareForInsert(request, sampling: sampling)
+                prepared = row
+
+                let initialTokenID = row.initialGeneratedToken?.tokenID
+                let generatedTokens = initialTokenID.map { [$0] } ?? []
+                let generatedTokenCount = initialTokenID == nil ? 0 : 1
+                let finishReason = initialTokenID.map { tokenID in
+                    self.finishReason(
+                        token: tokenID,
+                        generatedTokenCount: generatedTokenCount,
+                        request: request
+                    )
+                } ?? nil
+
+                if finishReason == nil {
+                    try generator.insert(
+                        uid: request.uid,
+                        cache: row.cache,
+                        lastToken: row.lastToken,
+                        sampling: sampling,
+                        generatedTokens: generatedTokens
+                    )
+                    running[request.uid] = RunningRequest(
+                        request: request,
+                        promptTokens: row.promptTokens,
+                        prefixHit: row.prefixHit,
+                        generatedTokenCount: generatedTokenCount
+                    )
+                }
+
                 waiting.removeFirst()
-                running[request.uid] = RunningRequest(
-                    request: request,
-                    promptTokens: row.promptTokens,
-                    prefixHit: row.prefixHit,
-                    generatedTokenCount: 0
-                )
+
+                if let initialTokenID {
+                    let response = Response(
+                        uid: request.uid,
+                        token: initialTokenID,
+                        finishReason: finishReason
+                    )
+                    collector.record(response)
+                    admittedResponses.append(response)
+                }
             } catch {
                 if let hit = prepared?.prefixHit {
                     prefixStore?.release(hit)
@@ -175,11 +202,11 @@ public actor Scheduler {
                     finishReason: .failed(String(describing: error))
                 )
                 collector.record(response)
-                failedResponses.append(response)
+                admittedResponses.append(response)
                 continue
             }
         }
-        return failedResponses
+        return admittedResponses
     }
 
     private func applyPendingCancellation() -> [Response] {
@@ -200,14 +227,23 @@ public actor Scheduler {
         return responses
     }
 
-    private func prepareForInsert(_ request: Request) throws -> PreparedBatchRow {
+    private func prepareForInsert(_ request: Request, sampling: SamplingParameters) throws
+        -> PreparedBatchRow
+    {
         let rowCache = model.newCache(parameters: parameters)
         let promptText: LMInput.Text
         switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
         case .tokens(let tokens):
             promptText = tokens
-        case .logits:
-            throw BatchGeneratorError.unsupportedPreparedLogits
+        case .logits(let output):
+            let firstToken = sampledToken(from: output.logits, sampling: sampling)
+            return PreparedBatchRow(
+                cache: rowCache,
+                lastToken: firstToken.token,
+                promptTokens: [],
+                prefixHit: nil,
+                initialGeneratedToken: firstToken
+            )
         }
 
         let promptTokensArray = promptText.tokens
@@ -216,8 +252,13 @@ public actor Scheduler {
             throw BatchGeneratorError.promptTooShortForExternalPrefill
         }
         let promptTokens = promptTokensArray.asArray(Int.self)
+        let prefixCacheEligible = isPrefixCacheEligible(request.input)
 
-        if prefixCacheEnabled, let prefixStore, let hit = prefixStore.fetch(tokens: promptTokens) {
+        if prefixCacheEnabled,
+            prefixCacheEligible,
+            let prefixStore,
+            let hit = prefixStore.fetch(tokens: promptTokens)
+        {
             do {
                 let serialized = try prefixStore.reconstructCache(from: hit)
                 let reconstructedCache = try serialized.map {
@@ -240,6 +281,7 @@ public actor Scheduler {
             request: request,
             promptTokens: promptTokens,
             promptTokensArray: promptTokensArray,
+            storedPromptTokens: prefixCacheEligible ? promptTokens : [],
             rowCache: rowCache
         )
     }
@@ -264,7 +306,8 @@ public actor Scheduler {
                 cache: reconstructedCache,
                 lastToken: promptTokensArray[promptTokens.count - 1],
                 promptTokens: promptTokens,
-                prefixHit: hit
+                prefixHit: hit,
+                initialGeneratedToken: nil
             )
         }
 
@@ -281,7 +324,8 @@ public actor Scheduler {
             cache: reconstructedCache,
             lastToken: promptTokensArray[promptTokens.count - 1],
             promptTokens: promptTokens,
-            prefixHit: hit
+            prefixHit: hit,
+            initialGeneratedToken: nil
         )
     }
 
@@ -289,6 +333,7 @@ public actor Scheduler {
         request: Request,
         promptTokens: [Int],
         promptTokensArray: MLXArray,
+        storedPromptTokens: [Int],
         rowCache: [any KVCache]
     ) -> PreparedBatchRow {
         let prefixInput = LMInput.Text(tokens: promptTokensArray[..<(promptTokens.count - 1)])
@@ -298,8 +343,9 @@ public actor Scheduler {
         return PreparedBatchRow(
             cache: rowCache,
             lastToken: promptTokensArray[promptTokens.count - 1],
-            promptTokens: promptTokens,
-            prefixHit: nil
+            promptTokens: storedPromptTokens,
+            prefixHit: nil,
+            initialGeneratedToken: nil
         )
     }
 
@@ -307,6 +353,7 @@ public actor Scheduler {
         guard prefixCacheEnabled,
             let prefixStore,
             let runningRequest = running[uid],
+            !runningRequest.promptTokens.isEmpty,
             let cache = generator.extractCache(uid: uid)
         else {
             return
@@ -339,6 +386,37 @@ public actor Scheduler {
     private func logCacheFailure(_ message: String, _ error: Error) {
         let line = "MLXServe cache warning: \(message): \(error)\n"
         FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    private func finishReason(
+        token: Int,
+        generatedTokenCount: Int,
+        request: Request
+    ) -> FinishReason? {
+        if request.eosTokenIds.contains(token) {
+            return .stop
+        }
+        if generatedTokenCount >= request.maxTokens {
+            return .length
+        }
+        return nil
+    }
+
+    private func sampledToken(
+        from logits: MLXArray,
+        sampling: SamplingParameters
+    ) -> PreparedGeneratedToken {
+        let nextTokenLogits = logits[0..., -1, 0...]
+        let token = TokenSampler.sample(
+            logits: nextTokenLogits[0, 0...],
+            parameters: sampling,
+            generatedTokens: []
+        )
+        return PreparedGeneratedToken(token: token, tokenID: token.item(Int.self))
+    }
+
+    private func isPrefixCacheEligible(_ input: LMInput) -> Bool {
+        input.image == nil && input.video == nil && input.audio == nil
     }
 
     private static func usesWindowedKVCache(
@@ -379,4 +457,10 @@ private struct PreparedBatchRow {
     let lastToken: MLXArray
     let promptTokens: [Int]
     let prefixHit: PrefixKVStoreHit?
+    let initialGeneratedToken: PreparedGeneratedToken?
+}
+
+private struct PreparedGeneratedToken {
+    let token: MLXArray
+    let tokenID: Int
 }

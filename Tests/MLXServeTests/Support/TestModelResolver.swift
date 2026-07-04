@@ -25,6 +25,19 @@ enum TestModelResolver {
         return nil
     }
 
+    static func resolveVLM() -> TestModelResolution? {
+        let environment = ProcessInfo.processInfo.environment
+        guard let override = environment["MLXSERVE_VLM_TEST_MODEL"], !override.isEmpty else {
+            return nil
+        }
+
+        let url = URL(fileURLWithPath: override)
+        guard isMLXModelDirectory(url) else {
+            return nil
+        }
+        return TestModelResolution(url: url, source: "MLXSERVE_VLM_TEST_MODEL")
+    }
+
     private static let candidatePaths = [
         "/Users/timapple/Documents/Guest/Local AI Chat/BundledModels/mlc-chat-SmolLM-135M-4bit",
         "/Users/timapple/Documents/Guest/BundledModels/mlc-chat-SmolLM-135M-4bit",
