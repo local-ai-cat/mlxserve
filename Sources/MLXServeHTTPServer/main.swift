@@ -82,6 +82,7 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
                 frequencyPenalty: request.frequencyPenalty,
                 xtcProbability: request.xtcProbability,
                 xtcThreshold: request.xtcThreshold,
+                xtcSpecialTokens: xtcSpecialTokens(),
                 seed: request.seed
             ),
             eosTokenIds: eosTokenIds
@@ -131,6 +132,11 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
 
     private func countPromptTokens(_ input: LMInput) throws -> Int {
         input.text.tokens.dim(0)
+    }
+
+    private func xtcSpecialTokens() -> [Int] {
+        let newlineTokens = context.tokenizer.encode(text: "\n", addSpecialTokens: false)
+        return Array(Set(newlineTokens).union(eosTokenIds)).sorted()
     }
 
     private func userInput(from request: OpenAIChatRequest) -> UserInput {

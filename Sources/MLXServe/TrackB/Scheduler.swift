@@ -144,11 +144,15 @@ public actor Scheduler {
             do {
                 let row = try prepareForInsert(request)
                 prepared = row
+                var sampling = request.sampling
+                if !request.eosTokenIds.isEmpty {
+                    sampling.xtcSpecialTokens = Array(Set(sampling.xtcSpecialTokens).union(request.eosTokenIds))
+                }
                 try generator.insert(
                     uid: request.uid,
                     cache: row.cache,
                     lastToken: row.lastToken,
-                    sampling: request.sampling
+                    sampling: sampling
                 )
                 waiting.removeFirst()
                 running[request.uid] = RunningRequest(

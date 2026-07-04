@@ -10,6 +10,7 @@ public struct SamplingParameters: Sendable, Equatable {
     public var frequencyPenalty: Float
     public var xtcProbability: Float
     public var xtcThreshold: Float
+    public var xtcSpecialTokens: [Int]
     public var seed: Int?
     public var logprobCount: Int?
 
@@ -23,6 +24,7 @@ public struct SamplingParameters: Sendable, Equatable {
         frequencyPenalty: Float = 0,
         xtcProbability: Float = 0,
         xtcThreshold: Float = 0.1,
+        xtcSpecialTokens: [Int] = [],
         seed: Int? = nil,
         logprobCount: Int? = nil
     ) {
@@ -35,6 +37,7 @@ public struct SamplingParameters: Sendable, Equatable {
         self.frequencyPenalty = frequencyPenalty
         self.xtcProbability = xtcProbability
         self.xtcThreshold = xtcThreshold
+        self.xtcSpecialTokens = xtcSpecialTokens
         self.seed = seed
         self.logprobCount = logprobCount
     }
@@ -81,7 +84,8 @@ public enum TokenSampler {
             logprobs = applyXTC(
                 logprobs,
                 probability: parameters.xtcProbability,
-                threshold: parameters.xtcThreshold
+                threshold: parameters.xtcThreshold,
+                specialTokens: parameters.xtcSpecialTokens
             )
         }
         if parameters.topK > 0 {
@@ -164,14 +168,21 @@ public enum TokenSampler {
     private static func applyXTC(
         _ logprobs: MLXArray,
         probability: Float,
-        threshold: Float
+        threshold: Float,
+        specialTokens: [Int]
     ) -> MLXArray {
         let threshold = max(0, min(threshold, 0.5))
         let probability = max(0, min(probability, 1))
         let probs = softmax(logprobs, axis: -1)
         let aboveThreshold = MLX.where(probs .> threshold, probs, MLXArray(Float.infinity))
         let cutoff = aboveThreshold.min(axis: -1, keepDims: true)
-        let mask = probs .> cutoff
+        var mask = probs .> cutoff
+        let validSpecialTokens = specialTokens.filter { $0 >= 0 && $0 < logprobs.dim(-1) }
+        if !validSpecialTokens.isEmpty {
+            let indices = MLXArray(validSpecialTokens.map(Int32.init)).asType(.uint32)
+            let values = MLXArray(Array(repeating: false, count: validSpecialTokens.count))
+            mask = putAlong(mask, indices, values: values, axis: -1)
+        }
         let shouldApply = MLXRandom.uniform(0 ..< 1) .<= probability
         return MLX.where(shouldApply, MLX.where(mask, MLXArray(-Float.infinity), logprobs), logprobs)
     }
