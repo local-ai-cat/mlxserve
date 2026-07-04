@@ -115,7 +115,7 @@ final class NativeModelEngine: @unchecked Sendable {
     }
 
     private func countPromptTokens(_ input: LMInput) throws -> Int {
-        input.text.tokens.dim(0)
+        input.text.tokens.size
     }
 
     private func xtcSpecialTokens() -> [Int] {
