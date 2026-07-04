@@ -143,6 +143,7 @@ enum MLXMetalRuntime {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 }
 
