@@ -36,8 +36,14 @@ struct MLXServeHTTPServerMain {
     }
 }
 
-private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
+private final class NativeChatBackend: OpenAIChatBackend, OpenAIHealthProviding, @unchecked Sendable {
     let models: [OpenAIModelInfo]
+    var healthInfo: OpenAIHealthInfo {
+        OpenAIHealthInfo(
+            defaultModel: models.first?.id,
+            enginePool: OpenAIHealthEnginePool(modelCount: models.count, loadedCount: models.count)
+        )
+    }
 
     private let context: ModelContext
     private let engine: MLXServeEngine

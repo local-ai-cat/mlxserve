@@ -306,6 +306,8 @@ public final class OpenAIServer: @unchecked Sendable {
         do {
             let request = try await HTTPRequest.read(from: connection)
             switch (request.method, request.path) {
+            case ("GET", "/health"):
+                try await sendJSON(healthResponse(), status: 200, connection: connection)
             case ("GET", "/v1/models"):
                 try await sendJSON(modelsResponse(), status: 200, connection: connection)
             case ("POST", "/v1/chat/completions"):
@@ -626,6 +628,18 @@ public final class OpenAIServer: @unchecked Sendable {
                 return payload
             },
         ]
+    }
+
+    private func healthResponse() -> [String: Any] {
+        if let healthProvider = backend as? any OpenAIHealthProviding {
+            return buildHealthResponse(healthProvider.healthInfo)
+        }
+        return buildHealthResponse(
+            OpenAIHealthInfo(
+                defaultModel: backend.models.first?.id,
+                enginePool: nil
+            )
+        )
     }
 
     private func usage(
