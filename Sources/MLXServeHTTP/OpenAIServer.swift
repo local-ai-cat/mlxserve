@@ -102,6 +102,8 @@ public struct OpenAIChatRequest: Sendable {
     public let includeUsage: Bool
     public let enableThinking: Bool?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
+    public let tools: [OpenAIJSONValue]?
+    public let toolChoice: OpenAIToolChoice?
 
     public init(
         model: String,
@@ -121,7 +123,9 @@ public struct OpenAIChatRequest: Sendable {
         stream: Bool = false,
         includeUsage: Bool = false,
         enableThinking: Bool? = nil,
-        chatTemplateKwargs: [String: OpenAIJSONValue]? = nil
+        chatTemplateKwargs: [String: OpenAIJSONValue]? = nil,
+        tools: [OpenAIJSONValue]? = nil,
+        toolChoice: OpenAIToolChoice? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -141,6 +145,8 @@ public struct OpenAIChatRequest: Sendable {
         self.includeUsage = includeUsage
         self.enableThinking = enableThinking
         self.chatTemplateKwargs = chatTemplateKwargs
+        self.tools = tools
+        self.toolChoice = toolChoice
     }
 }
 
@@ -1132,6 +1138,8 @@ public extension OpenAIChatRequest {
         guard !messages.isEmpty else { throw OpenAIServerError.missingField("messages") }
         let streamOptions = object["stream_options"] as? [String: Any]
         let chatTemplateKwargs = try parseChatTemplateKwargs(object["chat_template_kwargs"])
+        let tools = try parseTools(object["tools"])
+        let toolChoice = try OpenAIToolChoice.parse(object["tool_choice"])
 
         return OpenAIChatRequest(
             model: model,
@@ -1151,7 +1159,9 @@ public extension OpenAIChatRequest {
             stream: object["stream"] as? Bool ?? false,
             includeUsage: streamOptions?["include_usage"] as? Bool ?? false,
             enableThinking: object["enable_thinking"] as? Bool,
-            chatTemplateKwargs: chatTemplateKwargs
+            chatTemplateKwargs: chatTemplateKwargs,
+            tools: tools,
+            toolChoice: toolChoice
         )
     }
 
@@ -1218,6 +1228,21 @@ public extension OpenAIChatRequest {
                 throw OpenAIServerError.invalidJSON
             }
             converted[key] = jsonValue
+        }
+        return converted
+    }
+
+    private static func parseTools(_ value: Any?) throws -> [OpenAIJSONValue]? {
+        guard let value else { return nil }
+        guard let array = value as? [Any] else {
+            throw OpenAIServerError.invalidJSON
+        }
+        var converted: [OpenAIJSONValue] = []
+        for item in array {
+            guard let jsonValue = OpenAIJSONValue(item) else {
+                throw OpenAIServerError.invalidJSON
+            }
+            converted.append(jsonValue)
         }
         return converted
     }
