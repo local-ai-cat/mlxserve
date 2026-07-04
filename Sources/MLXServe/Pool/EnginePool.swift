@@ -164,11 +164,13 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
         guard entry.engine != nil else {
             throw EnginePoolError.modelNotLoaded(id: modelID)
         }
-        guard !entry.isLoading, entry.inUse == 0 else {
+        guard !entry.isLoading, entry.inUse == 0, !entry.isPinned else {
             throw EnginePoolError.modelBusy(id: modelID, operation: "unload")
         }
 
-        await unloadLoadedModel(modelID)
+        guard await unloadLoadedModel(modelID) else {
+            throw EnginePoolError.modelBusy(id: modelID, operation: "unload")
+        }
     }
 
     public func sweepIdleModels(now: Date = Date()) async -> [String] {
@@ -191,8 +193,9 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             }
 
         for candidate in candidates {
-            await unloadLoadedModel(candidate.modelID)
-            unloaded.append(candidate.modelID)
+            if await unloadLoadedModel(candidate.modelID) {
+                unloaded.append(candidate.modelID)
+            }
         }
         return unloaded
     }
@@ -411,7 +414,7 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
                     ceiling: finalCeilingBytes
                 )
             }
-            await unloadLoadedModel(victim)
+            _ = await unloadLoadedModel(victim)
         }
     }
 
@@ -430,9 +433,17 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             .modelID
     }
 
-    private func unloadLoadedModel(_ modelID: String) async {
-        guard var entry = entries[modelID], let engine = entry.engine else {
-            return
+    /// Idempotently re-validates evictability before clearing state, so stale callers cannot unload a leased, pinned, or loading entry.
+    @discardableResult
+    private func unloadLoadedModel(_ modelID: String) async -> Bool {
+        guard
+            var entry = entries[modelID],
+            let engine = entry.engine,
+            entry.inUse == 0,
+            !entry.isPinned,
+            !entry.isLoading
+        else {
+            return false
         }
 
         let modelMemory = entry.actualSize ?? entry.estimatedSize
@@ -443,5 +454,6 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
         entries[modelID] = entry
 
         await loader.unloadModel(engine, id: modelID)
+        return true
     }
 }

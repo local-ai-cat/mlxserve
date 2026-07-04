@@ -15,11 +15,14 @@ struct MLXServeHTTPServerMain {
             throw ServerConfigError.invalidArgument("no models discovered in \(config.modelPath)")
         }
 
-        let finalCeiling = finalMemoryCeiling(for: config.memoryGuardTier)
+        let effectiveCeiling = finalMemoryCeiling(
+            overrideBytes: config.memoryCeilingBytes,
+            tier: config.memoryGuardTier
+        )
         let pool = EnginePool(
             models: discovered,
             loader: NativeModelLoader(maxConcurrentRequests: config.maxConcurrentRequests),
-            finalCeiling: finalCeiling,
+            finalCeiling: effectiveCeiling.bytes,
             idleTimeout: config.idleTimeout
         )
         for pinnedModelID in config.pinnedModelIDs {
@@ -41,7 +44,7 @@ struct MLXServeHTTPServerMain {
 
         try await server.start()
         print("MLXServeHTTP listening on http://\(config.host):\(config.port)")
-        print("Discovered \(discovered.count) model(s); memory ceiling: \(ModelDiscovery.formatSize(finalCeiling))")
+        print("Discovered \(discovered.count) model(s); memory ceiling: \(ModelDiscovery.formatSize(effectiveCeiling.bytes)) (\(effectiveCeiling.source))")
         fflush(stdout)
         server.waitForever()
     }
@@ -56,6 +59,7 @@ private struct ServerConfig {
     let modelID: String?
     let maxConcurrentRequests: Int
     let memoryGuardTier: MemoryGuardTier?
+    let memoryCeilingBytes: Int64?
     let idleTimeout: TimeInterval?
     let pinnedModelIDs: [String]
 
@@ -67,6 +71,7 @@ private struct ServerConfig {
         var modelID: String?
         var maxConcurrentRequests = 8
         var memoryGuardTier: MemoryGuardTier?
+        var memoryCeilingBytes: Int64?
         var idleTimeout: TimeInterval?
         var pinnedModelIDs: [String] = []
 
@@ -102,6 +107,12 @@ private struct ServerConfig {
                     throw ServerConfigError.invalidArgument("invalid memory guard tier: \(rawValue)")
                 }
                 memoryGuardTier = tier
+            case "--memory-ceiling-bytes":
+                index += 1
+                guard let parsed = nonNegativeInt64(try value(arguments, at: index, for: argument)) else {
+                    throw ServerConfigError.invalidArgument("invalid memory ceiling bytes")
+                }
+                memoryCeilingBytes = parsed
             case "--idle-timeout":
                 index += 1
                 guard let parsed = TimeInterval(try value(arguments, at: index, for: argument)), parsed > 0 else {
@@ -131,6 +142,7 @@ private struct ServerConfig {
             modelID: modelID,
             maxConcurrentRequests: maxConcurrentRequests,
             memoryGuardTier: memoryGuardTier,
+            memoryCeilingBytes: memoryCeilingBytes,
             idleTimeout: idleTimeout,
             pinnedModelIDs: pinnedModelIDs
         )
@@ -155,6 +167,7 @@ private struct ServerConfig {
               --model-id ID                     Single-model compatibility override.
               --max-concurrent-requests N       Scheduler concurrency cap. Default: 8
               --memory-guard-tier TIER          safe, balanced, or aggressive. Default: off.
+              --memory-ceiling-bytes N          Explicit pool ceiling in bytes. Overrides memory guard tier when > 0.
               --idle-timeout SECONDS            Unload idle, unpinned models after this many seconds. Default: off.
               --pin ID                          Pin a discovered model in memory. Repeatable.
             """
@@ -181,15 +194,24 @@ private func applyModelIDOverrideIfNeeded(
     ]
 }
 
-private func finalMemoryCeiling(for tier: MemoryGuardTier?) -> Int64 {
-    guard let tier else {
-        return 0
-    }
+private func finalMemoryCeiling(
+    overrideBytes: Int64?,
+    tier: MemoryGuardTier?
+) -> MemoryGuard.EffectiveCeiling {
     let recommendedWorkingSet = Int64(GPU.maxRecommendedWorkingSetBytes() ?? 0)
-    return MemoryGuard.finalCeiling(
+    return MemoryGuard.effectiveCeiling(
+        overrideBytes: overrideBytes,
         recommendedWorkingSetBytes: recommendedWorkingSet,
         tier: tier
     )
+}
+
+private func nonNegativeInt64(_ value: String) -> Int64? {
+    let normalized = value.replacingOccurrences(of: "_", with: "")
+    guard let parsed = Int64(normalized), parsed >= 0 else {
+        return nil
+    }
+    return parsed
 }
 
 private func startIdleSweep<Loader: EnginePoolModelLoader>(

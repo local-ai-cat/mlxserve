@@ -159,6 +159,9 @@ final class NativeModelEngine: @unchecked Sendable {
     }
 }
 
+// NOTE: Cross-model concurrent MLX eval is not process-serialized here. Each
+// model has its own scheduler; a process-wide MLX eval gate is a known follow-up
+// if native serving needs to mirror omlx's single executor more tightly.
 struct NativeModelLoader: EnginePoolModelLoader {
     let maxConcurrentRequests: Int
 

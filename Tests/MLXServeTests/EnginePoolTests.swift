@@ -123,6 +123,62 @@ private struct BlockingFakeLoader: EnginePoolModelLoader {
     }
 }
 
+private actor BlockingUnloadCoordinator {
+    private var startedCount = 0
+    private var unloadContinuations: [CheckedContinuation<Void, Never>] = []
+    private var startedWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func waitUntilUnloadStarted(count: Int) async {
+        if startedCount >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append((count, continuation))
+        }
+    }
+
+    func waitForReleaseAfterMarkingStarted() async {
+        startedCount += 1
+        resumeStartedWaitersIfNeeded()
+        await withCheckedContinuation { continuation in
+            unloadContinuations.append(continuation)
+        }
+    }
+
+    func releaseOne() {
+        guard !unloadContinuations.isEmpty else { return }
+        let continuation = unloadContinuations.removeFirst()
+        continuation.resume()
+    }
+
+    private func resumeStartedWaitersIfNeeded() {
+        var remaining: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+        for waiter in startedWaiters {
+            if startedCount >= waiter.count {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        startedWaiters = remaining
+    }
+}
+
+private struct BlockingUnloadFakeLoader: EnginePoolModelLoader {
+    let state: FakeLoaderState
+    let coordinator: BlockingUnloadCoordinator
+
+    func loadModel(id: String, modelURL: URL) async throws -> FakeEngine {
+        await state.recordLoad(id)
+        return FakeEngine(id: id)
+    }
+
+    func unloadModel(_ engine: FakeEngine, id: String) async {
+        await coordinator.waitForReleaseAfterMarkingStarted()
+        await state.recordUnload(id)
+    }
+}
+
 final class EnginePoolTests: XCTestCase {
     func testOnDemandLoadTakesAndReleasesLease() async throws {
         let pool = makePool(["a": 10])
@@ -221,6 +277,37 @@ final class EnginePoolTests: XCTestCase {
         XCTAssertEqual(unloaded, ["a"])
         let status = await pool.status()
         XCTAssertEqual(loadedModelIDs(status), ["b"])
+    }
+
+    func testIdleSweepSkipsStaleCandidateThatGetsLeasedDuringPriorUnload() async throws {
+        let state = FakeLoaderState()
+        let coordinator = BlockingUnloadCoordinator()
+        let pool = makeBlockingUnloadPool(
+            ["a": 10, "b": 20],
+            idleTimeout: 30,
+            state: state,
+            coordinator: coordinator
+        )
+        let start = Date(timeIntervalSince1970: 1_000)
+        try await pool.load("a", now: start)
+        try await pool.load("b", now: start.addingTimeInterval(1))
+
+        async let sweepResult: [String] = pool.sweepIdleModels(now: start.addingTimeInterval(40))
+        await coordinator.waitUntilUnloadStarted(count: 1)
+
+        let lease = try await pool.acquire("b")
+        await coordinator.releaseOne()
+        let unloaded = await sweepResult
+
+        let status = await pool.status()
+        XCTAssertEqual(unloaded, ["a"])
+        XCTAssertEqual(loadedModelIDs(status), ["b"])
+        XCTAssertEqual(status.models.first(where: { $0.id == "b" })?.inUse, 1)
+        XCTAssertEqual(status.currentModelMemory, 20)
+        assertMemoryAccountingInvariant(status)
+        XCTAssertEqual(lease.engine.id, "b")
+
+        await pool.release(lease)
     }
 
     func testUnknownModelErrorListsAvailableModels() async throws {
@@ -347,6 +434,73 @@ final class EnginePoolTests: XCTestCase {
         )
     }
 
+    func testMemoryGuardEffectiveCeilingPrecedence() {
+        let gib = MemoryGuard.gibibyte
+        let recommendedWorkingSet = 32 * gib
+        let physicalMemory = 64 * gib
+
+        XCTAssertEqual(
+            MemoryGuard.effectiveCeiling(
+                overrideBytes: 800_000_000,
+                recommendedWorkingSetBytes: recommendedWorkingSet,
+                physicalMemoryBytes: physicalMemory,
+                tier: .safe
+            ),
+            MemoryGuard.EffectiveCeiling(bytes: 800_000_000, source: "override")
+        )
+        XCTAssertEqual(
+            MemoryGuard.effectiveCeiling(
+                overrideBytes: 0,
+                recommendedWorkingSetBytes: recommendedWorkingSet,
+                physicalMemoryBytes: physicalMemory,
+                tier: .balanced
+            ),
+            MemoryGuard.EffectiveCeiling(bytes: 26 * gib, source: "tier")
+        )
+        XCTAssertEqual(
+            MemoryGuard.effectiveCeiling(
+                overrideBytes: nil,
+                recommendedWorkingSetBytes: recommendedWorkingSet,
+                physicalMemoryBytes: physicalMemory,
+                tier: nil
+            ),
+            MemoryGuard.EffectiveCeiling(bytes: 0, source: "off")
+        )
+    }
+
+    func testMemoryAccountingInvariantAfterConcurrentSweepLeaseAndEvictingLoad() async throws {
+        let state = FakeLoaderState()
+        let coordinator = BlockingUnloadCoordinator()
+        let pool = makeBlockingUnloadPool(
+            ["a": 40, "b": 30, "c": 80],
+            finalCeiling: 100,
+            idleTimeout: 30,
+            state: state,
+            coordinator: coordinator
+        )
+        let start = Date(timeIntervalSince1970: 1_000)
+        try await pool.load("a", now: start)
+        try await pool.load("b", now: start.addingTimeInterval(1))
+
+        async let sweepResult: [String] = pool.sweepIdleModels(now: start.addingTimeInterval(40))
+        await coordinator.waitUntilUnloadStarted(count: 1)
+        let lease = try await pool.acquire("b")
+        await coordinator.releaseOne()
+        let swept = await sweepResult
+        XCTAssertEqual(swept, ["a"])
+        await pool.release(lease)
+
+        async let loadC: EnginePoolLoadResult = pool.load("c", now: start.addingTimeInterval(50))
+        await coordinator.waitUntilUnloadStarted(count: 2)
+        await coordinator.releaseOne()
+        _ = try await loadC
+
+        let status = await pool.status()
+        XCTAssertEqual(loadedModelIDs(status), ["c"])
+        XCTAssertEqual(status.currentModelMemory, 80)
+        assertMemoryAccountingInvariant(status)
+    }
+
     private func makePool(
         _ sizes: [String: Int64],
         finalCeiling: Int64 = 0,
@@ -368,6 +522,29 @@ final class EnginePoolTests: XCTestCase {
             finalCeiling: finalCeiling,
             idleTimeout: idleTimeout,
             maxWaitingQueueDepth: maxWaitingQueueDepth
+        )
+    }
+
+    private func makeBlockingUnloadPool(
+        _ sizes: [String: Int64],
+        finalCeiling: Int64 = 0,
+        idleTimeout: TimeInterval? = nil,
+        state: FakeLoaderState,
+        coordinator: BlockingUnloadCoordinator
+    ) -> EnginePool<BlockingUnloadFakeLoader> {
+        var models: [String: DiscoveredModel] = [:]
+        for (id, size) in sizes {
+            models[id] = DiscoveredModel(
+                id: id,
+                modelURL: URL(fileURLWithPath: "/tmp/\(id)", isDirectory: true),
+                estimatedSize: size
+            )
+        }
+        return EnginePool(
+            models: models,
+            loader: BlockingUnloadFakeLoader(state: state, coordinator: coordinator),
+            finalCeiling: finalCeiling,
+            idleTimeout: idleTimeout
         )
     }
 
@@ -394,6 +571,19 @@ final class EnginePoolTests: XCTestCase {
 
     private func loadedModelIDs(_ status: EnginePoolStatus) -> [String] {
         status.models.filter(\.loaded).map(\.id).sorted()
+    }
+
+    private func assertMemoryAccountingInvariant(
+        _ status: EnginePoolStatus,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let loadedMemory = status.models
+            .filter(\.loaded)
+            .reduce(Int64(0)) { total, model in
+                total + (model.actualSize ?? model.estimatedSize)
+            }
+        XCTAssertEqual(status.currentModelMemory, loadedMemory, file: file, line: line)
     }
 }
 
