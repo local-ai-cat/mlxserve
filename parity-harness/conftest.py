@@ -1,10 +1,10 @@
 """Pytest fixtures + gating for the parity harness.
 
 Gate: the whole session is skipped unless PARITY_HARNESS=1 (no GPU / CI without
-Metal → clean skip). omlx is launched once (session scope, multi-model). native
-is launched one process per model on demand; to cap memory we keep at most one
-native alive and relaunch when the model changes. Tests are sorted by model so
-that costs at most one native launch per model.
+Metal → clean skip). Post-M3 native MLXServe is multi-model + validating, so —
+like omlx — it is launched ONCE (session scope) against the whole model store and
+serves every model on demand. Both servers point at the SAME real nested store so
+their discovered ids match and one `model` string selects the same model on both.
 """
 
 from __future__ import annotations
@@ -51,8 +51,12 @@ def pytest_generate_tests(metafunc):
         ids = []
         params = []
         for spec in specs:
-            present = (Path(config.MODEL_FARM) / spec.model_id).exists()
-            marks = () if present else (pytest.mark.skip(reason=f"{spec.model_id} not in farm"),)
+            present = config.model_present(spec.model_id)
+            marks = (
+                ()
+                if present
+                else (pytest.mark.skip(reason=f"{spec.model_id} not in store"),)
+            )
             params.append(pytest.param(spec.model_id, marks=marks))
             ids.append(spec.model_id)
         metafunc.parametrize("model_id", params, ids=ids)
@@ -103,18 +107,19 @@ def omlx_server():
 
 
 class _NativePool:
-    """Keeps at most one native process alive, keyed by model_id."""
+    """Holds the single, session-lived multi-model native server.
+
+    Post-M3 native is multi-model, so `get(model_id)` returns the ONE shared
+    process regardless of model (the `model` field selects at request time). The
+    signature is kept so existing call sites (`native_pool.get(model_id)`) don't
+    change. Launched lazily on first use; started once, reused everywhere."""
 
     def __init__(self) -> None:
         self.current: ServerHandle | None = None
 
-    def get(self, model_id: str) -> ServerHandle:
-        if self.current is not None and self.current.model_id == model_id:
-            return self.current
-        if self.current is not None:
-            self.current.stop()
-            self.current = None
-        self.current = start_native(model_id, _LOG_DIR)
+    def get(self, model_id: str | None = None) -> ServerHandle:  # noqa: ARG002
+        if self.current is None:
+            self.current = start_native(_LOG_DIR)
         return self.current
 
     def close(self) -> None:
@@ -136,10 +141,20 @@ def spec(model_id):
 
 
 @pytest.fixture
-def native_server(native_pool, model_id):
-    """Native server pinned to the current test's model. May raise if native
-    can't even launch — matrix tests catch that and record a GAP/FAIL."""
-    return native_pool.get(model_id)
+def native_server(native_pool, omlx_server, model_id):
+    """The shared multi-model native server. Skips loudly (never crashes) if the
+    current test's model isn't served by BOTH servers — the matrix axis is the
+    place that records a genuine native fault as a GAP; conformance axes only run
+    where both servers actually serve the model."""
+    native = native_pool.get(model_id)
+    absent = [
+        name
+        for name, srv in (("native", native), ("omlx", omlx_server))
+        if model_id not in srv.discovered_ids()
+    ]
+    if absent:
+        pytest.skip(f"model {model_id!r} not served by {absent}")
+    return native
 
 
 def _native_version() -> str:

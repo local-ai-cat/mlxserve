@@ -1,8 +1,10 @@
 """Launch, health-check, and tear down the two servers under test.
 
-native MLXServe serves ONE model per process (fixed at launch) and must be
-handed the resolved snapshot dir. omlx is multi-model and discovers subdirs of
-the farm; the `model` field selects. Both are started on ephemeral ports.
+Post-M3 native MLXServe is multi-model + validating: it is launched ONCE against
+a directory of model subdirs, discovers them (id = bare leaf dir name), serves
+on demand, and validates the request `model` id (unknown -> 404). omlx is also
+multi-model. Both are pointed at the SAME real nested store so their discovered
+ids match, and both run on ephemeral ports.
 """
 
 from __future__ import annotations
@@ -26,18 +28,6 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def resolve_snapshot_dir(model_id: str) -> Path:
-    """Resolve a farm symlink to the concrete dir that holds config.json + weights.
-
-    native's --model-dir wants the leaf snapshot dir, not the symlink.
-    """
-    link = Path(config.MODEL_FARM) / model_id
-    real = link.resolve()
-    if not (real / "config.json").exists():
-        raise FileNotFoundError(f"{real} has no config.json (model_id={model_id})")
-    return real
-
-
 class ServerHandle:
     """A running server process plus how to talk to it."""
 
@@ -47,12 +37,32 @@ class ServerHandle:
         self.proc = proc
         self.auth = auth
         self.model_id: str | None = None
+        self._ids_cache: set[str] | None = None
 
     def headers(self) -> dict[str, str]:
         head = {"Content-Type": "application/json"}
         if self.auth:
             head["Authorization"] = f"Bearer {self.auth}"
         return head
+
+    def discovered_ids(self, refresh: bool = False) -> set[str]:
+        """Model ids this server reports from GET /v1/models (cached). Empty set
+        on any error, so callers can `model_id in server.discovered_ids()` and
+        skip loudly rather than crash."""
+        if self._ids_cache is not None and not refresh:
+            return self._ids_cache
+        ids: set[str] = set()
+        try:
+            resp = requests.get(
+                f"{self.base_url}/v1/models", headers=self.headers(), timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data") or []
+                ids = {m.get("id") for m in data if isinstance(m, dict) and m.get("id")}
+        except (requests.RequestException, ValueError):
+            ids = set()
+        self._ids_cache = ids
+        return ids
 
     def wait_listening(self, timeout: float = 60.0) -> None:
         """Block until GET /v1/models returns 200 (process up + routes live)."""
@@ -88,19 +98,20 @@ class ServerHandle:
                 pass
 
 
-def start_native(model_id: str, log_dir: Path) -> ServerHandle:
-    """Launch native MLXServe pinned to one model. GOTCHA: mlx.metallib must sit
-    beside the binary — the frozen baseline dir guarantees that."""
-    snapshot = resolve_snapshot_dir(model_id)
+def start_native(log_dir: Path) -> ServerHandle:
+    """Launch native MLXServe ONCE against the whole model store (multi-model,
+    post-M3). No --model-id override — native discovers every subdir and serves
+    on demand, validating the request `model`. GOTCHA: mlx.metallib must sit
+    beside the binary — the frozen baseline dir guarantees that. GOTCHA: native's
+    discovery does NOT follow symlinks, so MODEL_STORE must be the real nested
+    store, not the flattened symlink farm."""
     port = free_port()
     log = open(log_dir / f"native-{port}.log", "w")  # noqa: SIM115 (kept open for proc)
     proc = subprocess.Popen(
         [
             config.NATIVE_BIN,
             "--model-dir",
-            str(snapshot),
-            "--model-id",
-            model_id,
+            config.MODEL_STORE,
             "--host",
             "127.0.0.1",
             "--port",
@@ -111,13 +122,14 @@ def start_native(model_id: str, log_dir: Path) -> ServerHandle:
         cwd=str(Path(config.NATIVE_BIN).parent),
     )
     handle = ServerHandle("native", f"http://127.0.0.1:{port}", proc, auth=None)
-    handle.model_id = model_id
     handle.wait_listening()
     return handle
 
 
 def start_omlx(log_dir: Path) -> ServerHandle:
-    """Launch omlx once; it serves every model in the farm."""
+    """Launch omlx once against the SAME real store as native, so the ids it
+    discovers (bare leaf dir names) match native's and one `model` string selects
+    the same model on both."""
     port = free_port()
     log = open(log_dir / f"omlx-{port}.log", "w")  # noqa: SIM115
     proc = subprocess.Popen(
@@ -125,7 +137,7 @@ def start_omlx(log_dir: Path) -> ServerHandle:
             config.OMLX_BIN,
             "serve",
             "--model-dir",
-            config.MODEL_FARM,
+            config.MODEL_STORE,
             "--host",
             "127.0.0.1",
             "--port",
