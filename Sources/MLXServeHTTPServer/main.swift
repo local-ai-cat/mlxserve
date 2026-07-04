@@ -65,14 +65,25 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
     }
 
     func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
-        let input = try await context.processor.prepare(input: userInput(from: request.messages))
+        let input = try await context.processor.prepare(input: userInput(from: request))
         let promptTokens = try countPromptTokens(input)
         let uid = "chat-\(UUID().uuidString)"
         let mlxRequest = Request(
             uid: uid,
             input: input,
             maxTokens: request.maxTokens,
-            sampling: SamplingParameters(temperature: request.temperature),
+            sampling: SamplingParameters(
+                temperature: request.temperature,
+                topP: request.topP,
+                topK: request.topK,
+                minP: request.minP,
+                repetitionPenalty: request.repetitionPenalty,
+                presencePenalty: request.presencePenalty,
+                frequencyPenalty: request.frequencyPenalty,
+                xtcProbability: request.xtcProbability,
+                xtcThreshold: request.xtcThreshold,
+                seed: request.seed
+            ),
             eosTokenIds: eosTokenIds
         )
 
@@ -122,9 +133,9 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
         input.text.tokens.dim(0)
     }
 
-    private func userInput(from messages: [OpenAIChatMessage]) -> UserInput {
+    private func userInput(from request: OpenAIChatRequest) -> UserInput {
         UserInput(
-            chat: messages.map { message in
+            chat: request.messages.map { message in
                 switch message.role {
                 case "system":
                     return .system(message.content)
@@ -135,8 +146,39 @@ private final class NativeChatBackend: OpenAIChatBackend, @unchecked Sendable {
                 default:
                     return .user(message.content)
                 }
-            }
+            },
+            additionalContext: additionalContext(from: request)
         )
+    }
+
+    private func additionalContext(from request: OpenAIChatRequest) -> [String: any Sendable]? {
+        var context: [String: any Sendable] = [:]
+        if let chatTemplateKwargs = request.chatTemplateKwargs {
+            for (key, value) in chatTemplateKwargs {
+                context[key] = sendableValue(from: value)
+            }
+        }
+        if let enableThinking = request.enableThinking {
+            context["enable_thinking"] = enableThinking
+        }
+        return context.isEmpty ? nil : context
+    }
+
+    private func sendableValue(from value: OpenAIJSONValue) -> any Sendable {
+        switch value {
+        case .string(let string):
+            return string
+        case .number(let number):
+            return number
+        case .bool(let bool):
+            return bool
+        case .object(let object):
+            return object.mapValues { sendableValue(from: $0) }
+        case .array(let array):
+            return array.map { sendableValue(from: $0) }
+        case .null:
+            return Optional<String>.none as String?
+        }
     }
 }
 

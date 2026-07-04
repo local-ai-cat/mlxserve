@@ -146,6 +146,78 @@ public struct OpenAIChatStream: Sendable {
     }
 }
 
+public struct StopSequenceMatch: Sendable, Equatable {
+    public let text: String
+    public let stopped: Bool
+
+    public init(text: String, stopped: Bool) {
+        self.text = text
+        self.stopped = stopped
+    }
+}
+
+public struct StreamingStopSequenceMatcher: Sendable {
+    private let stopSequences: [String]
+    private let maxTailCount: Int
+    private var pending = ""
+
+    public init(stopSequences: [String]) {
+        let stopSequences = stopSequences.filter { !$0.isEmpty }
+        self.stopSequences = stopSequences
+        self.maxTailCount = max((stopSequences.map(\.count).max() ?? 0) - 1, 0)
+    }
+
+    public mutating func feed(_ text: String) -> StopSequenceMatch {
+        guard !stopSequences.isEmpty else {
+            return StopSequenceMatch(text: text, stopped: false)
+        }
+
+        let combined = pending + text
+        if let range = firstStopRange(in: combined, stopSequences: stopSequences) {
+            pending = ""
+            return StopSequenceMatch(text: String(combined[..<range.lowerBound]), stopped: true)
+        }
+
+        let tailCount = min(maxTailCount, combined.count)
+        let emitEnd = combined.index(combined.endIndex, offsetBy: -tailCount)
+        let emitted = String(combined[..<emitEnd])
+        pending = String(combined[emitEnd...])
+        return StopSequenceMatch(text: emitted, stopped: false)
+    }
+
+    public mutating func finish() -> StopSequenceMatch {
+        let text = pending
+        pending = ""
+        guard let range = firstStopRange(in: text, stopSequences: stopSequences) else {
+            return StopSequenceMatch(text: text, stopped: false)
+        }
+        return StopSequenceMatch(text: String(text[..<range.lowerBound]), stopped: true)
+    }
+}
+
+public func truncateAtStop(_ text: String, stopSequences: [String]) -> StopSequenceMatch {
+    let stopSequences = stopSequences.filter { !$0.isEmpty }
+    guard let range = firstStopRange(in: text, stopSequences: stopSequences) else {
+        return StopSequenceMatch(text: text, stopped: false)
+    }
+    return StopSequenceMatch(text: String(text[..<range.lowerBound]), stopped: true)
+}
+
+private func firstStopRange(in text: String, stopSequences: [String]) -> Range<String.Index>? {
+    var bestRange: Range<String.Index>?
+    for stop in stopSequences {
+        guard let range = text.range(of: stop) else { continue }
+        if let current = bestRange {
+            if range.lowerBound < current.lowerBound {
+                bestRange = range
+            }
+        } else {
+            bestRange = range
+        }
+    }
+    return bestRange
+}
+
 public protocol OpenAIChatBackend: Sendable {
     var models: [OpenAIModelInfo] { get }
     func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream
@@ -293,6 +365,11 @@ public final class OpenAIServer: @unchecked Sendable {
         var lastToken: UInt64?
         var completionTokens = 0
         var finishReason = "length"
+        // Stop matching runs on raw decoded model text before thinking tags are split,
+        // matching omlx's output_text-level stop behavior.
+        var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
+        var thinkingParser = ThinkingParser()
+        var stoppedByTextStop = false
 
         try await connection.send(
             data: Data(
@@ -334,23 +411,22 @@ public final class OpenAIServer: @unchecked Sendable {
                 if let chunkFinishReason = chunk.finishReason {
                     finishReason = chunkFinishReason
                 }
-                if !chunk.text.isEmpty {
-                    try await sendSSE(
-                        [
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": request.model,
-                            "choices": [
-                                [
-                                    "index": 0,
-                                    "delta": ["content": chunk.text],
-                                    "finish_reason": NSNull(),
-                                ]
-                            ],
-                        ],
+                let stopMatch = stopMatcher.feed(chunk.text)
+                if stopMatch.stopped {
+                    finishReason = "stop"
+                    stoppedByTextStop = true
+                }
+                if !stopMatch.text.isEmpty {
+                    try await sendParserDelta(
+                        thinkingParser.feed(stopMatch.text),
+                        id: id,
+                        created: created,
+                        model: request.model,
                         connection: connection
                     )
+                }
+                if stoppedByTextStop {
+                    break
                 }
             }
         } catch {
@@ -366,6 +442,30 @@ public final class OpenAIServer: @unchecked Sendable {
             try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
             return
         }
+
+        if !stoppedByTextStop {
+            let stopMatch = stopMatcher.finish()
+            if stopMatch.stopped {
+                finishReason = "stop"
+                stoppedByTextStop = true
+            }
+            if !stopMatch.text.isEmpty {
+                try await sendParserDelta(
+                    thinkingParser.feed(stopMatch.text),
+                    id: id,
+                    created: created,
+                    model: request.model,
+                    connection: connection
+                )
+            }
+        }
+        try await sendParserDelta(
+            thinkingParser.finish(),
+            id: id,
+            created: created,
+            model: request.model,
+            connection: connection
+        )
 
         let ended = DispatchTime.now().uptimeNanoseconds
         try await sendSSE(
@@ -419,6 +519,10 @@ public final class OpenAIServer: @unchecked Sendable {
         var completionTokens = 0
         var finishReason = "length"
         var text = ""
+        // Stop matching runs on raw decoded model text before thinking tags are split,
+        // matching omlx's output_text-level stop behavior.
+        var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
+        var stoppedByTextStop = false
 
         for try await chunk in stream.chunks {
             let now = DispatchTime.now().uptimeNanoseconds
@@ -427,10 +531,32 @@ public final class OpenAIServer: @unchecked Sendable {
             }
             lastToken = now
             completionTokens += 1
-            text += chunk.text
             if let chunkFinishReason = chunk.finishReason {
                 finishReason = chunkFinishReason
             }
+            let stopMatch = stopMatcher.feed(chunk.text)
+            text += stopMatch.text
+            if stopMatch.stopped {
+                finishReason = "stop"
+                stoppedByTextStop = true
+                break
+            }
+        }
+        if !stoppedByTextStop {
+            let stopMatch = stopMatcher.finish()
+            text += stopMatch.text
+            if stopMatch.stopped {
+                finishReason = "stop"
+            }
+        }
+
+        let extracted = extractThinking(text)
+        var message: [String: Any] = [
+            "role": "assistant",
+            "content": extracted.content,
+        ]
+        if !extracted.reasoning.isEmpty {
+            message["reasoning_content"] = extracted.reasoning
         }
 
         let ended = DispatchTime.now().uptimeNanoseconds
@@ -443,7 +569,7 @@ public final class OpenAIServer: @unchecked Sendable {
                 "choices": [
                     [
                         "index": 0,
-                        "message": ["role": "assistant", "content": text],
+                        "message": message,
                         "finish_reason": finishReason,
                     ]
                 ],
@@ -514,6 +640,40 @@ public final class OpenAIServer: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object, options: [])
         let line = "data: \(String(decoding: data, as: UTF8.self))\n\n"
         try await connection.send(data: Data(line.utf8))
+    }
+
+    private func sendParserDelta(
+        _ delta: (reasoning: String, content: String),
+        id: String,
+        created: Int,
+        model: String,
+        connection: NWConnection
+    ) async throws {
+        var payload: [String: Any] = [:]
+        if !delta.reasoning.isEmpty {
+            payload["reasoning_content"] = delta.reasoning
+        }
+        if !delta.content.isEmpty {
+            payload["content"] = delta.content
+        }
+        guard !payload.isEmpty else { return }
+
+        try await sendSSE(
+            [
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    [
+                        "index": 0,
+                        "delta": payload,
+                        "finish_reason": NSNull(),
+                    ]
+                ],
+            ],
+            connection: connection
+        )
     }
 
     private func sendJSON(

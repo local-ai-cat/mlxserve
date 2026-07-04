@@ -159,4 +159,35 @@ final class OpenAIServerTests: XCTestCase {
 
         XCTAssertFalse(request.includeUsage)
     }
+
+    func testTruncateAtStopRemovesStopSequence() {
+        let result = truncateAtStop("hello STOP hidden", stopSequences: ["STOP"])
+
+        XCTAssertTrue(result.stopped)
+        XCTAssertEqual(result.text, "hello ")
+    }
+
+    func testStreamingStopMatcherBuffersStopSplitAcrossChunks() {
+        var matcher = StreamingStopSequenceMatcher(stopSequences: ["STOP"])
+
+        let first = matcher.feed("hello ST")
+        let second = matcher.feed("OP hidden")
+
+        XCTAssertFalse(first.stopped)
+        XCTAssertEqual(first.text, "hello")
+        XCTAssertTrue(second.stopped)
+        XCTAssertEqual(second.text, " ")
+    }
+
+    func testStreamingStopMatcherFlushesTailWhenNoStopMatches() {
+        var matcher = StreamingStopSequenceMatcher(stopSequences: ["STOP"])
+
+        let first = matcher.feed("hello ST")
+        let final = matcher.finish()
+
+        XCTAssertFalse(first.stopped)
+        XCTAssertEqual(first.text, "hello")
+        XCTAssertFalse(final.stopped)
+        XCTAssertEqual(final.text, " ST")
+    }
 }
