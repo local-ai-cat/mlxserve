@@ -29,6 +29,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
     public let seed: Int?
     public let stream: Bool
     public let includeUsage: Bool
+    public let structuredOutput: StructuredOutputSpec
 
     public init(
         model: String,
@@ -44,7 +45,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         stop: [String] = [],
         seed: Int? = nil,
         stream: Bool = false,
-        includeUsage: Bool = false
+        includeUsage: Bool = false,
+        structuredOutput: StructuredOutputSpec = .none
     ) {
         self.model = model
         self.prompt = prompt
@@ -60,6 +62,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         self.seed = seed
         self.stream = stream
         self.includeUsage = includeUsage
+        self.structuredOutput = structuredOutput
     }
 
     public func request(forPrompt prompt: String) -> OpenAICompletionRequest {
@@ -77,7 +80,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             stop: stop,
             seed: seed,
             stream: stream,
-            includeUsage: includeUsage
+            includeUsage: includeUsage,
+            structuredOutput: structuredOutput
         )
     }
 
@@ -113,7 +117,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             stop: try openAIStringArray(object["stop"]),
             seed: openAIIntValue(object["seed"]),
             stream: object["stream"] as? Bool ?? false,
-            includeUsage: streamOptions?["include_usage"] as? Bool ?? false
+            includeUsage: streamOptions?["include_usage"] as? Bool ?? false,
+            structuredOutput: try StructuredOutputParser.parse(from: object)
         )
     }
 }

@@ -102,6 +102,7 @@ public struct OpenAIChatRequest: Sendable {
     public let includeUsage: Bool
     public let enableThinking: Bool?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
+    public let structuredOutput: StructuredOutputSpec
 
     public init(
         model: String,
@@ -121,7 +122,8 @@ public struct OpenAIChatRequest: Sendable {
         stream: Bool = false,
         includeUsage: Bool = false,
         enableThinking: Bool? = nil,
-        chatTemplateKwargs: [String: OpenAIJSONValue]? = nil
+        chatTemplateKwargs: [String: OpenAIJSONValue]? = nil,
+        structuredOutput: StructuredOutputSpec = .none
     ) {
         self.model = model
         self.messages = messages
@@ -141,6 +143,11 @@ public struct OpenAIChatRequest: Sendable {
         self.includeUsage = includeUsage
         self.enableThinking = enableThinking
         self.chatTemplateKwargs = chatTemplateKwargs
+        self.structuredOutput = structuredOutput
+    }
+
+    public var structuredOutputWarning: String? {
+        structuredOutput.warningMessage
     }
 }
 
@@ -964,6 +971,7 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
     case invalidContentLength
     case payloadTooLarge
     case listenerFailed(String)
+    case invalidStructuredOutput(String)
 
     var httpStatus: Int {
         switch self {
@@ -971,7 +979,7 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
             return 422
         case .payloadTooLarge:
             return 413
-        case .invalidRequest, .unsupportedContent, .invalidContentLength:
+        case .invalidRequest, .unsupportedContent, .invalidContentLength, .invalidStructuredOutput:
             return 400
         case .invalidPort, .listenerFailed:
             return 500
@@ -996,6 +1004,8 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
             return "HTTP payload too large"
         case .listenerFailed(let message):
             return "listener failed: \(message)"
+        case .invalidStructuredOutput(let message):
+            return message
         }
     }
 }
@@ -1132,6 +1142,7 @@ public extension OpenAIChatRequest {
         guard !messages.isEmpty else { throw OpenAIServerError.missingField("messages") }
         let streamOptions = object["stream_options"] as? [String: Any]
         let chatTemplateKwargs = try parseChatTemplateKwargs(object["chat_template_kwargs"])
+        let structuredOutput = try StructuredOutputParser.parse(from: object)
 
         return OpenAIChatRequest(
             model: model,
@@ -1151,7 +1162,8 @@ public extension OpenAIChatRequest {
             stream: object["stream"] as? Bool ?? false,
             includeUsage: streamOptions?["include_usage"] as? Bool ?? false,
             enableThinking: object["enable_thinking"] as? Bool,
-            chatTemplateKwargs: chatTemplateKwargs
+            chatTemplateKwargs: chatTemplateKwargs,
+            structuredOutput: structuredOutput
         )
     }
 
