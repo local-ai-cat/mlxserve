@@ -326,6 +326,16 @@ public final class OpenAIServer: @unchecked Sendable {
                     return
                 }
                 try await EmbeddingsHandler(backend: embeddingsBackend).handleEmbeddings(request, connection: connection)
+            case ("POST", "/v1/audio/transcriptions"):
+                guard let audioBackend = backend as? any AudioTranscriptionBackend, !audioBackend.transcriptionModels.isEmpty else {
+                    try await sendJSON(
+                        openAIErrorBody(message: "transcription backend not configured", status: 501),
+                        status: 501,
+                        connection: connection
+                    )
+                    return
+                }
+                try await AudioTranscriptionHandler(backend: audioBackend).handleTranscription(request, connection: connection)
             case ("POST", "/v1/messages"):
                 try await AnthropicMessagesHandler(backend: backend).handleMessages(request, connection: connection)
             case ("POST", "/v1/messages/count_tokens"):
@@ -918,6 +928,8 @@ private func httpReasonPhrase(_ status: Int) -> String {
         return "Insufficient Storage"
     case 500:
         return "Internal Server Error"
+    case 501:
+        return "Not Implemented"
     default:
         return "OK"
     }
