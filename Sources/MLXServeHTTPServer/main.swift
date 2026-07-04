@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXEmbedders
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
@@ -12,6 +13,21 @@ struct MLXServeHTTPServerMain {
     static func main() async throws {
         let config = try ServerConfig.parse(CommandLine.arguments)
         let modelURL = URL(fileURLWithPath: config.modelPath)
+        let embeddingBackend: NativeEmbeddingsBackend?
+        if let embeddingModelPath = config.embeddingModelPath {
+            let embeddingModelURL = URL(fileURLWithPath: embeddingModelPath)
+            let embeddingContainer = try await EmbedderModelFactory.shared.loadContainer(
+                from: embeddingModelURL,
+                using: #huggingFaceTokenizerLoader()
+            )
+            embeddingBackend = NativeEmbeddingsBackend(
+                container: embeddingContainer,
+                modelID: embeddingModelURL.lastPathComponent
+            )
+        } else {
+            embeddingBackend = nil
+        }
+
         let container = try await LLMModelFactory.shared.loadContainer(
             from: modelURL,
             using: #huggingFaceTokenizerLoader()
@@ -21,6 +37,7 @@ struct MLXServeHTTPServerMain {
             let backend = NativeChatBackend(
                 context: context,
                 modelID: config.modelID ?? modelURL.lastPathComponent,
+                embeddingsBackend: embeddingBackend,
                 maxConcurrentRequests: config.maxConcurrentRequests
             )
             let server = try OpenAIServer(
@@ -36,12 +53,14 @@ struct MLXServeHTTPServerMain {
     }
 }
 
-private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBackend, OpenAIHealthProviding, @unchecked Sendable {
+private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIHealthProviding, @unchecked Sendable {
     let models: [OpenAIModelInfo]
+    let embeddingModels: [OpenAIModelInfo]
     var healthInfo: OpenAIHealthInfo {
-        OpenAIHealthInfo(
+        let modelCount = models.count + embeddingModels.count
+        return OpenAIHealthInfo(
             defaultModel: models.first?.id,
-            enginePool: OpenAIHealthEnginePool(modelCount: models.count, loadedCount: models.count)
+            enginePool: OpenAIHealthEnginePool(modelCount: modelCount, loadedCount: modelCount)
         )
     }
 
@@ -49,13 +68,16 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBacken
     private let engine: MLXServeEngine
     private let parameters: GenerateParameters
     private let eosTokenIds: Set<Int>
+    private let embeddingsBackend: NativeEmbeddingsBackend?
 
     init(
         context: ModelContext,
         modelID: String,
+        embeddingsBackend: NativeEmbeddingsBackend?,
         maxConcurrentRequests: Int
     ) {
         self.context = context
+        self.embeddingsBackend = embeddingsBackend
         self.parameters = GenerateParameters(maxTokens: 16, temperature: 0)
         self.engine = MLXServeEngine(
             model: context.model,
@@ -68,6 +90,7 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBacken
         }
         self.eosTokenIds = eosTokenIds
         self.models = [OpenAIModelInfo(id: modelID, maxModelLength: nil)]
+        self.embeddingModels = embeddingsBackend?.embeddingModels ?? []
     }
 
     func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
@@ -115,6 +138,13 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBacken
                 seed: request.seed
             )
         )
+    }
+
+    func embed(_ request: OpenAIEmbeddingsRequest) async throws -> OpenAIEmbeddingsResult {
+        guard let embeddingsBackend else {
+            throw NativeChatBackendError.embeddingsUnavailable
+        }
+        return try await embeddingsBackend.embed(request)
     }
 
     private func streamGeneration(
@@ -259,10 +289,48 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBacken
     }
 }
 
+private final class NativeEmbeddingsBackend: OpenAIEmbeddingsBackend, @unchecked Sendable {
+    let embeddingModels: [OpenAIModelInfo]
+
+    private let container: EmbedderModelContainer
+
+    init(container: EmbedderModelContainer, modelID: String) {
+        self.container = container
+        self.embeddingModels = [OpenAIModelInfo(id: modelID, maxModelLength: nil)]
+    }
+
+    func embed(_ request: OpenAIEmbeddingsRequest) async throws -> OpenAIEmbeddingsResult {
+        let inputs = request.input.values
+        return await container.perform { context in
+            var embeddings: [[Float]] = []
+            var promptTokens = 0
+            embeddings.reserveCapacity(inputs.count)
+
+            for input in inputs {
+                let tokens = context.tokenizer.encode(text: input, addSpecialTokens: true)
+                promptTokens += tokens.count
+                let modelInput = MLXArray(tokens)[.newAxis, 0...]
+                let output = context.model(
+                    modelInput,
+                    positionIds: nil,
+                    tokenTypeIds: nil,
+                    attentionMask: nil
+                )
+                let pooled = context.pooling(output, normalize: true)
+                pooled.eval()
+                embeddings.append(pooled[0].asArray(Float.self))
+            }
+
+            return OpenAIEmbeddingsResult(embeddings: embeddings, promptTokens: promptTokens)
+        }
+    }
+}
+
 private struct ServerConfig {
     let host: String
     let port: UInt16
     let modelPath: String
+    let embeddingModelPath: String?
     let modelID: String?
     let maxConcurrentRequests: Int
 
@@ -271,6 +339,7 @@ private struct ServerConfig {
         var port: UInt16 = 18181
         var modelPath = ProcessInfo.processInfo.environment["MLXSERVE_MODEL_DIR"]
             ?? ProcessInfo.processInfo.environment["MLXSERVE_TEST_MODEL"]
+        var embeddingModelPath = ProcessInfo.processInfo.environment["MLXSERVE_EMBEDDING_MODEL_DIR"]
         var modelID: String?
         var maxConcurrentRequests = 8
 
@@ -290,6 +359,9 @@ private struct ServerConfig {
             case "--model-dir":
                 index += 1
                 modelPath = try value(arguments, at: index, for: argument)
+            case "--embedding-model-dir":
+                index += 1
+                embeddingModelPath = try value(arguments, at: index, for: argument)
             case "--model-id":
                 index += 1
                 modelID = try value(arguments, at: index, for: argument)
@@ -316,6 +388,7 @@ private struct ServerConfig {
             host: host,
             port: port,
             modelPath: modelPath,
+            embeddingModelPath: embeddingModelPath,
             modelID: modelID,
             maxConcurrentRequests: maxConcurrentRequests
         )
@@ -337,6 +410,7 @@ private struct ServerConfig {
               --host HOST                       Bind host. Default: 127.0.0.1
               --port PORT                       Bind port. Default: 18181
               --model-dir PATH                  MLX model directory. Required unless MLXSERVE_MODEL_DIR is set.
+              --embedding-model-dir PATH        Optional MLX embedding model directory. Also supports MLXSERVE_EMBEDDING_MODEL_DIR.
               --model-id ID                     OpenAI model id. Defaults to model directory name.
               --max-concurrent-requests N       Scheduler concurrency cap. Default: 8
             """
@@ -347,6 +421,7 @@ private struct ServerConfig {
 private enum NativeChatBackendError: Error, CustomStringConvertible {
     case generationFailed(String)
     case invalidPrompt
+    case embeddingsUnavailable
 
     var description: String {
         switch self {
@@ -354,6 +429,8 @@ private enum NativeChatBackendError: Error, CustomStringConvertible {
             return message
         case .invalidPrompt:
             return "completion backend requires a single prompt"
+        case .embeddingsUnavailable:
+            return "embeddings backend unavailable"
         }
     }
 }

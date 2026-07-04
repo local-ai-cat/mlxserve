@@ -318,6 +318,12 @@ public final class OpenAIServer: @unchecked Sendable {
                     return
                 }
                 try await CompletionsHandler(backend: completionBackend).handleCompletions(request, connection: connection)
+            case ("POST", "/v1/embeddings"):
+                guard let embeddingsBackend = backend as? any OpenAIEmbeddingsBackend else {
+                    try await sendJSON(openAIErrorBody(message: "embeddings backend unavailable", status: 404), status: 404, connection: connection)
+                    return
+                }
+                try await EmbeddingsHandler(backend: embeddingsBackend).handleEmbeddings(request, connection: connection)
             case ("POST", "/v1/messages"):
                 try await AnthropicMessagesHandler(backend: backend).handleMessages(request, connection: connection)
             case ("POST", "/v1/messages/count_tokens"):
