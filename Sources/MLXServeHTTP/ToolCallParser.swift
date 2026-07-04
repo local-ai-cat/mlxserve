@@ -2,6 +2,12 @@ import Foundation
 
 private let toolCallOpenTag = "<tool_call>"
 private let toolCallCloseTag = "</tool_call>"
+private let functionOpenTagPrefix = "<function="
+private let functionCloseTag = "</function>"
+private let parameterOpenTagPrefix = "<parameter="
+private let parameterCloseTag = "</parameter>"
+private let toolsOpenTag = "<tools>"
+private let toolsCloseTag = "</tools>"
 private let llamaPythonTagPrefix = "<|python_tag|>"
 private let toolCallsPrefix = "[TOOL_CALLS]"
 
@@ -36,6 +42,13 @@ public func parseToolCalls(
     }
 
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.contains(functionOpenTagPrefix) {
+        let result = parseBareXMLFunctionToolCalls(from: text, idGenerator: idGenerator)
+        if !result.toolCalls.isEmpty {
+            return result
+        }
+    }
+
     if trimmed.hasPrefix(llamaPythonTagPrefix) {
         let remainder = String(trimmed.dropFirst(llamaPythonTagPrefix.count))
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -47,7 +60,16 @@ public func parseToolCalls(
         return parseBareJSONToolCalls(from: remainder, originalText: text, idGenerator: idGenerator)
     }
 
-    return parseBareJSONToolCalls(from: trimmed, originalText: text, idGenerator: idGenerator)
+    let bareJSONResult = parseBareJSONToolCalls(from: trimmed, originalText: text, idGenerator: idGenerator)
+    if !bareJSONResult.toolCalls.isEmpty {
+        return bareJSONResult
+    }
+
+    if let toolsInnerText = toolsWrappedInnerText(from: trimmed) {
+        return parseBareJSONToolCalls(from: toolsInnerText, originalText: text, idGenerator: idGenerator)
+    }
+
+    return bareJSONResult
 }
 
 private func parseTaggedToolCalls(
@@ -71,6 +93,8 @@ private func parseTaggedToolCalls(
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if let toolCall = parseToolCallObject(from: innerText, idGenerator: idGenerator) {
             toolCalls.append(toolCall)
+        } else if let xmlToolCalls = parseXMLFunctionToolCalls(from: innerText, idGenerator: idGenerator) {
+            toolCalls.append(contentsOf: xmlToolCalls)
         } else {
             contentParts.append(String(text[openRange.lowerBound..<closeRange.upperBound]))
         }
@@ -118,6 +142,72 @@ private func parseBareJSONToolCalls(
     return ToolCallParseResult(content: originalText, toolCalls: [])
 }
 
+private func parseBareXMLFunctionToolCalls(
+    from text: String,
+    idGenerator: () -> String
+) -> ToolCallParseResult {
+    var cursor = text.startIndex
+    var contentParts: [String] = []
+    var toolCalls: [ParsedToolCall] = []
+
+    while let openRange = text[cursor...].range(of: functionOpenTagPrefix) {
+        guard let tagEnd = text[openRange.upperBound...].firstIndex(of: ">"),
+            let closeRange = text[tagEnd...].range(of: functionCloseTag)
+        else {
+            break
+        }
+
+        contentParts.append(String(text[cursor..<openRange.lowerBound]))
+        let functionText = String(text[openRange.lowerBound..<closeRange.upperBound])
+        if let payload = parseXMLFunctionPayload(from: functionText) {
+            toolCalls.append(payload.toolCall(id: idGenerator()))
+        } else {
+            contentParts.append(functionText)
+        }
+        cursor = closeRange.upperBound
+    }
+
+    if cursor < text.endIndex {
+        contentParts.append(String(text[cursor...]))
+    }
+
+    guard !toolCalls.isEmpty else {
+        return ToolCallParseResult(content: text, toolCalls: [])
+    }
+
+    return ToolCallParseResult(
+        content: contentParts.joined().trimmingCharacters(in: .whitespacesAndNewlines),
+        toolCalls: toolCalls
+    )
+}
+
+private func parseXMLFunctionToolCalls(
+    from text: String,
+    idGenerator: () -> String
+) -> [ParsedToolCall]? {
+    guard text.contains(functionOpenTagPrefix) else {
+        return nil
+    }
+
+    var cursor = text.startIndex
+    var toolCalls: [ParsedToolCall] = []
+    while let openRange = text[cursor...].range(of: functionOpenTagPrefix) {
+        guard let tagEnd = text[openRange.upperBound...].firstIndex(of: ">"),
+            let closeRange = text[tagEnd...].range(of: functionCloseTag)
+        else {
+            break
+        }
+
+        let functionText = String(text[openRange.lowerBound..<closeRange.upperBound])
+        if let payload = parseXMLFunctionPayload(from: functionText) {
+            toolCalls.append(payload.toolCall(id: idGenerator()))
+        }
+        cursor = closeRange.upperBound
+    }
+
+    return toolCalls.isEmpty ? nil : toolCalls
+}
+
 private func parseToolCallObject(
     from text: String,
     idGenerator: () -> String
@@ -156,6 +246,68 @@ private func parseToolCallPayload(from object: [String: Any]) -> ToolCallPayload
     return ToolCallPayload(name: name, arguments: arguments)
 }
 
+private func parseXMLFunctionPayload(from text: String) -> ToolCallPayload? {
+    guard let openRange = text.range(of: functionOpenTagPrefix),
+        let tagEnd = text[openRange.upperBound...].firstIndex(of: ">")
+    else {
+        return nil
+    }
+
+    let name = String(text[openRange.upperBound..<tagEnd])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else {
+        return nil
+    }
+
+    let bodyEnd = text.range(of: functionCloseTag, range: tagEnd..<text.endIndex)?.lowerBound ?? text.endIndex
+    let body = String(text[text.index(after: tagEnd)..<bodyEnd])
+    let arguments = xmlFunctionArgumentsJSONString(from: body) ?? "{}"
+    return ToolCallPayload(name: name, arguments: arguments)
+}
+
+private func xmlFunctionArgumentsJSONString(from text: String) -> String? {
+    var cursor = text.startIndex
+    var arguments: [String: Any] = [:]
+
+    while let openRange = text[cursor...].range(of: parameterOpenTagPrefix) {
+        guard let tagEnd = text[openRange.upperBound...].firstIndex(of: ">"),
+            let closeRange = text[tagEnd...].range(of: parameterCloseTag)
+        else {
+            break
+        }
+
+        let key = String(text[openRange.upperBound..<tagEnd])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty {
+            let rawValue = String(text[text.index(after: tagEnd)..<closeRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            arguments[key] = xmlParameterValue(from: rawValue)
+        }
+        cursor = closeRange.upperBound
+    }
+
+    return argumentsJSONString(from: arguments)
+}
+
+private func xmlParameterValue(from text: String) -> Any {
+    parseJSONFragment(from: text) ?? text
+}
+
+private func toolsWrappedInnerText(from text: String) -> String? {
+    guard text.hasPrefix(toolsOpenTag), text.hasSuffix(toolsCloseTag) else {
+        return nil
+    }
+
+    let innerStart = text.index(text.startIndex, offsetBy: toolsOpenTag.count)
+    let innerEnd = text.index(text.endIndex, offsetBy: -toolsCloseTag.count)
+    guard innerStart <= innerEnd else {
+        return nil
+    }
+
+    return String(text[innerStart..<innerEnd])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 private func argumentsJSONString(from value: Any?) -> String? {
     guard let value else {
         return "{}"
@@ -177,4 +329,11 @@ private func parseJSONValue(from text: String) -> Any? {
         return nil
     }
     return try? JSONSerialization.jsonObject(with: data)
+}
+
+private func parseJSONFragment(from text: String) -> Any? {
+    guard let data = text.data(using: .utf8), !data.isEmpty else {
+        return nil
+    }
+    return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
 }
