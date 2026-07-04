@@ -2,17 +2,24 @@ import Foundation
 import MLX
 import MLXEmbedders
 import MLXHuggingFace
-import MLXLLM
 import MLXLMCommon
 import MLXServe
 import MLXServeHTTP
 import Tokenizers
 
-@main
 struct MLXServeHTTPServerMain {
     static func main() async throws {
         let config = try ServerConfig.parse(CommandLine.arguments)
-        let modelURL = URL(fileURLWithPath: config.modelPath)
+        let modelRootURL = URL(fileURLWithPath: config.modelPath, isDirectory: true)
+        let discovered = try applyModelIDOverrideIfNeeded(
+            try ModelDiscovery.discoverModels(in: modelRootURL),
+            override: config.modelID
+        )
+        guard !discovered.isEmpty else {
+            throw ServerConfigError.invalidArgument("no models discovered in \(config.modelPath)")
+        }
+
+        // M5 embeddings: a separate model class, NOT part of the LLM pool.
         let embeddingBackend: NativeEmbeddingsBackend?
         if let embeddingModelPath = config.embeddingModelPath {
             let embeddingModelURL = URL(fileURLWithPath: embeddingModelPath)
@@ -28,266 +35,43 @@ struct MLXServeHTTPServerMain {
             embeddingBackend = nil
         }
 
-        let container = try await LLMModelFactory.shared.loadContainer(
-            from: modelURL,
-            using: #huggingFaceTokenizerLoader()
+        let effectiveCeiling = finalMemoryCeiling(
+            overrideBytes: config.memoryCeilingBytes,
+            tier: config.memoryGuardTier
         )
-
-        try await container.perform { context in
-            let backend = NativeChatBackend(
-                context: context,
-                modelID: config.modelID ?? modelURL.lastPathComponent,
-                embeddingsBackend: embeddingBackend,
-                maxConcurrentRequests: config.maxConcurrentRequests
-            )
-            let server = try OpenAIServer(
-                host: config.host,
-                port: config.port,
-                backend: backend
-            )
-            try await server.start()
-            print("MLXServeHTTP listening on http://\(config.host):\(config.port)")
-            fflush(stdout)
-            server.waitForever()
+        let pool = EnginePool(
+            models: discovered,
+            loader: NativeModelLoader(maxConcurrentRequests: config.maxConcurrentRequests),
+            finalCeiling: effectiveCeiling.bytes,
+            idleTimeout: config.idleTimeout
+        )
+        for pinnedModelID in config.pinnedModelIDs {
+            try await pool.setPinned(true, for: pinnedModelID)
         }
+
+        let backend = PoolBackedChatBackend(
+            pool: pool,
+            modelIDs: Array(discovered.keys),
+            embeddingsBackend: embeddingBackend
+        )
+        let server = try OpenAIServer(
+            host: config.host,
+            port: config.port,
+            backend: backend
+        )
+        if config.idleTimeout != nil {
+            startIdleSweep(pool: pool, interval: config.idleTimeout ?? 0)
+        }
+
+        try await server.start()
+        print("MLXServeHTTP listening on http://\(config.host):\(config.port)")
+        print("Discovered \(discovered.count) model(s); memory ceiling: \(ModelDiscovery.formatSize(effectiveCeiling.bytes)) (\(effectiveCeiling.source))")
+        fflush(stdout)
+        server.waitForever()
     }
 }
 
-private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIHealthProviding, @unchecked Sendable {
-    let models: [OpenAIModelInfo]
-    let embeddingModels: [OpenAIModelInfo]
-    var healthInfo: OpenAIHealthInfo {
-        let modelCount = models.count + embeddingModels.count
-        return OpenAIHealthInfo(
-            defaultModel: models.first?.id,
-            enginePool: OpenAIHealthEnginePool(modelCount: modelCount, loadedCount: modelCount)
-        )
-    }
-
-    private let context: ModelContext
-    private let engine: MLXServeEngine
-    private let parameters: GenerateParameters
-    private let eosTokenIds: Set<Int>
-    private let embeddingsBackend: NativeEmbeddingsBackend?
-
-    init(
-        context: ModelContext,
-        modelID: String,
-        embeddingsBackend: NativeEmbeddingsBackend?,
-        maxConcurrentRequests: Int
-    ) {
-        self.context = context
-        self.embeddingsBackend = embeddingsBackend
-        self.parameters = GenerateParameters(maxTokens: 16, temperature: 0)
-        self.engine = MLXServeEngine(
-            model: context.model,
-            parameters: parameters,
-            maxConcurrentRequests: maxConcurrentRequests
-        )
-        var eosTokenIds = context.configuration.eosTokenIds
-        if let tokenizerEosTokenId = context.tokenizer.eosTokenId {
-            eosTokenIds.insert(tokenizerEosTokenId)
-        }
-        self.eosTokenIds = eosTokenIds
-        self.models = [OpenAIModelInfo(id: modelID, maxModelLength: nil)]
-        self.embeddingModels = embeddingsBackend?.embeddingModels ?? []
-    }
-
-    func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
-        let input = try await context.processor.prepare(input: userInput(from: request))
-        let promptTokens = try countPromptTokens(input)
-        return streamGeneration(
-            uidPrefix: "chat",
-            input: input,
-            promptTokens: promptTokens,
-            maxTokens: request.maxTokens,
-            sampling: samplingParameters(
-                temperature: request.temperature,
-                topP: request.topP,
-                topK: request.topK,
-                minP: request.minP,
-                repetitionPenalty: request.repetitionPenalty,
-                presencePenalty: request.presencePenalty,
-                frequencyPenalty: request.frequencyPenalty,
-                xtcProbability: request.xtcProbability,
-                xtcThreshold: request.xtcThreshold,
-                seed: request.seed
-            )
-        )
-    }
-
-    func startCompletion(_ request: OpenAICompletionRequest) async throws -> OpenAIChatStream {
-        guard case .string(let prompt) = request.prompt else {
-            throw NativeChatBackendError.invalidPrompt
-        }
-        let tokenIDs = context.tokenizer.encode(text: prompt, addSpecialTokens: true)
-        let input = LMInput(tokens: MLXArray(tokenIDs))
-        return streamGeneration(
-            uidPrefix: "cmpl",
-            input: input,
-            promptTokens: tokenIDs.count,
-            maxTokens: request.maxTokens,
-            sampling: samplingParameters(
-                temperature: request.temperature,
-                topP: request.topP,
-                topK: request.topK,
-                minP: request.minP,
-                repetitionPenalty: request.repetitionPenalty,
-                presencePenalty: request.presencePenalty,
-                frequencyPenalty: request.frequencyPenalty,
-                seed: request.seed
-            )
-        )
-    }
-
-    func embed(_ request: OpenAIEmbeddingsRequest) async throws -> OpenAIEmbeddingsResult {
-        guard let embeddingsBackend else {
-            throw NativeChatBackendError.embeddingsUnavailable
-        }
-        return try await embeddingsBackend.embed(request)
-    }
-
-    private func streamGeneration(
-        uidPrefix: String,
-        input: LMInput,
-        promptTokens: Int,
-        maxTokens: Int,
-        sampling: SamplingParameters
-    ) -> OpenAIChatStream {
-        let mlxRequest = Request(
-            uid: "\(uidPrefix)-\(UUID().uuidString)",
-            input: input,
-            maxTokens: maxTokens,
-            sampling: sampling,
-            eosTokenIds: eosTokenIds
-        )
-
-        let responseStream = engine.stream(mlxRequest)
-        let chunks = AsyncThrowingStream<OpenAIChatChunk, Error> { continuation in
-            let task = Task {
-                do {
-                    for try await response in responseStream {
-                        if case .failed(let message)? = response.finishReason {
-                            throw NativeChatBackendError.generationFailed(message)
-                        }
-                        guard response.token >= 0 else {
-                            if response.finishReason != nil {
-                                break
-                            }
-                            continue
-                        }
-                        let text = self.context.tokenizer.decode(
-                            tokenIds: [response.token],
-                            skipSpecialTokens: true
-                        )
-                        continuation.yield(
-                            OpenAIChatChunk(
-                                text: text,
-                                tokenID: response.token,
-                                finishReason: openAIFinishReason(response.finishReason)
-                            )
-                        )
-                        if response.finishReason != nil {
-                            break
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
-        }
-
-        return OpenAIChatStream(promptTokens: promptTokens, chunks: chunks)
-    }
-
-    private func samplingParameters(
-        temperature: Float,
-        topP: Float,
-        topK: Int,
-        minP: Float,
-        repetitionPenalty: Float,
-        presencePenalty: Float,
-        frequencyPenalty: Float,
-        xtcProbability: Float = 0,
-        xtcThreshold: Float = 0.1,
-        seed: Int?
-    ) -> SamplingParameters {
-        SamplingParameters(
-            temperature: temperature,
-            topP: topP,
-            topK: topK,
-            minP: minP,
-            repetitionPenalty: repetitionPenalty,
-            presencePenalty: presencePenalty,
-            frequencyPenalty: frequencyPenalty,
-            xtcProbability: xtcProbability,
-            xtcThreshold: xtcThreshold,
-            xtcSpecialTokens: xtcSpecialTokens(),
-            seed: seed
-        )
-    }
-
-    private func countPromptTokens(_ input: LMInput) throws -> Int {
-        input.text.tokens.dim(0)
-    }
-
-    private func xtcSpecialTokens() -> [Int] {
-        let newlineTokens = context.tokenizer.encode(text: "\n", addSpecialTokens: false)
-        return Array(Set(newlineTokens).union(eosTokenIds)).sorted()
-    }
-
-    private func userInput(from request: OpenAIChatRequest) -> UserInput {
-        UserInput(
-            chat: request.messages.map { message in
-                switch message.role {
-                case "system":
-                    return .system(message.content)
-                case "assistant":
-                    return .assistant(message.content)
-                case "tool":
-                    return .tool(message.content)
-                default:
-                    return .user(message.content)
-                }
-            },
-            additionalContext: additionalContext(from: request)
-        )
-    }
-
-    private func additionalContext(from request: OpenAIChatRequest) -> [String: any Sendable]? {
-        var context: [String: any Sendable] = [:]
-        if let chatTemplateKwargs = request.chatTemplateKwargs {
-            for (key, value) in chatTemplateKwargs {
-                context[key] = sendableValue(from: value)
-            }
-        }
-        if let enableThinking = request.enableThinking {
-            context["enable_thinking"] = enableThinking
-        }
-        return context.isEmpty ? nil : context
-    }
-
-    private func sendableValue(from value: OpenAIJSONValue) -> any Sendable {
-        switch value {
-        case .string(let string):
-            return string
-        case .number(let number):
-            return number
-        case .bool(let bool):
-            return bool
-        case .object(let object):
-            return object.mapValues { sendableValue(from: $0) }
-        case .array(let array):
-            return array.map { sendableValue(from: $0) }
-        case .null:
-            return Optional<String>.none as String?
-        }
-    }
-}
+try await MLXServeHTTPServerMain.main()
 
 private final class NativeEmbeddingsBackend: OpenAIEmbeddingsBackend, @unchecked Sendable {
     let embeddingModels: [OpenAIModelInfo]
@@ -333,6 +117,10 @@ private struct ServerConfig {
     let embeddingModelPath: String?
     let modelID: String?
     let maxConcurrentRequests: Int
+    let memoryGuardTier: MemoryGuardTier?
+    let memoryCeilingBytes: Int64?
+    let idleTimeout: TimeInterval?
+    let pinnedModelIDs: [String]
 
     static func parse(_ arguments: [String]) throws -> ServerConfig {
         var host = "127.0.0.1"
@@ -342,6 +130,10 @@ private struct ServerConfig {
         var embeddingModelPath = ProcessInfo.processInfo.environment["MLXSERVE_EMBEDDING_MODEL_DIR"]
         var modelID: String?
         var maxConcurrentRequests = 8
+        var memoryGuardTier: MemoryGuardTier?
+        var memoryCeilingBytes: Int64?
+        var idleTimeout: TimeInterval?
+        var pinnedModelIDs: [String] = []
 
         var index = 1
         while index < arguments.count {
@@ -371,6 +163,28 @@ private struct ServerConfig {
                     throw ServerConfigError.invalidArgument("invalid max concurrent requests")
                 }
                 maxConcurrentRequests = parsed
+            case "--memory-guard-tier":
+                index += 1
+                let rawValue = try value(arguments, at: index, for: argument)
+                guard let tier = MemoryGuardTier(rawValue: rawValue) else {
+                    throw ServerConfigError.invalidArgument("invalid memory guard tier: \(rawValue)")
+                }
+                memoryGuardTier = tier
+            case "--memory-ceiling-bytes":
+                index += 1
+                guard let parsed = nonNegativeInt64(try value(arguments, at: index, for: argument)) else {
+                    throw ServerConfigError.invalidArgument("invalid memory ceiling bytes")
+                }
+                memoryCeilingBytes = parsed
+            case "--idle-timeout":
+                index += 1
+                guard let parsed = TimeInterval(try value(arguments, at: index, for: argument)), parsed > 0 else {
+                    throw ServerConfigError.invalidArgument("invalid idle timeout")
+                }
+                idleTimeout = parsed
+            case "--pin":
+                index += 1
+                pinnedModelIDs.append(try value(arguments, at: index, for: argument))
             case "--help", "-h":
                 printHelp()
                 Foundation.exit(0)
@@ -390,7 +204,11 @@ private struct ServerConfig {
             modelPath: modelPath,
             embeddingModelPath: embeddingModelPath,
             modelID: modelID,
-            maxConcurrentRequests: maxConcurrentRequests
+            maxConcurrentRequests: maxConcurrentRequests,
+            memoryGuardTier: memoryGuardTier,
+            memoryCeilingBytes: memoryCeilingBytes,
+            idleTimeout: idleTimeout,
+            pinnedModelIDs: pinnedModelIDs
         )
     }
 
@@ -411,42 +229,70 @@ private struct ServerConfig {
               --port PORT                       Bind port. Default: 18181
               --model-dir PATH                  MLX model directory. Required unless MLXSERVE_MODEL_DIR is set.
               --embedding-model-dir PATH        Optional MLX embedding model directory. Also supports MLXSERVE_EMBEDDING_MODEL_DIR.
-              --model-id ID                     OpenAI model id. Defaults to model directory name.
+              --model-id ID                     Single-model compatibility override.
               --max-concurrent-requests N       Scheduler concurrency cap. Default: 8
+              --memory-guard-tier TIER          safe, balanced, or aggressive. Default: off.
+              --memory-ceiling-bytes N          Explicit pool ceiling in bytes. Overrides memory guard tier when > 0.
+              --idle-timeout SECONDS            Unload idle, unpinned models after this many seconds. Default: off.
+              --pin ID                          Pin a discovered model in memory. Repeatable.
             """
         )
     }
 }
 
-private enum NativeChatBackendError: Error, CustomStringConvertible {
-    case generationFailed(String)
-    case invalidPrompt
-    case embeddingsUnavailable
-
-    var description: String {
-        switch self {
-        case .generationFailed(let message):
-            return message
-        case .invalidPrompt:
-            return "completion backend requires a single prompt"
-        case .embeddingsUnavailable:
-            return "embeddings backend unavailable"
-        }
+private func applyModelIDOverrideIfNeeded(
+    _ discovered: [String: DiscoveredModel],
+    override: String?
+) throws -> [String: DiscoveredModel] {
+    guard let override else {
+        return discovered
     }
+    guard discovered.count == 1, let model = discovered.values.first else {
+        throw ServerConfigError.invalidArgument("--model-id can only be used with a single discovered model")
+    }
+    return [
+        override: DiscoveredModel(
+            id: override,
+            modelURL: model.modelURL,
+            estimatedSize: model.estimatedSize
+        )
+    ]
 }
 
-private func openAIFinishReason(_ finishReason: FinishReason?) -> String? {
-    switch finishReason {
-    case .stop:
-        return "stop"
-    case .length:
-        return "length"
-    case .cancelled:
-        return "stop"
-    case .failed:
-        return "stop"
-    case nil:
+private func finalMemoryCeiling(
+    overrideBytes: Int64?,
+    tier: MemoryGuardTier?
+) -> MemoryGuard.EffectiveCeiling {
+    let recommendedWorkingSet = Int64(GPU.maxRecommendedWorkingSetBytes() ?? 0)
+    return MemoryGuard.effectiveCeiling(
+        overrideBytes: overrideBytes,
+        recommendedWorkingSetBytes: recommendedWorkingSet,
+        tier: tier
+    )
+}
+
+private func nonNegativeInt64(_ value: String) -> Int64? {
+    let normalized = value.replacingOccurrences(of: "_", with: "")
+    guard let parsed = Int64(normalized), parsed >= 0 else {
         return nil
+    }
+    return parsed
+}
+
+private func startIdleSweep<Loader: EnginePoolModelLoader>(
+    pool: EnginePool<Loader>,
+    interval: TimeInterval
+) {
+    let sleepNanoseconds = UInt64(max(interval, 1) * 1_000_000_000)
+    Task.detached {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: sleepNanoseconds)
+            let unloaded = await pool.sweepIdleModels()
+            if !unloaded.isEmpty {
+                print("Idle timeout unloaded model(s): \(unloaded.joined(separator: ", "))")
+                fflush(stdout)
+            }
+        }
     }
 }
 

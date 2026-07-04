@@ -310,6 +310,8 @@ public final class OpenAIServer: @unchecked Sendable {
                 try await sendJSON(healthResponse(), status: 200, connection: connection)
             case ("GET", "/v1/models"):
                 try await sendJSON(modelsResponse(), status: 200, connection: connection)
+            case ("GET", "/v1/models/status"):
+                try await sendLifecycleResponse(request, connection: connection)
             case ("POST", "/v1/chat/completions"):
                 try await handleChatCompletion(request, connection: connection)
             case ("POST", "/v1/completions"):
@@ -339,14 +341,28 @@ public final class OpenAIServer: @unchecked Sendable {
                     try await ResponsesHandler(backend: backend, store: responsesStore).handleDelete(id: id, connection: connection)
                     return
                 }
+                if isModelLifecyclePath(request.path) {
+                    try await sendLifecycleResponse(request, connection: connection)
+                    return
+                }
                 try await sendJSON(openAIErrorBody(message: "not found", status: 404), status: 404, connection: connection)
             }
         } catch {
-            try? await sendJSON(
-                openAIErrorBody(message: String(describing: error), status: 500),
-                status: 500,
-                connection: connection
+            try? await sendError(error, connection: connection)
+        }
+    }
+
+    func lifecycleRouteResponseForTesting(_ request: HTTPRequest) async -> HTTPJSONResponse {
+        do {
+            if let response = try await lifecycleResponse(for: request) {
+                return response
+            }
+            return HTTPJSONResponse(
+                status: 404,
+                body: openAIErrorBody(message: "not found", status: 404)
             )
+        } catch {
+            return errorResponse(for: error)
         }
     }
 
@@ -355,6 +371,61 @@ public final class OpenAIServer: @unchecked Sendable {
         guard path.hasPrefix(prefix) else { return nil }
         let id = String(path.dropFirst(prefix.count))
         return id.isEmpty ? nil : id
+    }
+
+    private func sendLifecycleResponse(_ request: HTTPRequest, connection: NWConnection) async throws {
+        guard let response = try await lifecycleResponse(for: request) else {
+            try await sendJSON(openAIErrorBody(message: "not found", status: 404), status: 404, connection: connection)
+            return
+        }
+
+        try await sendJSON(
+            response.body,
+            status: response.status,
+            headers: response.headers,
+            connection: connection
+        )
+    }
+
+    private func lifecycleResponse(for request: HTTPRequest) async throws -> HTTPJSONResponse? {
+        guard let lifecycleBackend = backend as? any OpenAIModelLifecycleBackend else {
+            return nil
+        }
+
+        if request.method == "GET", request.path == "/v1/models/status" {
+            return HTTPJSONResponse(status: 200, body: modelStatusBody(try await lifecycleBackend.modelPoolStatus()))
+        }
+
+        if request.method == "POST", let modelID = lifecycleModelID(from: request.path, action: "load") {
+            return HTTPJSONResponse(
+                status: 200,
+                body: lifecycleResultBody(try await lifecycleBackend.loadModel(modelID))
+            )
+        }
+
+        if request.method == "POST", let modelID = lifecycleModelID(from: request.path, action: "unload") {
+            return HTTPJSONResponse(
+                status: 200,
+                body: lifecycleResultBody(try await lifecycleBackend.unloadModel(modelID))
+            )
+        }
+
+        return nil
+    }
+
+    private func isModelLifecyclePath(_ path: String) -> Bool {
+        lifecycleModelID(from: path, action: "load") != nil
+            || lifecycleModelID(from: path, action: "unload") != nil
+    }
+
+    private func lifecycleModelID(from path: String, action: String) -> String? {
+        let prefix = "/v1/models/"
+        let suffix = "/\(action)"
+        guard path.hasPrefix(prefix), path.hasSuffix(suffix) else { return nil }
+        let idStart = path.index(path.startIndex, offsetBy: prefix.count)
+        let idEnd = path.index(path.endIndex, offsetBy: -suffix.count)
+        guard idStart < idEnd else { return nil }
+        return String(path[idStart..<idEnd])
     }
 
     private func handleChatCompletion(_ request: HTTPRequest, connection: NWConnection) async throws {
@@ -728,41 +799,99 @@ public final class OpenAIServer: @unchecked Sendable {
     private func sendJSON(
         _ object: [String: Any],
         status: Int,
+        headers: [String: String] = [:],
         connection: NWConnection
     ) async throws {
         let body = try JSONSerialization.data(withJSONObject: object, options: [])
         let reason = httpReasonPhrase(status)
-        let header = "HTTP/1.1 \(status) \(reason)\r\n"
+        var header = "HTTP/1.1 \(status) \(reason)\r\n"
             + "Content-Type: application/json\r\n"
             + "Content-Length: \(body.count)\r\n"
             + "Connection: close\r\n"
-            + "\r\n"
+        for (key, value) in headers.sorted(by: { $0.key < $1.key }) {
+            header += "\(key): \(value)\r\n"
+        }
+        header += "\r\n"
         try await connection.sendFinal(data: Data(header.utf8) + body)
+    }
+
+    private func sendError(_ error: Error, connection: NWConnection) async throws {
+        let response = errorResponse(for: error)
+        try await sendJSON(
+            response.body,
+            status: response.status,
+            headers: response.headers,
+            connection: connection
+        )
     }
 }
 
-public func openAIErrorBody(message: String, status: Int) -> [String: Any] {
-    ["error": openAIErrorObject(message: message, status: status)]
+struct HTTPJSONResponse {
+    let status: Int
+    let body: [String: Any]
+    let headers: [String: String]
+
+    init(status: Int, body: [String: Any], headers: [String: String] = [:]) {
+        self.status = status
+        self.body = body
+        self.headers = headers
+    }
 }
 
-public func openAIErrorObject(message: String, status: Int) -> [String: Any] {
+private func modelStatusBody(_ status: OpenAIModelPoolStatus) -> [String: Any] {
     [
-        "message": message,
-        "type": openAIErrorType(status: status),
-        "param": NSNull(),
-        "code": NSNull(),
+        "final_ceiling": status.finalCeiling,
+        "current_model_memory": status.currentModelMemory,
+        "model_count": status.modelCount,
+        "loaded_count": status.loadedCount,
+        "models": status.models.map { model in
+            [
+                "id": model.id,
+                "model_path": model.modelPath,
+                "loaded": model.loaded,
+                "is_loading": model.isLoading,
+                "estimated_size": model.estimatedSize,
+                "actual_size": model.actualSize.map { $0 as Any } ?? NSNull(),
+                "pinned": model.pinned,
+                "last_access": model.lastAccess.map { $0 as Any } ?? NSNull(),
+                "in_use": model.inUse,
+            ] as [String: Any]
+        },
     ]
 }
 
-public func openAIErrorType(status: Int) -> String {
-    switch status {
-    case 404:
-        return "not_found_error"
-    case 500...:
-        return "server_error"
-    default:
-        return "invalid_request_error"
+private func lifecycleResultBody(_ result: OpenAIModelLifecycleResult) -> [String: Any] {
+    var body: [String: Any] = [
+        "status": result.status,
+        "model_id": result.modelID,
+    ]
+    if let message = result.message {
+        body["message"] = message
     }
+    return body
+}
+
+private func errorResponse(for error: Error) -> HTTPJSONResponse {
+    let httpError = openAIHTTPError(from: error)
+    var headers: [String: String] = [:]
+    if let retryAfterSeconds = httpError.retryAfterSeconds {
+        headers["Retry-After"] = "\(retryAfterSeconds)"
+    }
+    return HTTPJSONResponse(
+        status: httpError.status,
+        body: openAIErrorBody(message: httpError.message, status: httpError.status),
+        headers: headers
+    )
+}
+
+private func openAIHTTPError(from error: Error) -> OpenAIHTTPError {
+    if let httpError = error as? OpenAIHTTPError {
+        return httpError
+    }
+    if let serverError = error as? OpenAIServerError {
+        return OpenAIHTTPError(status: serverError.httpStatus, message: String(describing: serverError))
+    }
+    return OpenAIHTTPError(status: 500, message: String(describing: error))
 }
 
 private func httpReasonPhrase(_ status: Int) -> String {
@@ -771,10 +900,22 @@ private func httpReasonPhrase(_ status: Int) -> String {
         return "OK"
     case 400:
         return "Bad Request"
+    case 401:
+        return "Unauthorized"
     case 404:
         return "Not Found"
+    case 409:
+        return "Conflict"
+    case 413:
+        return "Payload Too Large"
     case 422:
         return "Unprocessable Entity"
+    case 429:
+        return "Too Many Requests"
+    case 503:
+        return "Service Unavailable"
+    case 507:
+        return "Insufficient Storage"
     case 500:
         return "Internal Server Error"
     default:
@@ -786,6 +927,7 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
     case invalidPort(UInt16)
     case invalidRequest
     case invalidJSON
+    case missingField(String)
     case unsupportedContent
     case invalidContentLength
     case payloadTooLarge
@@ -793,7 +935,11 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
 
     var httpStatus: Int {
         switch self {
-        case .invalidJSON, .invalidRequest, .unsupportedContent, .invalidContentLength, .payloadTooLarge:
+        case .invalidJSON, .missingField:
+            return 422
+        case .payloadTooLarge:
+            return 413
+        case .invalidRequest, .unsupportedContent, .invalidContentLength:
             return 400
         case .invalidPort, .listenerFailed:
             return 500
@@ -808,6 +954,8 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
             return "invalid HTTP request"
         case .invalidJSON:
             return "invalid JSON request body"
+        case .missingField(let field):
+            return "missing required field: \(field)"
         case .unsupportedContent:
             return "unsupported request content"
         case .invalidContentLength:
@@ -912,12 +1060,21 @@ struct HTTPRequest {
 
 public extension OpenAIChatRequest {
     static func parse(_ body: Data) throws -> OpenAIChatRequest {
-        guard
-            let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let model = object["model"] as? String,
-            let rawMessages = object["messages"] as? [[String: Any]]
-        else {
+        let rawObject: Any
+        do {
+            rawObject = try JSONSerialization.jsonObject(with: body)
+        } catch {
             throw OpenAIServerError.invalidJSON
+        }
+
+        guard let object = rawObject as? [String: Any] else {
+            throw OpenAIServerError.invalidJSON
+        }
+        guard let model = object["model"] as? String, !model.isEmpty else {
+            throw OpenAIServerError.missingField("model")
+        }
+        guard let rawMessages = object["messages"] as? [[String: Any]] else {
+            throw OpenAIServerError.missingField("messages")
         }
 
         let messages = rawMessages.compactMap { raw -> OpenAIChatMessage? in
@@ -934,7 +1091,7 @@ public extension OpenAIChatRequest {
             }
             return nil
         }
-        guard !messages.isEmpty else { throw OpenAIServerError.invalidJSON }
+        guard !messages.isEmpty else { throw OpenAIServerError.missingField("messages") }
         let streamOptions = object["stream_options"] as? [String: Any]
         let chatTemplateKwargs = try parseChatTemplateKwargs(object["chat_template_kwargs"])
 

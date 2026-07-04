@@ -1,4 +1,5 @@
 import Foundation
+@testable import MLXServe
 @testable import MLXServeHTTP
 import XCTest
 
@@ -23,6 +24,7 @@ final class OpenAIServerTests: XCTestCase {
         let body = openAIErrorBody(message: "not found", status: 404)
         let error = try XCTUnwrap(body["error"] as? [String: Any])
 
+        XCTAssertEqual(Set(error.keys), ["message", "type", "param", "code"])
         XCTAssertEqual(error["message"] as? String, "not found")
         XCTAssertEqual(error["type"] as? String, "not_found_error")
         XCTAssertTrue(error["param"] is NSNull)
@@ -30,11 +32,99 @@ final class OpenAIServerTests: XCTestCase {
     }
 
     func testOpenAIErrorTypeMapping() {
+        XCTAssertEqual(openAIErrorType(status: 401), "authentication_error")
         XCTAssertEqual(openAIErrorType(status: 400), "invalid_request_error")
+        XCTAssertEqual(openAIErrorType(status: 413), "invalid_request_error")
         XCTAssertEqual(openAIErrorType(status: 422), "invalid_request_error")
         XCTAssertEqual(openAIErrorType(status: 404), "not_found_error")
+        XCTAssertEqual(openAIErrorType(status: 429), "rate_limit_error")
         XCTAssertEqual(openAIErrorType(status: 500), "server_error")
         XCTAssertEqual(openAIErrorType(status: 503), "server_error")
+    }
+
+    func testOpenAIErrorResponseCarriesRetryAfter() {
+        let response = openAIErrorResponse(
+            message: "Scheduler waiting queue full (1/1). Try again shortly.",
+            status: 503,
+            retryAfterSeconds: 1
+        )
+
+        XCTAssertEqual(response.status, 503)
+        XCTAssertEqual(response.retryAfterSeconds, 1)
+        XCTAssertEqual(response.body["type"] as? String, "server_error")
+    }
+
+    func testModelsStatusLifecycleRouteShape() async throws {
+        let backend = FakePoolLifecycleBackend()
+        let server = try OpenAIServer(port: 0, backend: backend)
+        let response = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "GET", path: "/v1/models/status", headers: [:], body: Data())
+        )
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.body["final_ceiling"] as? Int64, 1_000)
+        XCTAssertEqual(response.body["current_model_memory"] as? Int64, 0)
+        XCTAssertEqual(response.body["model_count"] as? Int, 2)
+        XCTAssertEqual(response.body["loaded_count"] as? Int, 0)
+        let models = try XCTUnwrap(response.body["models"] as? [[String: Any]])
+        XCTAssertEqual(models.count, 2)
+        let first = try XCTUnwrap(models.first)
+        XCTAssertEqual(
+            Set(first.keys),
+            ["id", "model_path", "loaded", "is_loading", "estimated_size", "actual_size", "pinned", "last_access", "in_use"]
+        )
+    }
+
+    func testModelLoadAndUnloadLifecycleRoutes() async throws {
+        let backend = FakePoolLifecycleBackend()
+        let server = try OpenAIServer(port: 0, backend: backend)
+
+        let load = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/alpha/load", headers: [:], body: Data())
+        )
+        XCTAssertEqual(load.status, 200)
+        XCTAssertEqual(load.body["status"] as? String, "ok")
+        XCTAssertEqual(load.body["model_id"] as? String, "alpha")
+        XCTAssertEqual(load.body["message"] as? String, "Loaded: alpha")
+
+        let unload = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/alpha/unload", headers: [:], body: Data())
+        )
+        XCTAssertEqual(unload.status, 200)
+        XCTAssertEqual(unload.body["status"] as? String, "ok")
+        XCTAssertEqual(unload.body["model_id"] as? String, "alpha")
+    }
+
+    func testModelLifecycleRouteErrorPathsUseOpenAIEnvelope() async throws {
+        let backend = FakePoolLifecycleBackend()
+        let server = try OpenAIServer(port: 0, backend: backend)
+
+        let unknown = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/missing/load", headers: [:], body: Data())
+        )
+        XCTAssertEqual(unknown.status, 404)
+        var error = try XCTUnwrap(unknown.body["error"] as? [String: Any])
+        XCTAssertEqual(error["type"] as? String, "not_found_error")
+        XCTAssertEqual(error["message"] as? String, "Model 'missing' not found. Available models: alpha, beta")
+
+        let notLoaded = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/beta/unload", headers: [:], body: Data())
+        )
+        XCTAssertEqual(notLoaded.status, 400)
+        error = try XCTUnwrap(notLoaded.body["error"] as? [String: Any])
+        XCTAssertEqual(error["message"] as? String, "Model not loaded: beta")
+
+        _ = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/alpha/load", headers: [:], body: Data())
+        )
+        let lease = try await backend.acquireForTest("alpha")
+        let busy = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/alpha/unload", headers: [:], body: Data())
+        )
+        XCTAssertEqual(busy.status, 409)
+        error = try XCTUnwrap(busy.body["error"] as? [String: Any])
+        XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+        await backend.releaseForTest(lease)
     }
 
     func testChatRequestParsePopulatesSamplingAndOpenAIFields() throws {
@@ -114,6 +204,40 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertEqual(request.stop, ["END"])
     }
 
+    func testChatRequestParseMissingModelIsValidationError() {
+        XCTAssertThrowsError(
+            try OpenAIChatRequest.parse(
+                Data(
+                    """
+                    {
+                      "messages": [{"role": "user", "content": "hello"}]
+                    }
+                    """.utf8
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? OpenAIServerError, .missingField("model"))
+            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 422)
+        }
+    }
+
+    func testChatRequestParseMissingMessagesIsValidationError() {
+        XCTAssertThrowsError(
+            try OpenAIChatRequest.parse(
+                Data(
+                    """
+                    {
+                      "model": "test-model"
+                    }
+                    """.utf8
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? OpenAIServerError, .missingField("messages"))
+            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 422)
+        }
+    }
+
     func testChatRequestParseUsesNeutralDefaults() throws {
         let request = try OpenAIChatRequest.parse(
             Data(
@@ -189,5 +313,126 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertEqual(first.text, "hello")
         XCTAssertFalse(final.stopped)
         XCTAssertEqual(final.text, " ST")
+    }
+}
+
+private struct RouteFakeEngine: Sendable {
+    let id: String
+}
+
+private struct RouteFakeLoader: EnginePoolModelLoader {
+    func loadModel(id: String, modelURL: URL) async throws -> RouteFakeEngine {
+        RouteFakeEngine(id: id)
+    }
+
+    func unloadModel(_ engine: RouteFakeEngine, id: String) async {}
+}
+
+private final class FakePoolLifecycleBackend: OpenAIModelLifecycleBackend, @unchecked Sendable {
+    let models: [OpenAIModelInfo] = [
+        OpenAIModelInfo(id: "alpha"),
+        OpenAIModelInfo(id: "beta"),
+    ]
+
+    private let pool: EnginePool<RouteFakeLoader>
+
+    init() {
+        self.pool = EnginePool(
+            models: [
+                "alpha": DiscoveredModel(
+                    id: "alpha",
+                    modelURL: URL(fileURLWithPath: "/models/alpha", isDirectory: true),
+                    estimatedSize: 100
+                ),
+                "beta": DiscoveredModel(
+                    id: "beta",
+                    modelURL: URL(fileURLWithPath: "/models/beta", isDirectory: true),
+                    estimatedSize: 200
+                ),
+            ],
+            loader: RouteFakeLoader(),
+            finalCeiling: 1_000
+        )
+    }
+
+    func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
+        OpenAIChatStream(
+            promptTokens: 0,
+            chunks: AsyncThrowingStream { continuation in
+                continuation.finish()
+            }
+        )
+    }
+
+    func modelPoolStatus() async throws -> OpenAIModelPoolStatus {
+        OpenAIModelPoolStatus(await pool.status())
+    }
+
+    func loadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        do {
+            let result = try await pool.load(id)
+            return OpenAIModelLifecycleResult(
+                modelID: id,
+                message: result.alreadyLoaded ? "Already loaded: \(id)" : "Loaded: \(id)"
+            )
+        } catch {
+            throw openAIError(from: error)
+        }
+    }
+
+    func unloadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        do {
+            try await pool.unload(id)
+            return OpenAIModelLifecycleResult(modelID: id)
+        } catch {
+            throw openAIError(from: error)
+        }
+    }
+
+    func acquireForTest(_ id: String) async throws -> EnginePoolLease<RouteFakeEngine> {
+        try await pool.acquire(id)
+    }
+
+    func releaseForTest(_ lease: EnginePoolLease<RouteFakeEngine>) async {
+        await pool.release(lease)
+    }
+
+    private func openAIError(from error: Error) -> OpenAIHTTPError {
+        guard let poolError = error as? EnginePoolError else {
+            return OpenAIHTTPError(status: 500, message: String(describing: error))
+        }
+        return OpenAIHTTPError(
+            status: poolError.httpStatus,
+            message: poolError.message,
+            retryAfterSeconds: poolError.retryAfterSeconds
+        )
+    }
+}
+
+private extension OpenAIModelPoolStatus {
+    init(_ status: EnginePoolStatus) {
+        self.init(
+            finalCeiling: status.finalCeiling,
+            currentModelMemory: status.currentModelMemory,
+            modelCount: status.modelCount,
+            loadedCount: status.loadedCount,
+            models: status.models.map(OpenAIModelRuntimeStatus.init)
+        )
+    }
+}
+
+private extension OpenAIModelRuntimeStatus {
+    init(_ status: EnginePoolModelStatus) {
+        self.init(
+            id: status.id,
+            modelPath: status.modelPath,
+            loaded: status.loaded,
+            isLoading: status.isLoading,
+            estimatedSize: status.estimatedSize,
+            actualSize: status.actualSize,
+            pinned: status.pinned,
+            lastAccess: status.lastAccess,
+            inUse: status.inUse
+        )
     }
 }
