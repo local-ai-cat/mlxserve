@@ -7,7 +7,7 @@ public enum CausalMask {
         leftPadding: MLXArray? = nil,
         windowSize: Int? = nil
     ) -> MLXArray? {
-        if n == 1, leftPaddingMax(leftPadding) == 0 {
+        if n == 1, windowSize == nil, leftPaddingMax(leftPadding) == 0 {
             return nil
         }
 

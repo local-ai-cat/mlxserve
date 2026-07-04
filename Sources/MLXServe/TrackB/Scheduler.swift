@@ -17,6 +17,7 @@ public actor Scheduler {
     private let maxConcurrentRequests: Int
     private let queueLimit: Int
     private let prefixStore: (any PrefixKVStore)?
+    private let prefixCacheEnabled: Bool
     private var waiting: [Request] = []
     private var running: [String: RunningRequest] = [:]
     private var pendingCancellation: Set<String> = []
@@ -34,6 +35,8 @@ public actor Scheduler {
         self.maxConcurrentRequests = maxConcurrentRequests
         self.queueLimit = max(maxConcurrentRequests * 4, 32)
         self.prefixStore = prefixStore
+        self.prefixCacheEnabled = prefixStore != nil
+            && !Self.usesWindowedKVCache(model: modelBox.model, parameters: parameters)
     }
 
     public var isIdle: Bool {
@@ -214,7 +217,7 @@ public actor Scheduler {
         }
         let promptTokens = promptTokensArray.asArray(Int.self)
 
-        if let prefixStore, let hit = prefixStore.fetch(tokens: promptTokens) {
+        if prefixCacheEnabled, let prefixStore, let hit = prefixStore.fetch(tokens: promptTokens) {
             do {
                 let serialized = try prefixStore.reconstructCache(from: hit)
                 let reconstructedCache = try serialized.map {
@@ -301,7 +304,9 @@ public actor Scheduler {
     }
 
     private func storeFinishedPromptCache(uid: String) {
-        guard let prefixStore, let runningRequest = running[uid],
+        guard prefixCacheEnabled,
+            let prefixStore,
+            let runningRequest = running[uid],
             let cache = generator.extractCache(uid: uid)
         else {
             return
@@ -334,6 +339,38 @@ public actor Scheduler {
     private func logCacheFailure(_ message: String, _ error: Error) {
         let line = "MLXServe cache warning: \(message): \(error)\n"
         FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    private static func usesWindowedKVCache(
+        model: any LanguageModel,
+        parameters: GenerateParameters
+    ) -> Bool {
+        usesWindowedKVCache(model.newCache(parameters: parameters))
+    }
+
+    private static func usesWindowedKVCache(_ caches: [any KVCache]) -> Bool {
+        caches.contains { cache in
+            cache.maxSize != nil || isKnownWindowedCacheType(cache)
+                || usesWindowedKVCache(nestedCaches(in: cache))
+        }
+    }
+
+    private static func nestedCaches(in cache: any KVCache) -> [any KVCache] {
+        Mirror(reflecting: cache).children.flatMap { child -> [any KVCache] in
+            if let caches = child.value as? [any KVCache] {
+                return caches
+            }
+            if let cache = child.value as? any KVCache {
+                return [cache]
+            }
+            return []
+        }
+    }
+
+    private static func isKnownWindowedCacheType(_ cache: any KVCache) -> Bool {
+        let cacheType = String(describing: type(of: cache))
+        return cacheType.localizedCaseInsensitiveContains("rotating")
+            || cacheType.localizedCaseInsensitiveContains("circular")
     }
 }
 

@@ -11,7 +11,6 @@ public enum BatchKVCacheError: Error, Equatable, CustomStringConvertible {
     case incompatibleLayout(expected: String, actual: String)
     case unsupportedStateMutation(layout: String, stateCount: Int)
     case invalidMetadata([String])
-    case rotatingCacheUnsupported(cacheType: String)
 
     public var description: String {
         switch self {
@@ -31,8 +30,6 @@ public enum BatchKVCacheError: Error, Equatable, CustomStringConvertible {
             return "BatchKVCache cannot set \(stateCount) state arrays on \(layout) layout."
         case .invalidMetadata(let metadata):
             return "BatchKVCache metadata is invalid: \(metadata)."
-        case .rotatingCacheUnsupported(let cacheType):
-            return "BatchKVCache cannot merge rotating cache type \(cacheType)."
         }
     }
 }
@@ -61,8 +58,15 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         }
     }
 
+    private struct RotatingCacheMetadata {
+        let keep: Int
+        let offset: Int
+        let idx: Int
+    }
+
     private var buffers: [MLXArray] = []
     private var rowMetaStates: [[String]] = []
+    private var positionOffsets: MLXArray
     private var layout: Layout
     private let step: Int
 
@@ -72,13 +76,14 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
 
     public init(leftPadding: [Int], idx: Int = 0, step: Int = 256) {
         self.leftPadding = MLXArray(leftPadding.map(Int32.init))
+        self.positionOffsets = MLXArray(leftPadding.map { Int32(idx - $0) })
         self.idx = idx
         self.step = step
         self.layout = .sequence(axis: 2)
     }
 
     public var batchOffset: MLXArray {
-        MLXArray(Int32(idx)) - leftPadding
+        positionOffsets
     }
 
     public func innerState() -> [MLXArray] {
@@ -90,13 +95,13 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             throw BatchKVCacheError.emptyMerge
         }
 
-        let states = caches.map(\.state)
+        let rawStates = caches.map(\.state)
         let cacheTypes = caches.map { String(describing: type(of: $0)) }
-        guard let firstState = states.first, !firstState.isEmpty else {
+        guard let firstState = rawStates.first, !firstState.isEmpty else {
             throw BatchKVCacheError.emptyState(cacheType: cacheTypes.first ?? "unknown")
         }
 
-        for (state, cacheType) in zip(states, cacheTypes) where state.count != firstState.count {
+        for (state, cacheType) in zip(rawStates, cacheTypes) where state.count != firstState.count {
             throw BatchKVCacheError.inconsistentStateCount(
                 expected: firstState.count,
                 actual: state.count,
@@ -105,25 +110,28 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         }
 
         let layout = try inferLayout(cacheType: cacheTypes[0], state: firstState)
-        if case .sequence(let sequenceAxis) = layout {
-            for (state, cacheType) in zip(states, cacheTypes) {
-                if isKnownRotatingCache(cacheType) {
-                    throw BatchKVCacheError.rotatingCacheUnsupported(cacheType: cacheType)
-                }
-                _ = try sequenceLength(
-                    cacheType: cacheType,
+        switch layout {
+        case .sequence(let sequenceAxis):
+            let states = rawStates.enumerated().map { row, state in
+                normalizedSequenceState(
+                    cache: caches[row],
+                    cacheType: cacheTypes[row],
                     state: state,
                     sequenceAxis: sequenceAxis
                 )
             }
-        }
-        switch layout {
-        case .sequence(let sequenceAxis):
+            let lengths = try states.enumerated().map { row, state in
+                try sequenceLength(cacheType: cacheTypes[row], state: state, sequenceAxis: sequenceAxis)
+            }
+            let positionOffsets = zip(caches, lengths).map { cache, length in
+                max(cache.offset, length)
+            }
             return try mergeSequenceCaches(
                 states: states,
                 cacheTypes: cacheTypes,
                 sequenceAxis: sequenceAxis,
-                rowMetaStates: caches.map(\.metaState)
+                rowMetaStates: caches.map(\.metaState),
+                positionOffsets: positionOffsets
             )
         case .batchState:
             throw BatchKVCacheError.unsupportedSequenceState(
@@ -146,8 +154,10 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         case .batchState:
             cache.state = buffers.map { Self.sliceRow($0, row: row) }
         }
-        if row < rowMetaStates.count {
-            cache.metaState = rowMetaStates[row]
+        if row < rowMetaStates.count,
+            let metaState = Self.kvCacheSimpleCompatibleMetaState(rowMetaStates[row])
+        {
+            cache.metaState = metaState
         }
         return cache
     }
@@ -157,6 +167,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             buffers.removeAll()
             rowMetaStates.removeAll()
             leftPadding = MLXArray([Int32]())
+            positionOffsets = MLXArray([Int32]())
             idx = 0
             return
         }
@@ -164,6 +175,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         let rowIndices = MLXArray(rows.map(Int32.init))
         buffers = buffers.map { $0.take(rowIndices, axis: 0) }
         leftPadding = leftPadding.take(rowIndices, axis: 0)
+        positionOffsets = positionOffsets.take(rowIndices, axis: 0)
         rowMetaStates = rows.map { row in
             row < rowMetaStates.count ? rowMetaStates[row] : []
         }
@@ -200,6 +212,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         guard batchSize > 0, !buffers.isEmpty else {
             state = other.state
             leftPadding = other.leftPadding
+            positionOffsets = other.positionOffsets
             rowMetaStates = other.rowMetaStates
             idx = other.idx
             layout = other.layout
@@ -228,10 +241,12 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
                 concatenated([$0, $1], axis: 0)
             }
             leftPadding = concatenated([normalizedCurrent.leftPadding, normalizedOther.leftPadding], axis: 0)
+            positionOffsets = concatenated([positionOffsets, other.positionOffsets], axis: 0)
             idx = targetIdx
         case .batchState:
             buffers = zip(buffers, other.buffers).map { concatenated([$0, $1], axis: 0) }
             leftPadding = concatenated([leftPadding, other.leftPadding], axis: 0)
+            positionOffsets = concatenated([positionOffsets, other.positionOffsets], axis: 0)
         }
 
         rowMetaStates.append(contentsOf: other.rowMetaStates)
@@ -243,6 +258,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             let previous = idx
             ensureCapacity(keys: newKeys, values: newValues, sequenceAxis: sequenceAxis)
             idx += newKeys.dim(sequenceAxis)
+            positionOffsets = positionOffsets + MLXArray(Int32(newKeys.dim(sequenceAxis)))
 
             buffers[0][Self.indices(sequenceAxis: sequenceAxis, range: previous ..< idx, rank: buffers[0].shape.count)] = newKeys
             buffers[1][Self.indices(sequenceAxis: sequenceAxis, range: previous ..< idx, rank: buffers[1].shape.count)] = newValues
@@ -254,6 +270,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         case .batchState:
             buffers = [newKeys, newValues]
             leftPadding = MLXArray(Array(repeating: Int32(0), count: newKeys.dim(0)))
+            positionOffsets = MLXArray(Array(repeating: Int32(0), count: newKeys.dim(0)))
             return (newKeys, newValues)
         }
     }
@@ -275,9 +292,11 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
                 buffers = newValue
                 idx = newValue[0].dim(sequenceAxis)
                 leftPadding = MLXArray(Array(repeating: Int32(0), count: newValue[0].dim(0)))
+                positionOffsets = MLXArray(Array(repeating: Int32(idx), count: newValue[0].dim(0)))
             } else {
                 buffers = newValue
                 leftPadding = MLXArray(Array(repeating: Int32(0), count: newValue.first?.dim(0) ?? 0))
+                positionOffsets = MLXArray(Array(repeating: Int32(0), count: newValue.first?.dim(0) ?? 0))
             }
         }
     }
@@ -288,6 +307,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
                 String(idx),
                 leftPadding.asArray(Int.self).map(String.init).joined(separator: ","),
                 layout.description,
+                positionOffsets.asArray(Int.self).map(String.init).joined(separator: ","),
             ]
         }
         set {
@@ -295,6 +315,12 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             idx = Int(newValue[0]) ?? 0
             let padding = newValue[1].split(separator: ",").compactMap { Int($0) }
             leftPadding = MLXArray(padding.map(Int32.init))
+            if newValue.count >= 4 {
+                let offsets = newValue[3].split(separator: ",").compactMap { Int($0) }
+                positionOffsets = MLXArray(offsets.map(Int32.init))
+            } else {
+                positionOffsets = MLXArray(padding.map { Int32(idx - $0) })
+            }
         }
     }
 
@@ -325,7 +351,23 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
     public func trim(_ n: Int) -> Int {
         guard case .sequence = layout else { return 0 }
         let trimmed = min(idx, n)
+        guard trimmed > 0 else { return 0 }
+
+        let currentIdx = idx
+        let currentLeftPadding = leftPadding.asArray(Int.self)
+        let currentPositionOffsets = positionOffsets.asArray(Int.self)
+        let rowTrimmed = currentLeftPadding.map { padding in
+            min(trimmed, max(0, currentIdx - padding))
+        }
+
         idx -= trimmed
+        leftPadding = MLXArray(zip(currentLeftPadding, rowTrimmed).map { padding, rowTrimmed in
+            let remainingLength = max(0, currentIdx - padding - rowTrimmed)
+            return Int32(idx - remainingLength)
+        })
+        positionOffsets = MLXArray(zip(currentPositionOffsets, rowTrimmed).map { offset, rowTrimmed in
+            Int32(offset - rowTrimmed)
+        })
         return trimmed
     }
 
@@ -334,6 +376,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         copy.layout = layout
         copy.buffers = buffers.map { $0[.ellipsis] }
         copy.rowMetaStates = rowMetaStates
+        copy.positionOffsets = positionOffsets
         return copy
     }
 
@@ -341,10 +384,11 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         states: [[MLXArray]],
         cacheTypes: [String],
         sequenceAxis: Int,
-        rowMetaStates: [[String]]
+        rowMetaStates: [[String]],
+        positionOffsets: [Int]
     ) throws -> BatchKVCache {
-        let lengths = try states.map { state in
-            try sequenceLength(cacheType: cacheTypes[0], state: state, sequenceAxis: sequenceAxis)
+        let lengths = try states.enumerated().map { row, state in
+            try sequenceLength(cacheType: cacheTypes[row], state: state, sequenceAxis: sequenceAxis)
         }
         let maxLength = lengths.max() ?? 0
         let padding = lengths.map { maxLength - $0 }
@@ -375,6 +419,7 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
         cache.layout = .sequence(axis: sequenceAxis)
         cache.buffers = batchBuffers
         cache.rowMetaStates = rowMetaStates
+        cache.positionOffsets = MLXArray(positionOffsets.map(Int32.init))
         return cache
     }
 
@@ -419,6 +464,66 @@ public final class BatchKVCache: KVCache, BatchPositionedKVCache {
             return .sequence(axis: ranks[0] - 2)
         }
         return .batchState
+    }
+
+    private static func normalizedSequenceState(
+        cache: any KVCache,
+        cacheType: String,
+        state: [MLXArray],
+        sequenceAxis: Int
+    ) -> [MLXArray] {
+        guard isKnownRotatingCache(cacheType) else { return state }
+        guard let metadata = rotatingMetadata(from: cache.metaState) else { return state }
+        guard state.count == 2 else { return state }
+        return state.map {
+            temporalRotatingArray($0, metadata: metadata, sequenceAxis: sequenceAxis)
+        }
+    }
+
+    private static func rotatingMetadata(from metaState: [String]) -> RotatingCacheMetadata? {
+        guard metaState.count == 5,
+            let keep = Int(metaState[0]),
+            Int(metaState[1]) != nil,
+            Int(metaState[2]) != nil,
+            let offset = Int(metaState[3]),
+            let idx = Int(metaState[4])
+        else {
+            return nil
+        }
+        return RotatingCacheMetadata(keep: keep, offset: offset, idx: idx)
+    }
+
+    private static func temporalRotatingArray(
+        _ array: MLXArray,
+        metadata: RotatingCacheMetadata,
+        sequenceAxis: Int
+    ) -> MLXArray {
+        let length = array.dim(sequenceAxis)
+        let idx = min(metadata.idx, length)
+        let keep = min(metadata.keep, idx)
+
+        if idx == length {
+            return array
+        }
+        if idx < metadata.offset {
+            var parts: [MLXArray] = []
+            if keep > 0 {
+                parts.append(slice(array, sequenceAxis: sequenceAxis, range: 0 ..< keep))
+            }
+            if idx < length {
+                parts.append(slice(array, sequenceAxis: sequenceAxis, range: idx ..< length))
+            }
+            if keep < idx {
+                parts.append(slice(array, sequenceAxis: sequenceAxis, range: keep ..< idx))
+            }
+            return concatenated(parts, axis: sequenceAxis)
+        }
+        return slice(array, sequenceAxis: sequenceAxis, range: ..<idx)
+    }
+
+    private static func kvCacheSimpleCompatibleMetaState(_ metaState: [String]) -> [String]? {
+        guard metaState.count == 1, metaState[0].isEmpty else { return nil }
+        return metaState
     }
 
     private static func isKnownRotatingCache(_ cacheType: String) -> Bool {
