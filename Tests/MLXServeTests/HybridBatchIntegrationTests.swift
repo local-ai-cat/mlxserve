@@ -75,7 +75,7 @@ final class HybridBatchIntegrationTests: XCTestCase {
                 )
             }
             let serial = try inputs.map {
-                try Self.serialGreedyTokens(
+                try SerialGreedyTokenHelper.tokens(
                     model: context.model,
                     input: $0,
                     parameters: parameters,
@@ -102,49 +102,5 @@ final class HybridBatchIntegrationTests: XCTestCase {
                 XCTAssertEqual(batched["hybrid-batch-\(index)"], serial[index])
             }
         }
-    }
-
-    private static func serialGreedyTokens(
-        model: any LanguageModel,
-        input: LMInput,
-        parameters: GenerateParameters,
-        steps: Int
-    ) throws -> [Int] {
-        let cache = model.newCache(parameters: parameters)
-        var state: LMOutput.State?
-        var currentLogits: MLXArray
-        var currentToken: MLXArray
-
-        switch try model.prepare(input, cache: cache, windowSize: parameters.prefillStepSize) {
-        case .tokens(let tokens):
-            let output = model(tokens[text: .newAxis], cache: cache, state: state)
-            state = output.state
-            currentLogits = output.logits[0..., -1, 0...]
-            currentToken = argMax(currentLogits, axis: -1)
-        case .logits(let output):
-            state = output.state
-            currentLogits = output.logits[0..., -1, 0...]
-            currentToken = argMax(currentLogits, axis: -1)
-        }
-        eval(currentToken, currentLogits, cache)
-
-        var tokens: [Int] = []
-        for _ in 0 ..< steps {
-            eval(currentToken, currentLogits)
-            tokens.append(currentToken.item(Int.self))
-
-            let output = model(
-                LMInput.Text(tokens: currentToken[.newAxis, 0...]),
-                cache: cache,
-                state: state
-            )
-            state = output.state
-            currentLogits = output.logits[0..., -1, 0...]
-            currentToken = argMax(currentLogits, axis: -1)
-            asyncEval(currentToken, currentLogits)
-        }
-
-        eval(currentToken, currentLogits)
-        return tokens
     }
 }
