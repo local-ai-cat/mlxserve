@@ -150,6 +150,9 @@ final class NativeModelEngine: @unchecked Sendable {
     private func userInput(from request: OpenAIChatRequest) throws -> UserInput {
         UserInput(
             chat: try request.messages.map(chatMessage),
+            tools: toolSpecDictionaries(
+                from: selectOpenAITools(tools: request.tools, toolChoice: request.toolChoice)
+            ),
             additionalContext: additionalContext(from: request)
         )
     }
@@ -157,6 +160,7 @@ final class NativeModelEngine: @unchecked Sendable {
     private func chatMessage(from message: OpenAIChatMessage) throws -> Chat.Message {
         let role = Chat.Message.Role(rawValue: message.role) ?? .user
         let images = try message.imageReferences.map(image)
+        // TODO(M6b): render prior assistant tool_calls once OpenAIChatMessage carries them.
         return Chat.Message(role: role, content: message.content, images: images)
     }
 
@@ -216,6 +220,21 @@ final class NativeModelEngine: @unchecked Sendable {
             context["enable_thinking"] = enableThinking
         }
         return context.isEmpty ? nil : context
+    }
+
+    private func toolSpecDictionaries(from tools: [OpenAIJSONValue]?) -> [[String: any Sendable]]? {
+        guard let tools else { return nil }
+
+        var toolSpecs: [[String: any Sendable]] = []
+        for tool in tools {
+            guard case .object(let object) = tool else { continue }
+            var converted: [String: any Sendable] = [:]
+            for (key, value) in object {
+                converted[key] = sendableValue(from: value)
+            }
+            toolSpecs.append(converted)
+        }
+        return toolSpecs.isEmpty ? nil : toolSpecs
     }
 
     private func sendableValue(from value: OpenAIJSONValue) -> any Sendable {
