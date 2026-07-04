@@ -1,0 +1,797 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-04T20:30:33+00:00",
+  "omlx_version": "0.4.5.dev1",
+  "sources": {
+    "omlx_src": "/tmp/omlx-sidecar-src-20260703/omlx",
+    "mlx_site": "/private/tmp/omlx-sidecar-venv-20260703/lib/python3.14/site-packages"
+  },
+  "counts": {
+    "routes": 106,
+    "chat_request_fields": 26,
+    "model_architectures": {
+      "mlx_lm": 108,
+      "mlx_vlm": 77,
+      "mlx_embeddings": 10
+    },
+    "error_codes": 13
+  },
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/admin",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/bench/accuracy/cancel",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/bench/accuracy/queue/add",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/bench/accuracy/queue/status",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/bench/accuracy/queue/{idx}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/bench/accuracy/results",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/bench/accuracy/results/reset",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/bench/accuracy/{bench_id}/stream",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/bench/active",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/bench/start",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/bench/{bench_id}/cancel",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/bench/{bench_id}/results",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/bench/{bench_id}/stream",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/cache/probe",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/device-info",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/global-settings",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/global-settings",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/grammar/parsers",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/hf/cancel/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/hf/download",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/hf/model-info",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/hf/models",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/hf/models/{model_name}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/hf/recommended",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/hf/retry/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/hf/search",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/hf/task/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/hf/tasks",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/hot-cache/clear",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/login",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/logout",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/logs",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/models",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/models/{model_id}/generation_config",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/models/{model_id}/load",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/models/{model_id}/profiles",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/models/{model_id}/profiles",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/models/{model_id}/profiles/{name}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "PUT",
+      "path": "/admin/api/models/{model_id}/profiles/{name}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/models/{model_id}/profiles/{name}/apply",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "PUT",
+      "path": "/admin/api/models/{model_id}/settings",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/models/{model_id}/unload",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/ms/cancel/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/ms/download",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/ms/model-info",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/ms/recommended",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/ms/retry/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/ms/search",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/ms/status",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/ms/task/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/ms/tasks",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/oq/cancel/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/oq/estimate",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/oq/models",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/oq/start",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/oq/task/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/oq/tasks",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/presets/refresh",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/profile-fields",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/profile-templates",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/profile-templates",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/profile-templates/{name}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "PUT",
+      "path": "/admin/api/profile-templates/{name}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/reload",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/server-info",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/server/restart",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/setup-api-key",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/ssd-cache/clear",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/stats",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/stats/clear",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/stats/clear-alltime",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/sub-keys",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/sub-keys",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/update-check",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/upload/cancel/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/upload/oq-models",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/upload/start",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/api/upload/task/{task_id}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/api/upload/tasks",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/api/upload/validate-token",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/auto-login",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/chat",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/dashboard",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/admin/static/{path:path}",
+      "source": "admin/routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/api/status",
+      "source": "server.py"
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/process",
+      "source": "api/audio_routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/speech",
+      "source": "api/audio_routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/transcriptions",
+      "source": "api/audio_routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/completions",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/embeddings",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/mcp/execute",
+      "source": "api/mcp_routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/mcp/servers",
+      "source": "api/mcp_routes.py"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/mcp/tools",
+      "source": "api/mcp_routes.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages/count_tokens",
+      "source": "server.py"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "source": "server.py"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/models/status",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/models/{model_id}/load",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/models/{model_id}/unload",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/rerank",
+      "source": "server.py"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "source": "server.py"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/responses/{response_id}",
+      "source": "server.py"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/responses/{response_id}",
+      "source": "server.py"
+    }
+  ],
+  "chat_request_fields": [
+    "chat_template_kwargs",
+    "frequency_penalty",
+    "guided_grammar",
+    "max_tokens",
+    "messages",
+    "min_p",
+    "model",
+    "presence_penalty",
+    "repetition_penalty",
+    "response_format",
+    "seed",
+    "specprefill",
+    "specprefill_keep_pct",
+    "specprefill_threshold",
+    "stop",
+    "stream",
+    "stream_options",
+    "structured_outputs",
+    "temperature",
+    "thinking_budget",
+    "tool_choice",
+    "tools",
+    "top_k",
+    "top_p",
+    "xtc_probability",
+    "xtc_threshold"
+  ],
+  "model_architectures": {
+    "mlx_lm": [
+      "Klear",
+      "afm7",
+      "afmoe",
+      "apertus",
+      "baichuan_m1",
+      "bailing_moe",
+      "bailing_moe_linear",
+      "bitnet",
+      "cohere",
+      "cohere2",
+      "dbrx",
+      "deepseek",
+      "deepseek_v2",
+      "deepseek_v3",
+      "deepseek_v32",
+      "dots1",
+      "ernie4_5",
+      "ernie4_5_moe",
+      "exaone",
+      "exaone4",
+      "exaone_moe",
+      "falcon_h1",
+      "gemma",
+      "gemma2",
+      "gemma3",
+      "gemma3_text",
+      "gemma3n",
+      "gemma4",
+      "gemma4_text",
+      "glm",
+      "glm4",
+      "glm4_moe",
+      "glm4_moe_lite",
+      "glm_moe_dsa",
+      "gpt2",
+      "gpt_bigcode",
+      "gpt_neox",
+      "gpt_oss",
+      "granite",
+      "granitemoe",
+      "granitemoehybrid",
+      "helium",
+      "hunyuan",
+      "hunyuan_v1_dense",
+      "internlm2",
+      "internlm3",
+      "iquestloopcoder",
+      "jamba",
+      "kimi_k25",
+      "kimi_linear",
+      "kimi_vl",
+      "lfm2",
+      "lfm2-vl",
+      "lfm2_moe",
+      "lille-130m",
+      "llama",
+      "llama4",
+      "llama4_text",
+      "longcat_flash",
+      "longcat_flash_ngram",
+      "mamba",
+      "mamba2",
+      "mellum",
+      "mimo",
+      "mimo_v2_flash",
+      "minicpm",
+      "minicpm3",
+      "minimax",
+      "ministral3",
+      "mistral3",
+      "mixtral",
+      "nanochat",
+      "nemotron",
+      "nemotron-nas",
+      "nemotron_h",
+      "olmo",
+      "olmo2",
+      "olmo3",
+      "olmoe",
+      "openelm",
+      "phi",
+      "phi3",
+      "phi3small",
+      "phimoe",
+      "phixtral",
+      "pixtral",
+      "plamo",
+      "plamo2",
+      "qwen",
+      "qwen2",
+      "qwen2_moe",
+      "qwen2_vl",
+      "qwen3",
+      "qwen3_5",
+      "qwen3_5_moe",
+      "qwen3_moe",
+      "qwen3_next",
+      "qwen3_vl",
+      "qwen3_vl_moe",
+      "recurrent_gemma",
+      "rwkv7",
+      "seed_oss",
+      "smollm3",
+      "stablelm",
+      "starcoder2",
+      "step3p5",
+      "telechat3",
+      "youtu_llm"
+    ],
+    "mlx_vlm": [
+      "aya_vision",
+      "bonsai",
+      "cohere2_moe",
+      "deepseek_v4",
+      "deepseek_vl_v2",
+      "deepseekocr",
+      "deepseekocr_2",
+      "diffusion_gemma",
+      "dots_ocr",
+      "ernie4_5_moe_vl",
+      "falcon_ocr",
+      "falcon_perception",
+      "fastvlm",
+      "florence2",
+      "flux2",
+      "gemma3",
+      "gemma3n",
+      "gemma4",
+      "gemma4_unified",
+      "glm4v",
+      "glm4v_moe",
+      "glm_ocr",
+      "granite4_vision",
+      "granite_vision",
+      "hrm_text",
+      "hunyuan_vl",
+      "idefics2",
+      "idefics3",
+      "ideogram4",
+      "internvl_chat",
+      "jina_vlm",
+      "kimi_k25",
+      "kimi_vl",
+      "laguna",
+      "lfm2_moe",
+      "lfm2_vl",
+      "llada2_moe",
+      "llama4",
+      "llava",
+      "llava_bunny",
+      "llava_next",
+      "locateanything",
+      "minicpmo",
+      "minicpmv4_6",
+      "mistral3",
+      "mistral4",
+      "mllama",
+      "molmo",
+      "molmo2",
+      "molmo_point",
+      "moondream2",
+      "moondream3",
+      "multi_modality",
+      "nemotron_h_nano_omni",
+      "nemotron_labs_diffusion",
+      "paddleocr_vl",
+      "paligemma",
+      "phi3_v",
+      "phi4_siglip",
+      "phi4mm",
+      "pixtral",
+      "qwen2_5_vl",
+      "qwen2_vl",
+      "qwen3_5",
+      "qwen3_5_moe",
+      "qwen3_omni_moe",
+      "qwen3_vl",
+      "qwen3_vl_moe",
+      "rfdetr",
+      "rt_detr_v2",
+      "sam3",
+      "sam3_1",
+      "sam3d_body",
+      "smolvlm",
+      "step3p7",
+      "youtu_vl",
+      "zaya1_vl"
+    ],
+    "mlx_embeddings": [
+      "bert",
+      "colidefics3",
+      "colqwen2_5",
+      "gemma3_text",
+      "lfm2",
+      "llama_bidirec",
+      "modernbert",
+      "qwen3",
+      "siglip",
+      "xlm_roberta"
+    ]
+  },
+  "error_codes": [
+    202,
+    302,
+    400,
+    401,
+    404,
+    409,
+    413,
+    422,
+    500,
+    502,
+    503,
+    504,
+    507
+  ]
+}
