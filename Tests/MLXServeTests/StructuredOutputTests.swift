@@ -1,4 +1,6 @@
 import Foundation
+import MLX
+@testable import MLXServe
 @testable import MLXServeHTTP
 import XCTest
 
@@ -212,5 +214,71 @@ final class StructuredOutputTests: XCTestCase {
         )
 
         XCTAssertEqual(request.structuredOutput, .choice(["A", "B"]))
+    }
+
+    func testAllowedNextTokenIDsForPrefixCases() {
+        let allowed = TokenSampler.allowedNextTokenIDs(
+            allowedSequences: [
+                [10, 20],
+                [10, 30],
+                [40],
+            ],
+            generatedTokens: [10]
+        )
+
+        XCTAssertEqual(allowed, [20, 30])
+    }
+
+    func testAllowedNextTokenIDsExcludesCompletedSequences() {
+        let allowed = TokenSampler.allowedNextTokenIDs(
+            allowedSequences: [
+                [10],
+                [10, 20],
+            ],
+            generatedTokens: [10]
+        )
+
+        XCTAssertEqual(allowed, [20])
+    }
+
+    func testAllowedNextTokenIDsReturnsNilWhenOnlyViableSequenceIsComplete() {
+        let allowed = TokenSampler.allowedNextTokenIDs(
+            allowedSequences: [[10, 20]],
+            generatedTokens: [10, 20]
+        )
+
+        XCTAssertNil(allowed)
+    }
+
+    func testAllowedNextTokenIDsReturnsNilForEmptyOrNoMatchingSequences() {
+        XCTAssertNil(
+            TokenSampler.allowedNextTokenIDs(
+                allowedSequences: [],
+                generatedTokens: []
+            )
+        )
+        XCTAssertNil(
+            TokenSampler.allowedNextTokenIDs(
+                allowedSequences: [[10, 20]],
+                generatedTokens: [99]
+            )
+        )
+    }
+
+    func testChoiceLogitsMaskConstrainsGreedyArgmax() {
+        let logits = MLXArray([0.1, 99.0, 0.2, 0.3, 0.4, 0.5].map(Float.init))
+        let sampled = TokenSampler.sample(
+            logits: logits,
+            parameters: SamplingParameters(
+                temperature: 0,
+                allowedSequences: [
+                    [10, 2],
+                    [10, 4],
+                ]
+            ),
+            generatedTokens: [10]
+        )
+
+        XCTAssertTrue([2, 4].contains(sampled.item(Int.self)))
     }
 }

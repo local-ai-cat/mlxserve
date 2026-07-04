@@ -13,6 +13,7 @@ public struct SamplingParameters: Sendable, Equatable {
     public var xtcSpecialTokens: [Int]
     public var seed: Int?
     public var logprobCount: Int?
+    public var allowedSequences: [[Int]]?
 
     public init(
         temperature: Float = 0,
@@ -26,7 +27,8 @@ public struct SamplingParameters: Sendable, Equatable {
         xtcThreshold: Float = 0.1,
         xtcSpecialTokens: [Int] = [],
         seed: Int? = nil,
-        logprobCount: Int? = nil
+        logprobCount: Int? = nil,
+        allowedSequences: [[Int]]? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
@@ -40,6 +42,7 @@ public struct SamplingParameters: Sendable, Equatable {
         self.xtcSpecialTokens = xtcSpecialTokens
         self.seed = seed
         self.logprobCount = logprobCount
+        self.allowedSequences = allowedSequences
     }
 
     var hasSamplingFiltersOrPenalties: Bool {
@@ -60,11 +63,21 @@ public enum TokenSampler {
         parameters: SamplingParameters,
         generatedTokens: [Int] = []
     ) -> MLXArray {
+        var logits = logits
+        if let allowedSequences = parameters.allowedSequences,
+            let allowedTokenIDs = allowedNextTokenIDs(
+                allowedSequences: allowedSequences,
+                generatedTokens: generatedTokens
+            )
+        {
+            // TRUE constrained decode (prefix trie); choice mode.
+            logits = applyAllowedTokenMask(logits, allowedTokenIDs: allowedTokenIDs)
+        }
+
         if parameters.temperature == 0 && !parameters.hasSamplingFiltersOrPenalties {
             return argMax(logits, axis: -1).reshaped([1])
         }
 
-        var logits = logits
         if logits.dtype == .bfloat16 {
             logits = logits.asType(.float32)
         }
@@ -95,6 +108,48 @@ public enum TokenSampler {
 
         let scaled = logprobs / MLXArray(parameters.temperature)
         return MLXRandom.categorical(scaled, axis: -1).asType(.int32).reshaped([1])
+    }
+
+    public static func allowedNextTokenIDs(
+        allowedSequences: [[Int]],
+        generatedTokens: [Int]
+    ) -> [Int]? {
+        guard !allowedSequences.isEmpty else { return nil }
+
+        var allowed = Set<Int>()
+        for sequence in allowedSequences {
+            guard generatedTokens.count <= sequence.count else { continue }
+            guard sequenceMatchesPrefix(sequence, prefix: generatedTokens) else { continue }
+            guard generatedTokens.count < sequence.count else { continue }
+            allowed.insert(sequence[generatedTokens.count])
+        }
+
+        guard !allowed.isEmpty else { return nil }
+        return allowed.sorted()
+    }
+
+    private static func sequenceMatchesPrefix(_ sequence: [Int], prefix: [Int]) -> Bool {
+        for index in prefix.indices {
+            if sequence[index] != prefix[index] {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func applyAllowedTokenMask(_ logits: MLXArray, allowedTokenIDs: [Int]) -> MLXArray {
+        var logits = logits
+        if logits.dtype == .bfloat16 {
+            logits = logits.asType(.float32)
+        }
+
+        let vocabularySize = logits.dim(-1)
+        let validTokenIDs = allowedTokenIDs.filter { $0 >= 0 && $0 < vocabularySize }
+        guard !validTokenIDs.isEmpty else { return logits }
+
+        let indices = MLXArray(validTokenIDs.map(Int32.init)).asType(.uint32)
+        let masked = MLXArray(Array(repeating: -Float.infinity, count: vocabularySize))
+        return putAlong(masked, indices, values: logits[indices], axis: -1)
     }
 
     private static func applyPenalties(
