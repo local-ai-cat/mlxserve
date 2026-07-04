@@ -4,6 +4,11 @@ import MLXLMCommon
 import XCTest
 
 final class BatchCacheShapeTests: XCTestCase {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try MLXMetalRuntime.requireAvailable()
+    }
+
     func testSequenceMergeUsesInferredAxisForRankThreeKV() throws {
         let short = KVCacheSimple()
         short.state = [
