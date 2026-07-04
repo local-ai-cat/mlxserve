@@ -312,6 +312,12 @@ public final class OpenAIServer: @unchecked Sendable {
                 try await sendJSON(modelsResponse(), status: 200, connection: connection)
             case ("POST", "/v1/chat/completions"):
                 try await handleChatCompletion(request, connection: connection)
+            case ("POST", "/v1/completions"):
+                guard let completionBackend = backend as? any OpenAICompletionBackend else {
+                    try await sendJSON(openAIErrorBody(message: "completions backend unavailable", status: 404), status: 404, connection: connection)
+                    return
+                }
+                try await CompletionsHandler(backend: completionBackend).handleCompletions(request, connection: connection)
             case ("POST", "/v1/messages"):
                 try await AnthropicMessagesHandler(backend: backend).handleMessages(request, connection: connection)
             case ("POST", "/v1/messages/count_tokens"):

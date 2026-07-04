@@ -36,7 +36,7 @@ struct MLXServeHTTPServerMain {
     }
 }
 
-private final class NativeChatBackend: OpenAIChatBackend, OpenAIHealthProviding, @unchecked Sendable {
+private final class NativeChatBackend: OpenAIChatBackend, OpenAICompletionBackend, OpenAIHealthProviding, @unchecked Sendable {
     let models: [OpenAIModelInfo]
     var healthInfo: OpenAIHealthInfo {
         OpenAIHealthInfo(
@@ -73,12 +73,12 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAIHealthProviding,
     func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
         let input = try await context.processor.prepare(input: userInput(from: request))
         let promptTokens = try countPromptTokens(input)
-        let uid = "chat-\(UUID().uuidString)"
-        let mlxRequest = Request(
-            uid: uid,
+        return streamGeneration(
+            uidPrefix: "chat",
             input: input,
+            promptTokens: promptTokens,
             maxTokens: request.maxTokens,
-            sampling: SamplingParameters(
+            sampling: samplingParameters(
                 temperature: request.temperature,
                 topP: request.topP,
                 topK: request.topK,
@@ -88,9 +88,47 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAIHealthProviding,
                 frequencyPenalty: request.frequencyPenalty,
                 xtcProbability: request.xtcProbability,
                 xtcThreshold: request.xtcThreshold,
-                xtcSpecialTokens: xtcSpecialTokens(),
                 seed: request.seed
-            ),
+            )
+        )
+    }
+
+    func startCompletion(_ request: OpenAICompletionRequest) async throws -> OpenAIChatStream {
+        guard case .string(let prompt) = request.prompt else {
+            throw NativeChatBackendError.invalidPrompt
+        }
+        let tokenIDs = context.tokenizer.encode(text: prompt, addSpecialTokens: true)
+        let input = LMInput(tokens: MLXArray(tokenIDs))
+        return streamGeneration(
+            uidPrefix: "cmpl",
+            input: input,
+            promptTokens: tokenIDs.count,
+            maxTokens: request.maxTokens,
+            sampling: samplingParameters(
+                temperature: request.temperature,
+                topP: request.topP,
+                topK: request.topK,
+                minP: request.minP,
+                repetitionPenalty: request.repetitionPenalty,
+                presencePenalty: request.presencePenalty,
+                frequencyPenalty: request.frequencyPenalty,
+                seed: request.seed
+            )
+        )
+    }
+
+    private func streamGeneration(
+        uidPrefix: String,
+        input: LMInput,
+        promptTokens: Int,
+        maxTokens: Int,
+        sampling: SamplingParameters
+    ) -> OpenAIChatStream {
+        let mlxRequest = Request(
+            uid: "\(uidPrefix)-\(UUID().uuidString)",
+            input: input,
+            maxTokens: maxTokens,
+            sampling: sampling,
             eosTokenIds: eosTokenIds
         )
 
@@ -134,6 +172,33 @@ private final class NativeChatBackend: OpenAIChatBackend, OpenAIHealthProviding,
         }
 
         return OpenAIChatStream(promptTokens: promptTokens, chunks: chunks)
+    }
+
+    private func samplingParameters(
+        temperature: Float,
+        topP: Float,
+        topK: Int,
+        minP: Float,
+        repetitionPenalty: Float,
+        presencePenalty: Float,
+        frequencyPenalty: Float,
+        xtcProbability: Float = 0,
+        xtcThreshold: Float = 0.1,
+        seed: Int?
+    ) -> SamplingParameters {
+        SamplingParameters(
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            minP: minP,
+            repetitionPenalty: repetitionPenalty,
+            presencePenalty: presencePenalty,
+            frequencyPenalty: frequencyPenalty,
+            xtcProbability: xtcProbability,
+            xtcThreshold: xtcThreshold,
+            xtcSpecialTokens: xtcSpecialTokens(),
+            seed: seed
+        )
     }
 
     private func countPromptTokens(_ input: LMInput) throws -> Int {
@@ -281,11 +346,14 @@ private struct ServerConfig {
 
 private enum NativeChatBackendError: Error, CustomStringConvertible {
     case generationFailed(String)
+    case invalidPrompt
 
     var description: String {
         switch self {
         case .generationFailed(let message):
             return message
+        case .invalidPrompt:
+            return "completion backend requires a single prompt"
         }
     }
 }
