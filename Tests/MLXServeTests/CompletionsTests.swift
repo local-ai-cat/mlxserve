@@ -141,7 +141,8 @@ final class CompletionsTests: XCTestCase {
 
         XCTAssertEqual(first.count, 1)
         XCTAssertEqual(chunkText(first[0]), "hello")
-        XCTAssertTrue(second.isEmpty)
+        XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(chunkText(second[0]), " ")
         XCTAssertEqual(final.count, 1)
         XCTAssertEqual(chunkText(final[0]), "")
         XCTAssertEqual(chunkFinishReason(final[0]) as? String, "stop")
