@@ -308,6 +308,10 @@ public final class OpenAIServer: @unchecked Sendable {
                 try await sendJSON(modelsResponse(), status: 200, connection: connection)
             case ("POST", "/v1/chat/completions"):
                 try await handleChatCompletion(request, connection: connection)
+            case ("POST", "/v1/messages"):
+                try await AnthropicMessagesHandler(backend: backend).handleMessages(request, connection: connection)
+            case ("POST", "/v1/messages/count_tokens"):
+                try await AnthropicMessagesHandler(backend: backend).handleCountTokens(request, connection: connection)
             default:
                 try await sendJSON(openAIErrorBody(message: "not found", status: 404), status: 404, connection: connection)
             }
@@ -984,7 +988,9 @@ private extension NWConnection {
             }
         }
     }
+}
 
+extension NWConnection {
     func send(data: Data) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             send(content: data, completion: .contentProcessed { error in
