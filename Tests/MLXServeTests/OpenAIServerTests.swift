@@ -188,6 +188,101 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertEqual(request.chatTemplateKwargs?["nested"], .object(["enabled": .bool(true)]))
     }
 
+    func testChatRequestParseCapturesToolsArray() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "weather?"}],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "get_weather",
+                        "description": "Get weather for a city",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "city": {"type": "string"},
+                            "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                          },
+                          "required": ["city"]
+                        }
+                      }
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(
+            request.tools,
+            [
+                .object([
+                    "type": .string("function"),
+                    "function": .object([
+                        "name": .string("get_weather"),
+                        "description": .string("Get weather for a city"),
+                        "parameters": .object([
+                            "type": .string("object"),
+                            "properties": .object([
+                                "city": .object(["type": .string("string")]),
+                                "units": .object([
+                                    "type": .string("string"),
+                                    "enum": .array([.string("celsius"), .string("fahrenheit")]),
+                                ]),
+                            ]),
+                            "required": .array([.string("city")]),
+                        ]),
+                    ]),
+                ])
+            ]
+        )
+    }
+
+    func testChatRequestParseToolChoiceStringForms() throws {
+        for (rawChoice, expectedChoice) in [
+            ("none", OpenAIToolChoice.none),
+            ("auto", OpenAIToolChoice.auto),
+            ("required", OpenAIToolChoice.required),
+        ] {
+            let request = try OpenAIChatRequest.parse(
+                Data(
+                    """
+                    {
+                      "model": "test-model",
+                      "messages": [{"role": "user", "content": "hello"}],
+                      "tool_choice": "\(rawChoice)"
+                    }
+                    """.utf8
+                )
+            )
+
+            XCTAssertEqual(request.toolChoice, expectedChoice)
+        }
+    }
+
+    func testChatRequestParseToolChoiceFunctionForm() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_weather"}
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(request.toolChoice, .function("get_weather"))
+    }
+
     func testChatRequestParseCapturesDataURIImageURLPart() throws {
         let dataURI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
         let request = try OpenAIChatRequest.parse(
@@ -400,6 +495,8 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertFalse(request.includeUsage)
         XCTAssertNil(request.enableThinking)
         XCTAssertNil(request.chatTemplateKwargs)
+        XCTAssertNil(request.tools)
+        XCTAssertNil(request.toolChoice)
     }
 
     func testChatRequestParseIncludeUsageDefaultsFalse() throws {

@@ -103,6 +103,8 @@ public struct OpenAIChatRequest: Sendable {
     public let enableThinking: Bool?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
     public let structuredOutput: StructuredOutputSpec
+    public let tools: [OpenAIJSONValue]?
+    public let toolChoice: OpenAIToolChoice?
 
     public init(
         model: String,
@@ -123,7 +125,9 @@ public struct OpenAIChatRequest: Sendable {
         includeUsage: Bool = false,
         enableThinking: Bool? = nil,
         chatTemplateKwargs: [String: OpenAIJSONValue]? = nil,
-        structuredOutput: StructuredOutputSpec = .none
+        structuredOutput: StructuredOutputSpec = .none,
+        tools: [OpenAIJSONValue]? = nil,
+        toolChoice: OpenAIToolChoice? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -144,6 +148,8 @@ public struct OpenAIChatRequest: Sendable {
         self.enableThinking = enableThinking
         self.chatTemplateKwargs = chatTemplateKwargs
         self.structuredOutput = structuredOutput
+        self.tools = tools
+        self.toolChoice = toolChoice
     }
 
     public var structuredOutputWarning: String? {
@@ -504,6 +510,16 @@ public final class OpenAIServer: @unchecked Sendable {
         started: UInt64,
         connection: NWConnection
     ) async throws {
+        if toolsRequested(request) {
+            try await sendStreamingChatWithTools(
+                request: request,
+                stream: stream,
+                started: started,
+                connection: connection
+            )
+            return
+        }
+
         let id = "chatcmpl-\(UUID().uuidString.prefix(8))"
         let created = Int(Date().timeIntervalSince1970)
         var firstToken: UInt64?
@@ -652,6 +668,187 @@ public final class OpenAIServer: @unchecked Sendable {
         try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
     }
 
+    private func sendStreamingChatWithTools(
+        request: OpenAIChatRequest,
+        stream: OpenAIChatStream,
+        started: UInt64,
+        connection: NWConnection
+    ) async throws {
+        let id = "chatcmpl-\(UUID().uuidString.prefix(8))"
+        let created = Int(Date().timeIntervalSince1970)
+        var firstToken: UInt64?
+        var lastToken: UInt64?
+        var completionTokens = 0
+        var finishReason = "length"
+        var text = ""
+        // Stop matching runs on raw decoded model text before thinking tags are split,
+        // matching omlx's output_text-level stop behavior.
+        var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
+        var stoppedByTextStop = false
+
+        try await connection.send(
+            data: Data(
+                (
+                    "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: text/event-stream\r\n"
+                        + "Cache-Control: no-cache\r\n"
+                        + "Connection: close\r\n"
+                        + "X-Accel-Buffering: no\r\n"
+                        + "\r\n"
+                ).utf8
+            )
+        )
+        try await sendSSE(
+            [
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": request.model,
+                "choices": [
+                    [
+                        "index": 0,
+                        "delta": ["role": "assistant"],
+                        "finish_reason": NSNull(),
+                    ]
+                ],
+            ],
+            connection: connection
+        )
+
+        do {
+            for try await chunk in stream.chunks {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if firstToken == nil {
+                    firstToken = now
+                }
+                lastToken = now
+                completionTokens += 1
+                if let chunkFinishReason = chunk.finishReason {
+                    finishReason = chunkFinishReason
+                }
+                let stopMatch = stopMatcher.feed(chunk.text)
+                text += stopMatch.text
+                if stopMatch.stopped {
+                    finishReason = "stop"
+                    stoppedByTextStop = true
+                }
+                if stoppedByTextStop {
+                    break
+                }
+            }
+        } catch {
+            try await sendSSE(
+                [
+                    "id": id,
+                    "object": "error",
+                    "created": created,
+                    "error": openAIErrorObject(message: String(describing: error), status: 500),
+                ],
+                connection: connection
+            )
+            try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+            return
+        }
+
+        if !stoppedByTextStop {
+            let stopMatch = stopMatcher.finish()
+            text += stopMatch.text
+            if stopMatch.stopped {
+                finishReason = "stop"
+            }
+        }
+
+        let extracted = extractThinking(text)
+        let parsed = parseToolCalls(from: extracted.content)
+        if parsed.toolCalls.isEmpty {
+            try await sendParserDelta(
+                (extracted.reasoning, extracted.content),
+                id: id,
+                created: created,
+                model: request.model,
+                connection: connection
+            )
+        } else {
+            if !extracted.reasoning.isEmpty {
+                try await sendParserDelta(
+                    (extracted.reasoning, ""),
+                    id: id,
+                    created: created,
+                    model: request.model,
+                    connection: connection
+                )
+            }
+            if !parsed.content.isEmpty {
+                try await sendParserDelta(
+                    ("", parsed.content),
+                    id: id,
+                    created: created,
+                    model: request.model,
+                    connection: connection
+                )
+            }
+            try await sendSSE(
+                [
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                    "choices": [
+                        [
+                            "index": 0,
+                            "delta": ["tool_calls": toolCallDeltaDictionaries(from: parsed)],
+                            "finish_reason": NSNull(),
+                        ]
+                    ],
+                ],
+                connection: connection
+            )
+            finishReason = finishReasonForToolCalls(
+                defaultFinishReason: finishReason,
+                parsed: parsed
+            )
+        }
+
+        let ended = DispatchTime.now().uptimeNanoseconds
+        try await sendSSE(
+            [
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": request.model,
+                "choices": [
+                    [
+                        "index": 0,
+                        "delta": [:],
+                        "finish_reason": finishReason,
+                    ]
+                ],
+            ],
+            connection: connection
+        )
+        if request.includeUsage {
+            try await sendSSE(
+                [
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                    "choices": [],
+                    "usage": usage(
+                        promptTokens: stream.promptTokens,
+                        completionTokens: completionTokens,
+                        started: started,
+                        firstToken: firstToken ?? ended,
+                        lastToken: lastToken ?? ended,
+                        ended: ended
+                    ),
+                ],
+                connection: connection
+            )
+        }
+        try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
+    }
+
     private func sendBufferedChat(
         request: OpenAIChatRequest,
         stream: OpenAIChatStream,
@@ -696,12 +893,19 @@ public final class OpenAIServer: @unchecked Sendable {
         }
 
         let extracted = extractThinking(text)
-        var message: [String: Any] = [
-            "role": "assistant",
-            "content": extracted.content,
-        ]
-        if !extracted.reasoning.isEmpty {
-            message["reasoning_content"] = extracted.reasoning
+        let parsed = toolsRequested(request)
+            ? parseToolCalls(from: extracted.content)
+            : ToolCallParseResult(content: extracted.content, toolCalls: [])
+        let message = buildAssistantMessageWithToolCalls(
+            content: extracted.content,
+            reasoning: extracted.reasoning,
+            parsed: parsed
+        )
+        if !parsed.toolCalls.isEmpty {
+            finishReason = finishReasonForToolCalls(
+                defaultFinishReason: finishReason,
+                parsed: parsed
+            )
         }
 
         let ended = DispatchTime.now().uptimeNanoseconds
@@ -761,6 +965,10 @@ public final class OpenAIServer: @unchecked Sendable {
                 enginePool: nil
             )
         )
+    }
+
+    private func toolsRequested(_ request: OpenAIChatRequest) -> Bool {
+        selectOpenAITools(tools: request.tools, toolChoice: request.toolChoice) != nil
     }
 
     private func usage(
@@ -1157,6 +1365,8 @@ public extension OpenAIChatRequest {
         let streamOptions = object["stream_options"] as? [String: Any]
         let chatTemplateKwargs = try parseChatTemplateKwargs(object["chat_template_kwargs"])
         let structuredOutput = try StructuredOutputParser.parse(from: object)
+        let tools = try parseTools(object["tools"])
+        let toolChoice = try OpenAIToolChoice.parse(object["tool_choice"])
 
         return OpenAIChatRequest(
             model: model,
@@ -1177,7 +1387,9 @@ public extension OpenAIChatRequest {
             includeUsage: streamOptions?["include_usage"] as? Bool ?? false,
             enableThinking: object["enable_thinking"] as? Bool,
             chatTemplateKwargs: chatTemplateKwargs,
-            structuredOutput: structuredOutput
+            structuredOutput: structuredOutput,
+            tools: tools,
+            toolChoice: toolChoice
         )
     }
 
@@ -1244,6 +1456,21 @@ public extension OpenAIChatRequest {
                 throw OpenAIServerError.invalidJSON
             }
             converted[key] = jsonValue
+        }
+        return converted
+    }
+
+    private static func parseTools(_ value: Any?) throws -> [OpenAIJSONValue]? {
+        guard let value else { return nil }
+        guard let array = value as? [Any] else {
+            throw OpenAIServerError.invalidJSON
+        }
+        var converted: [OpenAIJSONValue] = []
+        for item in array {
+            guard let jsonValue = OpenAIJSONValue(item) else {
+                throw OpenAIServerError.invalidJSON
+            }
+            converted.append(jsonValue)
         }
         return converted
     }
