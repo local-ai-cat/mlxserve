@@ -234,6 +234,7 @@ final class SchedulerEngineTests: XCTestCase {
         )
 
         try await container.perform { context in
+            let eosTokenIds = Self.eosTokenIds(context: context)
             let input = try await context.processor.prepare(
                 input: UserInput(
                     prompt: "Describe the image briefly.",
@@ -242,8 +243,9 @@ final class SchedulerEngineTests: XCTestCase {
             )
             let engine = MLXServeEngine(
                 model: context.model,
-                parameters: GenerateParameters(maxTokens: 4, temperature: 0),
-                maxConcurrentRequests: 1
+                parameters: GenerateParameters(maxTokens: 24, temperature: 0),
+                maxConcurrentRequests: 1,
+                serializedDecode: true
             )
 
             let responses = try await Self.collectResponses(
@@ -251,14 +253,15 @@ final class SchedulerEngineTests: XCTestCase {
                     Request(
                         uid: "vlm-single",
                         input: input,
-                        maxTokens: 4,
-                        sampling: SamplingParameters(temperature: 0)
+                        maxTokens: 24,
+                        sampling: SamplingParameters(temperature: 0),
+                        eosTokenIds: eosTokenIds
                     )
                 )
             )
-            let tokens = responses.filter { $0.token >= 0 }
+            let tokens = responses.filter { $0.token >= 0 && !eosTokenIds.contains($0.token) }
 
-            XCTAssertGreaterThan(tokens.count, 0)
+            XCTAssertGreaterThan(tokens.count, 1)
             XCTAssertNotNil(responses.last?.finishReason)
         }
     }
@@ -276,6 +279,7 @@ final class SchedulerEngineTests: XCTestCase {
         )
 
         try await container.perform { context in
+            let eosTokenIds = Self.eosTokenIds(context: context)
             let inputs = try await [
                 Self.testImage(width: 96, height: 96),
                 Self.testImage(width: 160, height: 112),
@@ -289,20 +293,23 @@ final class SchedulerEngineTests: XCTestCase {
             }
             let engine = MLXServeEngine(
                 model: context.model,
-                parameters: GenerateParameters(maxTokens: 4, temperature: 0),
-                maxConcurrentRequests: 2
+                parameters: GenerateParameters(maxTokens: 24, temperature: 0),
+                maxConcurrentRequests: 2,
+                serializedDecode: true
             )
             let request0 = Request(
                 uid: "vlm-0",
                 input: inputs[0],
-                maxTokens: 4,
-                sampling: SamplingParameters(temperature: 0)
+                maxTokens: 24,
+                sampling: SamplingParameters(temperature: 0),
+                eosTokenIds: eosTokenIds
             )
             let request1 = Request(
                 uid: "vlm-1",
                 input: inputs[1],
-                maxTokens: 4,
-                sampling: SamplingParameters(temperature: 0)
+                maxTokens: 24,
+                sampling: SamplingParameters(temperature: 0),
+                eosTokenIds: eosTokenIds
             )
 
             async let responses0 = Self.collectResponses(
@@ -315,7 +322,8 @@ final class SchedulerEngineTests: XCTestCase {
             let allResponses = try await [responses0, responses1]
             for (index, responses) in allResponses.enumerated() {
                 let uid = "vlm-\(index)"
-                XCTAssertGreaterThan(responses.filter { $0.token >= 0 }.count, 0)
+                let nonEOSTokens = responses.filter { $0.token >= 0 && !eosTokenIds.contains($0.token) }
+                XCTAssertGreaterThan(nonEOSTokens.count, 1)
                 XCTAssertTrue(responses.allSatisfy { $0.uid == uid })
                 XCTAssertNotNil(responses.last?.finishReason)
             }
@@ -553,6 +561,14 @@ final class SchedulerEngineTests: XCTestCase {
         let image = CIImage(color: CIColor(red: 0.2, green: 0.6, blue: 0.9))
             .cropped(to: extent)
         return .ciImage(image)
+    }
+
+    private static func eosTokenIds(context: ModelContext) -> Set<Int> {
+        var eosTokenIds = context.configuration.eosTokenIds
+        if let tokenizerEosTokenId = context.tokenizer.eosTokenId {
+            eosTokenIds.insert(tokenizerEosTokenId)
+        }
+        return eosTokenIds
     }
 
     private static func topOneTopTwoMargin(_ logits: MLXArray) -> Float {

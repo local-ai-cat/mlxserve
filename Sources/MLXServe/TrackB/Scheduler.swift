@@ -18,6 +18,7 @@ public actor Scheduler {
     private let queueLimit: Int
     private let prefixStore: (any PrefixKVStore)?
     private let prefixCacheEnabled: Bool
+    private let serializedDecode: Bool
     private var waiting: [Request] = []
     private var running: [String: RunningRequest] = [:]
     private var pendingCancellation: Set<String> = []
@@ -27,7 +28,8 @@ public actor Scheduler {
         modelBox: LanguageModelBox,
         parameters: GenerateParameters,
         maxConcurrentRequests: Int,
-        prefixStore: (any PrefixKVStore)? = nil
+        prefixStore: (any PrefixKVStore)? = nil,
+        serializedDecode: Bool = false
     ) {
         self.model = modelBox.model
         self.parameters = parameters
@@ -37,6 +39,7 @@ public actor Scheduler {
         self.prefixStore = prefixStore
         self.prefixCacheEnabled = prefixStore != nil
             && !Self.usesWindowedKVCache(model: modelBox.model, parameters: parameters)
+        self.serializedDecode = serializedDecode
     }
 
     public var isIdle: Bool {
@@ -142,6 +145,16 @@ public actor Scheduler {
     private func admitWaiting() -> [Response] {
         var admittedResponses: [Response] = []
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
+            // VLM models such as Qwen2-VL currently apply RoPE with scalar
+            // cache.offset in MLXVLM/Models/Qwen2VL.swift:102 instead of the
+            // per-row cache.ropeOffset used by LLM Qwen2/Qwen3. Mixed-offset
+            // batches corrupt all but the row matching the scalar offset, so
+            // serialize the whole VLM engine until VLM attention consumes
+            // BatchPositionedKVCache.ropeOffset.
+            if serializedDecode, !running.isEmpty || !generator.isEmpty || !admittedResponses.isEmpty {
+                return admittedResponses
+            }
+
             let request = waiting[0]
             var prepared: PreparedBatchRow?
             do {

@@ -20,7 +20,8 @@ final class NativeModelEngine: @unchecked Sendable {
     init(
         context: ModelContext,
         modelID: String,
-        maxConcurrentRequests: Int
+        maxConcurrentRequests: Int,
+        serializedDecode: Bool
     ) {
         self.context = context
         self.modelID = modelID
@@ -28,7 +29,8 @@ final class NativeModelEngine: @unchecked Sendable {
         self.engine = MLXServeEngine(
             model: context.model,
             parameters: parameters,
-            maxConcurrentRequests: maxConcurrentRequests
+            maxConcurrentRequests: maxConcurrentRequests,
+            serializedDecode: serializedDecode
         )
         var eosTokenIds = context.configuration.eosTokenIds
         if let tokenizerEosTokenId = context.tokenizer.eosTokenId {
@@ -241,8 +243,9 @@ struct NativeModelLoader: EnginePoolModelLoader {
     let maxConcurrentRequests: Int
 
     func loadModel(id: String, modelURL: URL) async throws -> NativeModelEngine {
+        let isVLM = try isVLMModelDirectory(modelURL)
         let container =
-            if try isVLMModelDirectory(modelURL) {
+            if isVLM {
                 try await VLMModelFactory.shared.loadContainer(
                     from: modelURL,
                     using: #huggingFaceTokenizerLoader()
@@ -257,7 +260,8 @@ struct NativeModelLoader: EnginePoolModelLoader {
             NativeModelEngine(
                 context: context,
                 modelID: id,
-                maxConcurrentRequests: maxConcurrentRequests
+                maxConcurrentRequests: maxConcurrentRequests,
+                serializedDecode: isVLM
             )
         }
     }
