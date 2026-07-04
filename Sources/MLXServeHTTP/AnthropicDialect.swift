@@ -13,30 +13,11 @@ public struct AnthropicMessagesRequest {
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
 
     public static func parse(_ body: Data) throws -> AnthropicMessagesRequest {
-        guard
-            let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let model = object["model"] as? String,
-            let rawMessages = object["messages"] as? [[String: Any]]
-        else {
-            throw OpenAIServerError.invalidJSON
-        }
+        let parsed = try anthropicParsedBase(body)
+        let object = parsed.object
         guard let maxTokens = anthropicIntValue(object["max_tokens"]) else {
             throw OpenAIServerError.invalidJSON
         }
-
-        var messages: [OpenAIChatMessage] = []
-        if let system = try anthropicContentText(object["system"]), !system.isEmpty {
-            messages.append(OpenAIChatMessage(role: "system", content: system))
-        }
-
-        for rawMessage in rawMessages {
-            guard let role = rawMessage["role"] as? String else {
-                throw OpenAIServerError.invalidJSON
-            }
-            let content = try anthropicContentText(rawMessage["content"]) ?? ""
-            messages.append(OpenAIChatMessage(role: role, content: content))
-        }
-        guard !messages.isEmpty else { throw OpenAIServerError.invalidJSON }
 
         let thinking = object["thinking"] as? [String: Any]
         let thinkingType = thinking?["type"] as? String
@@ -51,9 +32,9 @@ public struct AnthropicMessagesRequest {
         }
 
         return AnthropicMessagesRequest(
-            model: model,
+            model: parsed.model,
             maxTokens: maxTokens,
-            messages: messages,
+            messages: parsed.messages,
             stopSequences: try anthropicStringArray(object["stop_sequences"]),
             stream: object["stream"] as? Bool ?? false,
             temperature: anthropicFloatValue(object["temperature"]) ?? 0,
@@ -83,6 +64,30 @@ public struct AnthropicMessagesRequest {
         let text = messages.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
         return anthropicEstimatedTokenCount(text)
     }
+}
+
+public struct AnthropicCountTokensRequest {
+    public let model: String
+    public let messages: [OpenAIChatMessage]
+    public let chatTemplateKwargs: [String: OpenAIJSONValue]?
+
+    public static func parse(_ body: Data) throws -> AnthropicCountTokensRequest {
+        let parsed = try anthropicParsedBase(body)
+        return AnthropicCountTokensRequest(
+            model: parsed.model,
+            messages: parsed.messages,
+            chatTemplateKwargs: try anthropicChatTemplateKwargs(from: parsed.object)
+        )
+    }
+
+    public func estimatedInputTokens() -> Int {
+        let text = messages.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
+        return anthropicEstimatedTokenCount(text)
+    }
+}
+
+public func buildAnthropicCountTokensResponse(request: AnthropicCountTokensRequest) -> [String: Int] {
+    ["input_tokens": request.estimatedInputTokens()]
 }
 
 public struct AnthropicBufferedCompletion {
@@ -392,6 +397,36 @@ public func anthropicEstimatedTokenCount(_ text: String) -> Int {
     guard !text.isEmpty else { return 0 }
     let wordLikeTokens = text.split { $0.isWhitespace || $0.isPunctuation }.count
     return max(1, wordLikeTokens)
+}
+
+private func anthropicParsedBase(_ body: Data) throws -> (
+    object: [String: Any],
+    model: String,
+    messages: [OpenAIChatMessage]
+) {
+    guard
+        let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+        let model = object["model"] as? String,
+        let rawMessages = object["messages"] as? [[String: Any]]
+    else {
+        throw OpenAIServerError.invalidJSON
+    }
+
+    var messages: [OpenAIChatMessage] = []
+    if let system = try anthropicContentText(object["system"]), !system.isEmpty {
+        messages.append(OpenAIChatMessage(role: "system", content: system))
+    }
+
+    for rawMessage in rawMessages {
+        guard let role = rawMessage["role"] as? String else {
+            throw OpenAIServerError.invalidJSON
+        }
+        let content = try anthropicContentText(rawMessage["content"]) ?? ""
+        messages.append(OpenAIChatMessage(role: role, content: content))
+    }
+    guard !messages.isEmpty else { throw OpenAIServerError.invalidJSON }
+
+    return (object, model, messages)
 }
 
 private func anthropicContentText(_ value: Any?) throws -> String? {

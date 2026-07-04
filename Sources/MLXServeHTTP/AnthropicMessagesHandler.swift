@@ -32,9 +32,9 @@ struct AnthropicMessagesHandler {
     }
 
     func handleCountTokens(_ request: HTTPRequest, connection: NWConnection) async throws {
-        let messagesRequest: AnthropicMessagesRequest
+        let countTokensRequest: AnthropicCountTokensRequest
         do {
-            messagesRequest = try AnthropicMessagesRequest.parse(request.body)
+            countTokensRequest = try AnthropicCountTokensRequest.parse(request.body)
         } catch {
             let status = (error as? OpenAIServerError)?.httpStatus ?? 422
             try await sendJSON(openAIErrorBody(message: String(describing: error), status: status), status: status, connection: connection)
@@ -43,7 +43,7 @@ struct AnthropicMessagesHandler {
 
         // Exact prompt tokens are exposed by the backend only when generation starts.
         // Keep count_tokens side-effect-free with one deterministic estimate.
-        try await sendJSON(["input_tokens": messagesRequest.estimatedInputTokens()], status: 200, connection: connection)
+        try await sendJSON(buildAnthropicCountTokensResponse(request: countTokensRequest), status: 200, connection: connection)
     }
 
     private func sendStreaming(

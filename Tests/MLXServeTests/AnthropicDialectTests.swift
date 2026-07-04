@@ -18,6 +18,26 @@ final class AnthropicDialectTests: XCTestCase {
         }
     }
 
+    func testCountTokensRequestAllowsMissingMaxTokensAndReturnsInputTokens() throws {
+        let request = try AnthropicCountTokensRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hi"}]
+                }
+                """.utf8
+            )
+        )
+
+        let response = buildAnthropicCountTokensResponse(request: request)
+
+        XCTAssertEqual(request.model, "test-model")
+        XCTAssertEqual(request.messages.count, 1)
+        XCTAssertEqual(request.messages[0].content, "hi")
+        XCTAssertEqual(response["input_tokens"], 2)
+    }
+
     func testMessagesRequestParsesSystemStringAndTranslationFields() throws {
         let request = try AnthropicMessagesRequest.parse(
             Data(
