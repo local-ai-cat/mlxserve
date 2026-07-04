@@ -9,17 +9,39 @@ private struct FakeEngine: Equatable, Sendable {
 private actor FakeLoaderState {
     private(set) var loaded: [String] = []
     private(set) var unloaded: [String] = []
+    private var activeLoads: Set<String> = []
+    private var observedOverlap = false
 
     func recordLoad(_ id: String) {
         loaded.append(id)
+    }
+
+    func beginLoad(_ id: String) {
+        if !activeLoads.isEmpty {
+            observedOverlap = true
+        }
+        activeLoads.insert(id)
+        loaded.append(id)
+    }
+
+    func endLoad(_ id: String) {
+        activeLoads.remove(id)
     }
 
     func recordUnload(_ id: String) {
         unloaded.append(id)
     }
 
+    func loadedIDs() -> [String] {
+        loaded
+    }
+
     func unloadedIDs() -> [String] {
         unloaded
+    }
+
+    func didObserveOverlap() -> Bool {
+        observedOverlap
     }
 }
 
@@ -28,6 +50,71 @@ private struct FakeLoader: EnginePoolModelLoader {
 
     func loadModel(id: String, modelURL: URL) async throws -> FakeEngine {
         await state.recordLoad(id)
+        return FakeEngine(id: id)
+    }
+
+    func unloadModel(_ engine: FakeEngine, id: String) async {
+        await state.recordUnload(id)
+    }
+}
+
+private actor BlockingLoadCoordinator {
+    private var startedCount = 0
+    private var loadContinuations: [CheckedContinuation<Void, Never>] = []
+    private var startedWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func waitUntilLoadStarted(count: Int) async {
+        if startedCount >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append((count, continuation))
+        }
+    }
+
+    func waitForReleaseAfterMarkingStarted() async {
+        startedCount += 1
+        resumeStartedWaitersIfNeeded()
+        await withCheckedContinuation { continuation in
+            loadContinuations.append(continuation)
+        }
+    }
+
+    func releaseOne() {
+        guard !loadContinuations.isEmpty else { return }
+        let continuation = loadContinuations.removeFirst()
+        continuation.resume()
+    }
+
+    func releaseAll() {
+        let continuations = loadContinuations
+        loadContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
+    private func resumeStartedWaitersIfNeeded() {
+        var remaining: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+        for waiter in startedWaiters {
+            if startedCount >= waiter.count {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        startedWaiters = remaining
+    }
+}
+
+private struct BlockingFakeLoader: EnginePoolModelLoader {
+    let state: FakeLoaderState
+    let coordinator: BlockingLoadCoordinator
+
+    func loadModel(id: String, modelURL: URL) async throws -> FakeEngine {
+        await state.beginLoad(id)
+        await coordinator.waitForReleaseAfterMarkingStarted()
+        await state.endLoad(id)
         return FakeEngine(id: id)
     }
 
@@ -156,6 +243,85 @@ final class EnginePoolTests: XCTestCase {
         }
     }
 
+    func testConcurrentDifferentModelLoadsWaitAndSerialize() async throws {
+        let state = FakeLoaderState()
+        let coordinator = BlockingLoadCoordinator()
+        let pool = makeBlockingPool(["a": 10, "b": 20], state: state, coordinator: coordinator)
+
+        async let loadA: EnginePoolLoadResult = pool.load("a")
+        await coordinator.waitUntilLoadStarted(count: 1)
+        async let loadB: EnginePoolLoadResult = pool.load("b")
+
+        await Task.yield()
+        var observedOverlap = await state.didObserveOverlap()
+        XCTAssertFalse(observedOverlap)
+
+        await coordinator.releaseOne()
+        _ = try await loadA
+        await coordinator.waitUntilLoadStarted(count: 2)
+        observedOverlap = await state.didObserveOverlap()
+        XCTAssertFalse(observedOverlap)
+
+        await coordinator.releaseOne()
+        _ = try await loadB
+
+        let status = await pool.status()
+        XCTAssertEqual(status.currentModelMemory, 30)
+        XCTAssertEqual(loadedModelIDs(status), ["a", "b"])
+        let loadedIDs = await state.loadedIDs()
+        XCTAssertEqual(loadedIDs, ["a", "b"])
+        observedOverlap = await state.didObserveOverlap()
+        XCTAssertFalse(observedOverlap)
+    }
+
+    func testConcurrentSameModelAcquireSharesSingleLoad() async throws {
+        let state = FakeLoaderState()
+        let coordinator = BlockingLoadCoordinator()
+        let pool = makeBlockingPool(["a": 10], state: state, coordinator: coordinator)
+
+        async let first: EnginePoolLease<FakeEngine> = pool.acquire("a")
+        await coordinator.waitUntilLoadStarted(count: 1)
+        async let second: EnginePoolLease<FakeEngine> = pool.acquire("a")
+
+        await Task.yield()
+        await coordinator.releaseOne()
+
+        let firstLease = try await first
+        let secondLease = try await second
+
+        XCTAssertEqual(firstLease.engine.id, "a")
+        XCTAssertEqual(secondLease.engine.id, "a")
+        let loadedIDs = await state.loadedIDs()
+        XCTAssertEqual(loadedIDs, ["a"])
+
+        var status = await pool.status()
+        XCTAssertEqual(status.currentModelMemory, 10)
+        XCTAssertEqual(status.models.first?.inUse, 2)
+
+        await pool.release(firstLease)
+        await pool.release(secondLease)
+        status = await pool.status()
+        XCTAssertEqual(status.models.first?.inUse, 0)
+    }
+
+    func testConcurrentSameModelExplicitLoadReportsLoading() async throws {
+        let state = FakeLoaderState()
+        let coordinator = BlockingLoadCoordinator()
+        let pool = makeBlockingPool(["a": 10], state: state, coordinator: coordinator)
+
+        async let first: EnginePoolLoadResult = pool.load("a")
+        await coordinator.waitUntilLoadStarted(count: 1)
+
+        await XCTAssertThrowsEnginePoolError(try await pool.load("a")) { error in
+            XCTAssertEqual(error, .modelLoading(id: "a"))
+        }
+
+        await coordinator.releaseOne()
+        _ = try await first
+        let loadedIDs = await state.loadedIDs()
+        XCTAssertEqual(loadedIDs, ["a"])
+    }
+
     func testMemoryGuardCeilingArithmetic() {
         let gib = MemoryGuard.gibibyte
 
@@ -202,6 +368,27 @@ final class EnginePoolTests: XCTestCase {
             finalCeiling: finalCeiling,
             idleTimeout: idleTimeout,
             maxWaitingQueueDepth: maxWaitingQueueDepth
+        )
+    }
+
+    private func makeBlockingPool(
+        _ sizes: [String: Int64],
+        finalCeiling: Int64 = 0,
+        state: FakeLoaderState,
+        coordinator: BlockingLoadCoordinator
+    ) -> EnginePool<BlockingFakeLoader> {
+        var models: [String: DiscoveredModel] = [:]
+        for (id, size) in sizes {
+            models[id] = DiscoveredModel(
+                id: id,
+                modelURL: URL(fileURLWithPath: "/tmp/\(id)", isDirectory: true),
+                estimatedSize: size
+            )
+        }
+        return EnginePool(
+            models: models,
+            loader: BlockingFakeLoader(state: state, coordinator: coordinator),
+            finalCeiling: finalCeiling
         )
     }
 

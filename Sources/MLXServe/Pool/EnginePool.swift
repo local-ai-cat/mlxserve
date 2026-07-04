@@ -27,6 +27,16 @@ public struct EnginePoolQueueTicket: Sendable {
     }
 }
 
+public struct EnginePoolLoadResult: Equatable, Sendable {
+    public let modelID: String
+    public let alreadyLoaded: Bool
+
+    public init(modelID: String, alreadyLoaded: Bool) {
+        self.modelID = modelID
+        self.alreadyLoaded = alreadyLoaded
+    }
+}
+
 public struct EnginePoolModelStatus: Equatable, Sendable {
     public let id: String
     public let modelPath: String
@@ -70,7 +80,9 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
     private let idleTimeout: TimeInterval?
     private let maxWaitingQueueDepth: Int
     private var currentModelMemory: Int64
-    private var loadInProgress: Bool
+    private var loadGateLocked: Bool
+    private var loadGateWaiters: [CheckedContinuation<Void, Never>]
+    private var modelLoadWaiters: [String: [CheckedContinuation<Void, Never>]]
     private var activeQueueTickets: Set<UUID>
 
     public init(
@@ -101,7 +113,9 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
         self.idleTimeout = idleTimeout
         self.maxWaitingQueueDepth = max(0, maxWaitingQueueDepth)
         self.currentModelMemory = 0
-        self.loadInProgress = false
+        self.loadGateLocked = false
+        self.loadGateWaiters = []
+        self.modelLoadWaiters = [:]
         self.activeQueueTickets = []
     }
 
@@ -131,8 +145,16 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
         entries[lease.modelID] = entry
     }
 
-    public func load(_ modelID: String, now: Date = Date()) async throws {
-        _ = try await getOrLoadEngine(modelID, takeLease: false, now: now)
+    public func isLoaded(_ modelID: String) throws -> Bool {
+        guard let entry = entries[modelID] else {
+            throw EnginePoolError.modelNotFound(id: modelID, available: availableModelIDs())
+        }
+        return entry.engine != nil
+    }
+
+    @discardableResult
+    public func load(_ modelID: String, now: Date = Date()) async throws -> EnginePoolLoadResult {
+        try await getOrLoadEngine(modelID, takeLease: false, now: now).loadResult
     }
 
     public func unload(_ modelID: String) async throws {
@@ -222,28 +244,82 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
         _ modelID: String,
         takeLease: Bool,
         now: Date
-    ) async throws -> (engine: Loader.Engine, leaseID: UUID) {
-        guard var entry = entries[modelID] else {
-            throw EnginePoolError.modelNotFound(id: modelID, available: availableModelIDs())
-        }
-
-        if let engine = entry.engine {
-            let leaseID = UUID()
-            entry.lastAccess = now
-            if takeLease {
-                entry.activeLeaseIDs.insert(leaseID)
+    ) async throws -> (engine: Loader.Engine, leaseID: UUID, loadResult: EnginePoolLoadResult) {
+        while true {
+            guard var entry = entries[modelID] else {
+                throw EnginePoolError.modelNotFound(id: modelID, available: availableModelIDs())
             }
-            entries[modelID] = entry
-            return (engine, leaseID)
+
+            if let engine = entry.engine {
+                let leaseID = UUID()
+                entry.lastAccess = now
+                if takeLease {
+                    entry.activeLeaseIDs.insert(leaseID)
+                }
+                entries[modelID] = entry
+                return (
+                    engine,
+                    leaseID,
+                    EnginePoolLoadResult(modelID: modelID, alreadyLoaded: true)
+                )
+            }
+
+            if entry.isLoading {
+                guard takeLease else {
+                    throw EnginePoolError.modelLoading(id: modelID)
+                }
+                await waitForModelLoad(modelID)
+                continue
+            }
+
+            await acquireLoadGate()
+            do {
+                let loaded = try await loadAfterAcquiringGate(
+                    modelID,
+                    takeLease: takeLease,
+                    now: now
+                )
+                releaseLoadGate()
+                return loaded
+            } catch {
+                releaseLoadGate()
+                throw error
+            }
         }
+    }
 
-        guard !entry.isLoading, !loadInProgress else {
-            throw EnginePoolError.modelLoading(id: modelID)
-        }
+    private func loadAfterAcquiringGate(
+        _ modelID: String,
+        takeLease: Bool,
+        now: Date
+    ) async throws -> (engine: Loader.Engine, leaseID: UUID, loadResult: EnginePoolLoadResult) {
+        while true {
+            guard var entry = entries[modelID] else {
+                throw EnginePoolError.modelNotFound(id: modelID, available: availableModelIDs())
+            }
 
-        loadInProgress = true
+            if let engine = entry.engine {
+                let leaseID = UUID()
+                entry.lastAccess = now
+                if takeLease {
+                    entry.activeLeaseIDs.insert(leaseID)
+                }
+                entries[modelID] = entry
+                return (
+                    engine,
+                    leaseID,
+                    EnginePoolLoadResult(modelID: modelID, alreadyLoaded: true)
+                )
+            }
 
-        do {
+            if entry.isLoading {
+                guard takeLease else {
+                    throw EnginePoolError.modelLoading(id: modelID)
+                }
+                await waitForModelLoad(modelID)
+                continue
+            }
+
             try await admitModelForLoading(entry)
 
             var loadingEntry = entries[modelID] ?? entry
@@ -251,25 +327,65 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             loadingEntry.lastAccess = now
             entries[modelID] = loadingEntry
 
-            let engine = try await loader.loadModel(id: modelID, modelURL: loadingEntry.modelURL)
-            var loaded = entries[modelID] ?? loadingEntry
-            let leaseID = UUID()
-            loaded.engine = engine
-            loaded.isLoading = false
-            loaded.lastAccess = now
-            if takeLease {
-                loaded.activeLeaseIDs.insert(leaseID)
+            do {
+                let engine = try await loader.loadModel(id: modelID, modelURL: loadingEntry.modelURL)
+                var loaded = entries[modelID] ?? loadingEntry
+                let leaseID = UUID()
+                loaded.engine = engine
+                loaded.isLoading = false
+                loaded.lastAccess = now
+                if takeLease {
+                    loaded.activeLeaseIDs.insert(leaseID)
+                }
+                entries[modelID] = loaded
+                currentModelMemory += loaded.actualSize ?? loaded.estimatedSize
+                notifyModelLoadWaiters(modelID)
+                return (
+                    engine,
+                    leaseID,
+                    EnginePoolLoadResult(modelID: modelID, alreadyLoaded: false)
+                )
+            } catch {
+                var failed = entries[modelID] ?? loadingEntry
+                failed.isLoading = false
+                entries[modelID] = failed
+                notifyModelLoadWaiters(modelID)
+                throw error
             }
-            entries[modelID] = loaded
-            currentModelMemory += loaded.actualSize ?? loaded.estimatedSize
-            loadInProgress = false
-            return (engine, leaseID)
-        } catch {
-            var failed = entries[modelID] ?? entry
-            failed.isLoading = false
-            entries[modelID] = failed
-            loadInProgress = false
-            throw error
+        }
+    }
+
+    private func acquireLoadGate() async {
+        if !loadGateLocked {
+            loadGateLocked = true
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            loadGateWaiters.append(continuation)
+        }
+    }
+
+    private func releaseLoadGate() {
+        if loadGateWaiters.isEmpty {
+            loadGateLocked = false
+            return
+        }
+
+        let next = loadGateWaiters.removeFirst()
+        next.resume()
+    }
+
+    private func waitForModelLoad(_ modelID: String) async {
+        await withCheckedContinuation { continuation in
+            modelLoadWaiters[modelID, default: []].append(continuation)
+        }
+    }
+
+    private func notifyModelLoadWaiters(_ modelID: String) {
+        let waiters = modelLoadWaiters.removeValue(forKey: modelID) ?? []
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 

@@ -1,5 +1,21 @@
 import Foundation
 
+public struct OpenAIHTTPError: Error, CustomStringConvertible, Sendable, Equatable {
+    public let status: Int
+    public let message: String
+    public let retryAfterSeconds: Int?
+
+    public init(status: Int, message: String, retryAfterSeconds: Int? = nil) {
+        self.status = status
+        self.message = message
+        self.retryAfterSeconds = retryAfterSeconds
+    }
+
+    public var description: String {
+        message
+    }
+}
+
 public struct OpenAIErrorResponse: Sendable, Equatable {
     public let status: Int
     public let body: [String: String?]
