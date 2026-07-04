@@ -14,12 +14,11 @@ struct EmbeddingsHandler {
             return
         }
 
-        guard !backend.embeddingModels.isEmpty else {
-            try await sendJSON(
-                openAIErrorBody(message: "embeddings backend unavailable", status: 404),
-                status: 404,
-                connection: connection
-            )
+        if let errorResponse = embeddingModelAvailabilityResponse(
+            requestedModel: embeddingsRequest.model,
+            embeddingModels: backend.embeddingModels
+        ) {
+            try await sendJSON(errorResponse.body, status: errorResponse.status, connection: connection)
             return
         }
 
@@ -40,6 +39,30 @@ struct EmbeddingsHandler {
             + "\r\n"
         try await connection.sendFinal(data: Data(header.utf8) + body)
     }
+}
+
+func embeddingModelAvailabilityResponse(
+    requestedModel: String,
+    embeddingModels: [OpenAIModelInfo]
+) -> HTTPJSONResponse? {
+    guard !embeddingModels.isEmpty else {
+        return HTTPJSONResponse(
+            status: 404,
+            body: openAIErrorBody(message: "embeddings backend unavailable", status: 404)
+        )
+    }
+
+    guard !embeddingModels.contains(where: { $0.id == requestedModel }) else {
+        return nil
+    }
+
+    return HTTPJSONResponse(
+        status: 400,
+        body: openAIErrorBody(
+            message: "Model '\(requestedModel)' is not an embedding model. Use /v1/chat/completions for LLM models.",
+            status: 400
+        )
+    )
 }
 
 public func buildEmbeddingsResponse(

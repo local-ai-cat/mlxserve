@@ -93,6 +93,43 @@ final class EmbeddingsTests: XCTestCase {
         XCTAssertEqual(encoded, "AACAPwAAAEA=")
         XCTAssertEqual(decoded, Data([0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40]))
     }
+
+    func testEmbeddingModelAvailabilityReturnsNotFoundWhenBackendUnavailable() throws {
+        let response = try XCTUnwrap(
+            embeddingModelAvailabilityResponse(requestedModel: "text-model", embeddingModels: [])
+        )
+
+        XCTAssertEqual(response.status, 404)
+        let error = try XCTUnwrap(response.body["error"] as? [String: Any])
+        XCTAssertEqual(error["message"] as? String, "embeddings backend unavailable")
+        XCTAssertEqual(error["type"] as? String, "not_found_error")
+    }
+
+    func testEmbeddingModelAvailabilityReturnsBadRequestForNonEmbeddingModel() throws {
+        let response = try XCTUnwrap(
+            embeddingModelAvailabilityResponse(
+                requestedModel: "text-model",
+                embeddingModels: [OpenAIModelInfo(id: "embed-model")]
+            )
+        )
+
+        XCTAssertEqual(response.status, 400)
+        let error = try XCTUnwrap(response.body["error"] as? [String: Any])
+        XCTAssertEqual(
+            error["message"] as? String,
+            "Model 'text-model' is not an embedding model. Use /v1/chat/completions for LLM models."
+        )
+        XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+    }
+
+    func testEmbeddingModelAvailabilityAcceptsConfiguredEmbeddingModel() {
+        XCTAssertNil(
+            embeddingModelAvailabilityResponse(
+                requestedModel: "embed-model",
+                embeddingModels: [OpenAIModelInfo(id: "embed-model")]
+            )
+        )
+    }
 }
 
 private struct FakeEmbeddingsBackend: OpenAIEmbeddingsBackend {
