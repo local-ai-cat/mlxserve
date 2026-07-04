@@ -47,19 +47,7 @@ final class NativeModelEngine: @unchecked Sendable {
             uid: uid,
             input: input,
             maxTokens: request.maxTokens,
-            sampling: SamplingParameters(
-                temperature: request.temperature,
-                topP: request.topP,
-                topK: request.topK,
-                minP: request.minP,
-                repetitionPenalty: request.repetitionPenalty,
-                presencePenalty: request.presencePenalty,
-                frequencyPenalty: request.frequencyPenalty,
-                xtcProbability: request.xtcProbability,
-                xtcThreshold: request.xtcThreshold,
-                xtcSpecialTokens: xtcSpecialTokens(),
-                seed: request.seed
-            ),
+            sampling: samplingParameters(from: request),
             eosTokenIds: eosTokenIds
         )
 
@@ -77,19 +65,7 @@ final class NativeModelEngine: @unchecked Sendable {
             uid: uid,
             input: input,
             maxTokens: request.maxTokens,
-            sampling: SamplingParameters(
-                temperature: request.temperature,
-                topP: request.topP,
-                topK: request.topK,
-                minP: request.minP,
-                repetitionPenalty: request.repetitionPenalty,
-                presencePenalty: request.presencePenalty,
-                frequencyPenalty: request.frequencyPenalty,
-                xtcProbability: 0,
-                xtcThreshold: 0.1,
-                xtcSpecialTokens: xtcSpecialTokens(),
-                seed: request.seed
-            ),
+            sampling: samplingParameters(from: request),
             eosTokenIds: eosTokenIds
         )
         return makeStream(from: mlxRequest, promptTokens: tokenIDs.count)
@@ -149,9 +125,89 @@ final class NativeModelEngine: @unchecked Sendable {
 
     private func userInput(from request: OpenAIChatRequest) throws -> UserInput {
         UserInput(
-            chat: try request.messages.map(chatMessage),
+            chat: try injectedMessages(from: request).map(chatMessage),
             additionalContext: additionalContext(from: request)
         )
+    }
+
+    private func samplingParameters(from request: OpenAIChatRequest) -> SamplingParameters {
+        SamplingParameters(
+            temperature: request.temperature,
+            topP: request.topP,
+            topK: request.topK,
+            minP: request.minP,
+            repetitionPenalty: request.repetitionPenalty,
+            presencePenalty: request.presencePenalty,
+            frequencyPenalty: request.frequencyPenalty,
+            xtcProbability: request.xtcProbability,
+            xtcThreshold: request.xtcThreshold,
+            xtcSpecialTokens: xtcSpecialTokens(),
+            seed: request.seed,
+            allowedSequences: allowedSequences(from: request.structuredOutput)
+        )
+    }
+
+    private func samplingParameters(from request: OpenAICompletionRequest) -> SamplingParameters {
+        SamplingParameters(
+            temperature: request.temperature,
+            topP: request.topP,
+            topK: request.topK,
+            minP: request.minP,
+            repetitionPenalty: request.repetitionPenalty,
+            presencePenalty: request.presencePenalty,
+            frequencyPenalty: request.frequencyPenalty,
+            xtcProbability: 0,
+            xtcThreshold: 0.1,
+            xtcSpecialTokens: xtcSpecialTokens(),
+            seed: request.seed,
+            allowedSequences: allowedSequences(from: request.structuredOutput)
+        )
+    }
+
+    private func allowedSequences(from structuredOutput: StructuredOutputSpec) -> [[Int]]? {
+        guard case .choice(let choices) = structuredOutput else { return nil }
+        return choices.map { choice in
+            context.tokenizer.encode(text: choice, addSpecialTokens: false)
+        }
+    }
+
+    private func injectedMessages(from request: OpenAIChatRequest) throws -> [OpenAIChatMessage] {
+        let directive: String?
+        switch request.structuredOutput {
+        case .jsonObject:
+            directive = "You must respond with only a single valid JSON object and no other text."
+        case .jsonSchema(_, let schema):
+            let schemaJSON = try serializedJSONSchema(schema)
+            directive = "You must respond with only a single valid JSON object conforming to this JSON Schema: \(schemaJSON). Output only the JSON."
+        case .none, .choice:
+            directive = nil
+        }
+
+        guard let directive else { return request.messages }
+        return [OpenAIChatMessage(role: "system", content: directive)] + request.messages
+    }
+
+    private func serializedJSONSchema(_ schema: [String: OpenAIJSONValue]) throws -> String {
+        let object = schema.mapValues { jsonObject(from: $0) }
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func jsonObject(from value: OpenAIJSONValue) -> Any {
+        switch value {
+        case .string(let string):
+            return string
+        case .number(let number):
+            return number
+        case .bool(let bool):
+            return bool
+        case .object(let object):
+            return object.mapValues { jsonObject(from: $0) }
+        case .array(let array):
+            return array.map { jsonObject(from: $0) }
+        case .null:
+            return NSNull()
+        }
     }
 
     private func chatMessage(from message: OpenAIChatMessage) throws -> Chat.Message {
