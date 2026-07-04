@@ -23,6 +23,7 @@ final class OpenAIServerTests: XCTestCase {
         let body = openAIErrorBody(message: "not found", status: 404)
         let error = try XCTUnwrap(body["error"] as? [String: Any])
 
+        XCTAssertEqual(Set(error.keys), ["message", "type", "param", "code"])
         XCTAssertEqual(error["message"] as? String, "not found")
         XCTAssertEqual(error["type"] as? String, "not_found_error")
         XCTAssertTrue(error["param"] is NSNull)
@@ -30,11 +31,26 @@ final class OpenAIServerTests: XCTestCase {
     }
 
     func testOpenAIErrorTypeMapping() {
+        XCTAssertEqual(openAIErrorType(status: 401), "authentication_error")
         XCTAssertEqual(openAIErrorType(status: 400), "invalid_request_error")
+        XCTAssertEqual(openAIErrorType(status: 413), "invalid_request_error")
         XCTAssertEqual(openAIErrorType(status: 422), "invalid_request_error")
         XCTAssertEqual(openAIErrorType(status: 404), "not_found_error")
+        XCTAssertEqual(openAIErrorType(status: 429), "rate_limit_error")
         XCTAssertEqual(openAIErrorType(status: 500), "server_error")
         XCTAssertEqual(openAIErrorType(status: 503), "server_error")
+    }
+
+    func testOpenAIErrorResponseCarriesRetryAfter() {
+        let response = openAIErrorResponse(
+            message: "Scheduler waiting queue full (1/1). Try again shortly.",
+            status: 503,
+            retryAfterSeconds: 1
+        )
+
+        XCTAssertEqual(response.status, 503)
+        XCTAssertEqual(response.retryAfterSeconds, 1)
+        XCTAssertEqual(response.body["type"] as? String, "server_error")
     }
 
     func testChatRequestParsePopulatesSamplingAndOpenAIFields() throws {
@@ -112,6 +128,40 @@ final class OpenAIServerTests: XCTestCase {
         )
 
         XCTAssertEqual(request.stop, ["END"])
+    }
+
+    func testChatRequestParseMissingModelIsValidationError() {
+        XCTAssertThrowsError(
+            try OpenAIChatRequest.parse(
+                Data(
+                    """
+                    {
+                      "messages": [{"role": "user", "content": "hello"}]
+                    }
+                    """.utf8
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? OpenAIServerError, .missingField("model"))
+            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 422)
+        }
+    }
+
+    func testChatRequestParseMissingMessagesIsValidationError() {
+        XCTAssertThrowsError(
+            try OpenAIChatRequest.parse(
+                Data(
+                    """
+                    {
+                      "model": "test-model"
+                    }
+                    """.utf8
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? OpenAIServerError, .missingField("messages"))
+            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 422)
+        }
     }
 
     func testChatRequestParseUsesNeutralDefaults() throws {

@@ -715,40 +715,28 @@ public final class OpenAIServer: @unchecked Sendable {
     }
 }
 
-public func openAIErrorBody(message: String, status: Int) -> [String: Any] {
-    ["error": openAIErrorObject(message: message, status: status)]
-}
-
-public func openAIErrorObject(message: String, status: Int) -> [String: Any] {
-    [
-        "message": message,
-        "type": openAIErrorType(status: status),
-        "param": NSNull(),
-        "code": NSNull(),
-    ]
-}
-
-public func openAIErrorType(status: Int) -> String {
-    switch status {
-    case 404:
-        return "not_found_error"
-    case 500...:
-        return "server_error"
-    default:
-        return "invalid_request_error"
-    }
-}
-
 private func httpReasonPhrase(_ status: Int) -> String {
     switch status {
     case 200:
         return "OK"
     case 400:
         return "Bad Request"
+    case 401:
+        return "Unauthorized"
     case 404:
         return "Not Found"
+    case 409:
+        return "Conflict"
+    case 413:
+        return "Payload Too Large"
     case 422:
         return "Unprocessable Entity"
+    case 429:
+        return "Too Many Requests"
+    case 503:
+        return "Service Unavailable"
+    case 507:
+        return "Insufficient Storage"
     case 500:
         return "Internal Server Error"
     default:
@@ -760,6 +748,7 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
     case invalidPort(UInt16)
     case invalidRequest
     case invalidJSON
+    case missingField(String)
     case unsupportedContent
     case invalidContentLength
     case payloadTooLarge
@@ -767,7 +756,11 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
 
     var httpStatus: Int {
         switch self {
-        case .invalidJSON, .invalidRequest, .unsupportedContent, .invalidContentLength, .payloadTooLarge:
+        case .invalidJSON, .missingField:
+            return 422
+        case .payloadTooLarge:
+            return 413
+        case .invalidRequest, .unsupportedContent, .invalidContentLength:
             return 400
         case .invalidPort, .listenerFailed:
             return 500
@@ -782,6 +775,8 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
             return "invalid HTTP request"
         case .invalidJSON:
             return "invalid JSON request body"
+        case .missingField(let field):
+            return "missing required field: \(field)"
         case .unsupportedContent:
             return "unsupported request content"
         case .invalidContentLength:
@@ -886,12 +881,21 @@ struct HTTPRequest {
 
 public extension OpenAIChatRequest {
     static func parse(_ body: Data) throws -> OpenAIChatRequest {
-        guard
-            let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let model = object["model"] as? String,
-            let rawMessages = object["messages"] as? [[String: Any]]
-        else {
+        let rawObject: Any
+        do {
+            rawObject = try JSONSerialization.jsonObject(with: body)
+        } catch {
             throw OpenAIServerError.invalidJSON
+        }
+
+        guard let object = rawObject as? [String: Any] else {
+            throw OpenAIServerError.invalidJSON
+        }
+        guard let model = object["model"] as? String, !model.isEmpty else {
+            throw OpenAIServerError.missingField("model")
+        }
+        guard let rawMessages = object["messages"] as? [[String: Any]] else {
+            throw OpenAIServerError.missingField("messages")
         }
 
         let messages = rawMessages.compactMap { raw -> OpenAIChatMessage? in
@@ -908,7 +912,7 @@ public extension OpenAIChatRequest {
             }
             return nil
         }
-        guard !messages.isEmpty else { throw OpenAIServerError.invalidJSON }
+        guard !messages.isEmpty else { throw OpenAIServerError.missingField("messages") }
         let streamOptions = object["stream_options"] as? [String: Any]
         let chatTemplateKwargs = try parseChatTemplateKwargs(object["chat_template_kwargs"])
 
