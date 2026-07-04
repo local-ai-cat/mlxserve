@@ -193,6 +193,18 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             }
 
         for candidate in candidates {
+            guard
+                let entry = entries[candidate.modelID],
+                entry.engine != nil,
+                !entry.isPinned,
+                !entry.isLoading,
+                entry.inUse == 0,
+                let lastAccess = entry.lastAccess,
+                now.timeIntervalSince(lastAccess) >= idleTimeout
+            else {
+                continue
+            }
+
             if await unloadLoadedModel(candidate.modelID) {
                 unloaded.append(candidate.modelID)
             }
@@ -364,6 +376,7 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             return
         }
 
+        // NOTE: Gate waiters are not cancellation-aware; cancelled tasks stay queued until the gate resumes.
         await withCheckedContinuation { continuation in
             loadGateWaiters.append(continuation)
         }
@@ -380,6 +393,7 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
     }
 
     private func waitForModelLoad(_ modelID: String) async {
+        // NOTE: Model-load waiters are not cancellation-aware; cancelled tasks self-heal when load completes.
         await withCheckedContinuation { continuation in
             modelLoadWaiters[modelID, default: []].append(continuation)
         }

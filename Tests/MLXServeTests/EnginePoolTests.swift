@@ -310,6 +310,37 @@ final class EnginePoolTests: XCTestCase {
         await pool.release(lease)
     }
 
+    func testIdleSweepSkipsCandidateReusedAndReleasedDuringPriorUnload() async throws {
+        let state = FakeLoaderState()
+        let coordinator = BlockingUnloadCoordinator()
+        let pool = makeBlockingUnloadPool(
+            ["a": 10, "b": 20],
+            idleTimeout: 30,
+            state: state,
+            coordinator: coordinator
+        )
+        let start = Date(timeIntervalSince1970: 1_000)
+        let sweepNow = start.addingTimeInterval(40)
+        try await pool.load("a", now: start)
+        try await pool.load("b", now: start.addingTimeInterval(1))
+
+        async let sweepResult: [String] = pool.sweepIdleModels(now: sweepNow)
+        await coordinator.waitUntilUnloadStarted(count: 1)
+
+        let lease = try await pool.acquire("b", now: sweepNow)
+        await pool.release(lease)
+        await coordinator.releaseOne()
+        let unloaded = await sweepResult
+
+        let status = await pool.status()
+        XCTAssertEqual(unloaded, ["a"])
+        XCTAssertEqual(loadedModelIDs(status), ["b"])
+        XCTAssertEqual(status.models.first(where: { $0.id == "b" })?.inUse, 0)
+        XCTAssertEqual(status.currentModelMemory, 20)
+        assertMemoryAccountingInvariant(status)
+        XCTAssertEqual(lease.engine.id, "b")
+    }
+
     func testUnknownModelErrorListsAvailableModels() async throws {
         let pool = makePool(["a": 10, "b": 10])
 
