@@ -111,6 +111,7 @@ public final class ContinuousBatchGenerator {
     private var currentTokens = MLXArray([Int32]())
     private var rowUIDs: [String] = []
     private var samplers: [SamplingParameters] = []
+    private var generatedTokenHistory: [[Int]] = []
     private var state: LMOutput.State?
 
     public init(model: any LanguageModel, parameters: GenerateParameters) {
@@ -148,6 +149,12 @@ public final class ContinuousBatchGenerator {
         precondition(!rowUIDs.contains(uid), "duplicate batch uid '\(uid)'")
         precondition(!rowCache.isEmpty, "continuous batching requires a non-empty KV cache")
 
+        if let seed = sampling.seed {
+            // MLXRandom.seed mutates global RNG state. In mixed batches, the last inserted
+            // seeded request determines subsequent stochastic draws for all rows.
+            MLXRandom.seed(UInt64(bitPattern: Int64(seed)))
+        }
+
         if cache.isEmpty {
             let merged = try (0 ..< rowCache.count).map { layer in
                 try BatchLayerCache.merge([rowCache[layer]])
@@ -172,6 +179,7 @@ public final class ContinuousBatchGenerator {
 
         rowUIDs.append(uid)
         samplers.append(sampling)
+        generatedTokenHistory.append([])
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
@@ -192,6 +200,7 @@ public final class ContinuousBatchGenerator {
             cache.removeAll()
             rowUIDs.removeAll()
             samplers.removeAll()
+            generatedTokenHistory.removeAll()
             currentTokens = MLXArray([Int32]())
             state = nil
             return
@@ -204,6 +213,7 @@ public final class ContinuousBatchGenerator {
         currentTokens = currentTokens.take(rowIndices, axis: 0)
         rowUIDs = rows.map { rowUIDs[$0] }
         samplers = rows.map { samplers[$0] }
+        generatedTokenHistory = rows.map { generatedTokenHistory[$0] }
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
@@ -219,17 +229,23 @@ public final class ContinuousBatchGenerator {
         state = output.state
 
         let logits = output.logits[0..., -1, 0...]
-        let logprobs = logits - logSumExp(logits, axis: -1, keepDims: true)
         let sampledRows = (0 ..< rowUIDs.count).map { row in
-            TokenSampler.sample(logprobs: logprobs[row, 0...], parameters: samplers[row])
+            TokenSampler.sample(
+                logprobs: logits[row, 0...],
+                parameters: samplers[row],
+                generatedTokens: generatedTokenHistory[row]
+            )
         }
         let nextTokens = concatenated(sampledRows, axis: 0)
 
         asyncEval(nextTokens)
-        eval(currentTokens, logprobs)
+        eval(currentTokens, logits)
         currentTokens = nextTokens
 
         let tokenIds = nextTokens.asArray(Int.self)
+        for row in generatedTokenHistory.indices {
+            generatedTokenHistory[row].append(tokenIds[row])
+        }
         return rowUIDs.enumerated().map { row, uid in
             Response(uid: uid, token: tokenIds[row])
         }
