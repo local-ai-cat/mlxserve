@@ -14,10 +14,52 @@ public struct OpenAIModelInfo: Sendable {
 public struct OpenAIChatMessage: Sendable {
     public let role: String
     public let content: String
+    public let reasoningContent: String?
 
-    public init(role: String, content: String) {
+    public init(role: String, content: String, reasoningContent: String? = nil) {
         self.role = role
         self.content = content
+        self.reasoningContent = reasoningContent
+    }
+}
+
+public enum OpenAIJSONValue: Sendable, Equatable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: OpenAIJSONValue])
+    case array([OpenAIJSONValue])
+    case null
+
+    init?(_ value: Any) {
+        switch value {
+        case let string as String:
+            self = .string(string)
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                self = .bool(number.boolValue)
+            } else {
+                self = .number(number.doubleValue)
+            }
+        case let object as [String: Any]:
+            var converted: [String: OpenAIJSONValue] = [:]
+            for (key, value) in object {
+                guard let jsonValue = OpenAIJSONValue(value) else { return nil }
+                converted[key] = jsonValue
+            }
+            self = .object(converted)
+        case let array as [Any]:
+            var converted: [OpenAIJSONValue] = []
+            for value in array {
+                guard let jsonValue = OpenAIJSONValue(value) else { return nil }
+                converted.append(jsonValue)
+            }
+            self = .array(converted)
+        case _ as NSNull:
+            self = .null
+        default:
+            return nil
+        }
     }
 }
 
@@ -26,20 +68,59 @@ public struct OpenAIChatRequest: Sendable {
     public let messages: [OpenAIChatMessage]
     public let maxTokens: Int
     public let temperature: Float
+    public let topP: Float
+    public let topK: Int
+    public let repetitionPenalty: Float
+    public let minP: Float
+    public let xtcProbability: Float
+    public let xtcThreshold: Float
+    public let presencePenalty: Float
+    public let frequencyPenalty: Float
+    public let stop: [String]
+    public let seed: Int?
     public let stream: Bool
+    public let includeUsage: Bool
+    public let enableThinking: Bool?
+    public let chatTemplateKwargs: [String: OpenAIJSONValue]?
 
     public init(
         model: String,
         messages: [OpenAIChatMessage],
         maxTokens: Int,
-        temperature: Float,
-        stream: Bool
+        temperature: Float = 0,
+        topP: Float = 0,
+        topK: Int = 0,
+        repetitionPenalty: Float = 1,
+        minP: Float = 0,
+        xtcProbability: Float = 0,
+        xtcThreshold: Float = 0.1,
+        presencePenalty: Float = 0,
+        frequencyPenalty: Float = 0,
+        stop: [String] = [],
+        seed: Int? = nil,
+        stream: Bool = false,
+        includeUsage: Bool = false,
+        enableThinking: Bool? = nil,
+        chatTemplateKwargs: [String: OpenAIJSONValue]? = nil
     ) {
         self.model = model
         self.messages = messages
         self.maxTokens = maxTokens
         self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.repetitionPenalty = repetitionPenalty
+        self.minP = minP
+        self.xtcProbability = xtcProbability
+        self.xtcThreshold = xtcThreshold
+        self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.stop = stop
+        self.seed = seed
         self.stream = stream
+        self.includeUsage = includeUsage
+        self.enableThinking = enableThinking
+        self.chatTemplateKwargs = chatTemplateKwargs
     }
 }
 
@@ -156,11 +237,11 @@ public final class OpenAIServer: @unchecked Sendable {
             case ("POST", "/v1/chat/completions"):
                 try await handleChatCompletion(request, connection: connection)
             default:
-                try await sendJSON(["error": ["message": "not found"]], status: 404, connection: connection)
+                try await sendJSON(openAIErrorBody(message: "not found", status: 404), status: 404, connection: connection)
             }
         } catch {
             try? await sendJSON(
-                ["error": ["message": String(describing: error)]],
+                openAIErrorBody(message: String(describing: error), status: 500),
                 status: 500,
                 connection: connection
             )
@@ -168,7 +249,18 @@ public final class OpenAIServer: @unchecked Sendable {
     }
 
     private func handleChatCompletion(_ request: HTTPRequest, connection: NWConnection) async throws {
-        let chatRequest = try OpenAIChatRequest.parse(request.body)
+        let chatRequest: OpenAIChatRequest
+        do {
+            chatRequest = try OpenAIChatRequest.parse(request.body)
+        } catch {
+            let status = (error as? OpenAIServerError)?.httpStatus ?? 422
+            try await sendJSON(
+                openAIErrorBody(message: String(describing: error), status: status),
+                status: status,
+                connection: connection
+            )
+            return
+        }
         let started = DispatchTime.now().uptimeNanoseconds
         let stream = try await backend.startChatCompletion(chatRequest)
 
@@ -267,7 +359,7 @@ public final class OpenAIServer: @unchecked Sendable {
                     "id": id,
                     "object": "error",
                     "created": created,
-                    "error": ["message": String(describing: error)],
+                    "error": openAIErrorObject(message: String(describing: error), status: 500),
                 ],
                 connection: connection
             )
@@ -292,24 +384,26 @@ public final class OpenAIServer: @unchecked Sendable {
             ],
             connection: connection
         )
-        try await sendSSE(
-            [
-                "id": id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": request.model,
-                "choices": [],
-                "usage": usage(
-                    promptTokens: stream.promptTokens,
-                    completionTokens: completionTokens,
-                    started: started,
-                    firstToken: firstToken ?? ended,
-                    lastToken: lastToken ?? ended,
-                    ended: ended
-                ),
-            ],
-            connection: connection
-        )
+        if request.includeUsage {
+            try await sendSSE(
+                [
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                    "choices": [],
+                    "usage": usage(
+                        promptTokens: stream.promptTokens,
+                        completionTokens: completionTokens,
+                        started: started,
+                        firstToken: firstToken ?? ended,
+                        lastToken: lastToken ?? ended,
+                        ended: ended
+                    ),
+                ],
+                connection: connection
+            )
+        }
         try await connection.sendFinal(data: Data("data: [DONE]\n\n".utf8))
     }
 
@@ -428,13 +522,54 @@ public final class OpenAIServer: @unchecked Sendable {
         connection: NWConnection
     ) async throws {
         let body = try JSONSerialization.data(withJSONObject: object, options: [])
-        let reason = status == 200 ? "OK" : status == 404 ? "Not Found" : "Internal Server Error"
+        let reason = httpReasonPhrase(status)
         let header = "HTTP/1.1 \(status) \(reason)\r\n"
             + "Content-Type: application/json\r\n"
             + "Content-Length: \(body.count)\r\n"
             + "Connection: close\r\n"
             + "\r\n"
         try await connection.sendFinal(data: Data(header.utf8) + body)
+    }
+}
+
+public func openAIErrorBody(message: String, status: Int) -> [String: Any] {
+    ["error": openAIErrorObject(message: message, status: status)]
+}
+
+public func openAIErrorObject(message: String, status: Int) -> [String: Any] {
+    [
+        "message": message,
+        "type": openAIErrorType(status: status),
+        "param": NSNull(),
+        "code": NSNull(),
+    ]
+}
+
+public func openAIErrorType(status: Int) -> String {
+    switch status {
+    case 404:
+        return "not_found_error"
+    case 500...:
+        return "server_error"
+    default:
+        return "invalid_request_error"
+    }
+}
+
+private func httpReasonPhrase(_ status: Int) -> String {
+    switch status {
+    case 200:
+        return "OK"
+    case 400:
+        return "Bad Request"
+    case 404:
+        return "Not Found"
+    case 422:
+        return "Unprocessable Entity"
+    case 500:
+        return "Internal Server Error"
+    default:
+        return "OK"
     }
 }
 
@@ -446,6 +581,15 @@ public enum OpenAIServerError: Error, Equatable, CustomStringConvertible {
     case invalidContentLength
     case payloadTooLarge
     case listenerFailed(String)
+
+    var httpStatus: Int {
+        switch self {
+        case .invalidJSON, .invalidRequest, .unsupportedContent, .invalidContentLength, .payloadTooLarge:
+            return 400
+        case .invalidPort, .listenerFailed:
+            return 500
+        }
+    }
 
     public var description: String {
         switch self {
@@ -557,7 +701,7 @@ struct HTTPRequest {
     }
 }
 
-private extension OpenAIChatRequest {
+public extension OpenAIChatRequest {
     static func parse(_ body: Data) throws -> OpenAIChatRequest {
         guard
             let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
@@ -569,26 +713,94 @@ private extension OpenAIChatRequest {
 
         let messages = rawMessages.compactMap { raw -> OpenAIChatMessage? in
             guard let role = raw["role"] as? String else { return nil }
+            let reasoningContent = raw["reasoning_content"] as? String
             if let content = raw["content"] as? String {
-                return OpenAIChatMessage(role: role, content: content)
+                return OpenAIChatMessage(role: role, content: content, reasoningContent: reasoningContent)
             }
             if let parts = raw["content"] as? [[String: Any]] {
                 let text = parts.compactMap { part in
                     part["type"] as? String == "text" ? part["text"] as? String : nil
                 }.joined()
-                return OpenAIChatMessage(role: role, content: text)
+                return OpenAIChatMessage(role: role, content: text, reasoningContent: reasoningContent)
             }
             return nil
         }
         guard !messages.isEmpty else { throw OpenAIServerError.invalidJSON }
+        let streamOptions = object["stream_options"] as? [String: Any]
+        let chatTemplateKwargs = try parseChatTemplateKwargs(object["chat_template_kwargs"])
 
         return OpenAIChatRequest(
             model: model,
             messages: messages,
-            maxTokens: object["max_tokens"] as? Int ?? 16,
-            temperature: Float((object["temperature"] as? Double) ?? 0),
-            stream: object["stream"] as? Bool ?? false
+            maxTokens: intValue(object["max_tokens"] ?? object["max_completion_tokens"]) ?? 16,
+            temperature: floatValue(object["temperature"]) ?? 0,
+            topP: floatValue(object["top_p"]) ?? 0,
+            topK: intValue(object["top_k"]) ?? 0,
+            repetitionPenalty: floatValue(object["repetition_penalty"]) ?? 1,
+            minP: floatValue(object["min_p"]) ?? 0,
+            xtcProbability: floatValue(object["xtc_probability"]) ?? 0,
+            xtcThreshold: floatValue(object["xtc_threshold"]) ?? 0.1,
+            presencePenalty: floatValue(object["presence_penalty"]) ?? 0,
+            frequencyPenalty: floatValue(object["frequency_penalty"]) ?? 0,
+            stop: try stopValues(object["stop"]),
+            seed: intValue(object["seed"]),
+            stream: object["stream"] as? Bool ?? false,
+            includeUsage: streamOptions?["include_usage"] as? Bool ?? false,
+            enableThinking: object["enable_thinking"] as? Bool,
+            chatTemplateKwargs: chatTemplateKwargs
         )
+    }
+
+    private static func floatValue(_ value: Any?) -> Float? {
+        switch value {
+        case let value as Double:
+            return Float(value)
+        case let value as Float:
+            return value
+        case let value as Int:
+            return Float(value)
+        case let value as NSNumber:
+            return value.floatValue
+        default:
+            return nil
+        }
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        switch value {
+        case let value as Int:
+            return value
+        case let value as NSNumber:
+            return value.intValue
+        default:
+            return nil
+        }
+    }
+
+    private static func stopValues(_ value: Any?) throws -> [String] {
+        guard let value else { return [] }
+        if let string = value as? String {
+            return [string]
+        }
+        if let strings = value as? [String] {
+            return strings
+        }
+        throw OpenAIServerError.invalidJSON
+    }
+
+    private static func parseChatTemplateKwargs(_ value: Any?) throws -> [String: OpenAIJSONValue]? {
+        guard let value else { return nil }
+        guard let object = value as? [String: Any] else {
+            throw OpenAIServerError.invalidJSON
+        }
+        var converted: [String: OpenAIJSONValue] = [:]
+        for (key, value) in object {
+            guard let jsonValue = OpenAIJSONValue(value) else {
+                throw OpenAIServerError.invalidJSON
+            }
+            converted[key] = jsonValue
+        }
+        return converted
     }
 }
 
