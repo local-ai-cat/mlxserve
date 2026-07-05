@@ -286,11 +286,13 @@ public final class OpenAIServer: @unchecked Sendable {
     private let backend: any OpenAIChatBackend
     private let listener: NWListener
     private let responsesStore: ResponsesStore
+    private let mcpManager: MCPManager?
 
     public init(
         host: String = "127.0.0.1",
         port: UInt16,
-        backend: any OpenAIChatBackend
+        backend: any OpenAIChatBackend,
+        mcpManager: MCPManager? = nil
     ) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw OpenAIServerError.invalidPort(port)
@@ -300,6 +302,7 @@ public final class OpenAIServer: @unchecked Sendable {
         self.backend = backend
         self.listener = try NWListener(using: .tcp, on: nwPort)
         self.responsesStore = ResponsesStore()
+        self.mcpManager = mcpManager
     }
 
     public func start() async throws {
@@ -345,6 +348,12 @@ public final class OpenAIServer: @unchecked Sendable {
                 try await sendJSON(modelsResponse(), status: 200, connection: connection)
             case ("GET", "/v1/models/status"):
                 try await sendLifecycleResponse(request, connection: connection)
+            case ("GET", "/v1/mcp/tools"):
+                try await MCPHandler(manager: mcpManager).handleTools(connection: connection)
+            case ("GET", "/v1/mcp/servers"):
+                try await MCPHandler(manager: mcpManager).handleServers(connection: connection)
+            case ("POST", "/v1/mcp/execute"):
+                try await MCPHandler(manager: mcpManager).handleExecute(request, connection: connection)
             case ("POST", "/v1/chat/completions"):
                 try await handleChatCompletion(request, connection: connection)
             case ("POST", "/v1/completions"):
@@ -484,19 +493,20 @@ public final class OpenAIServer: @unchecked Sendable {
             )
             return
         }
+        let effectiveChatRequest = await chatRequestByMergingMCPTools(chatRequest)
         let started = DispatchTime.now().uptimeNanoseconds
-        let stream = try await backend.startChatCompletion(chatRequest)
+        let stream = try await backend.startChatCompletion(effectiveChatRequest)
 
-        if chatRequest.stream {
+        if effectiveChatRequest.stream {
             try await sendStreamingChat(
-                request: chatRequest,
+                request: effectiveChatRequest,
                 stream: stream,
                 started: started,
                 connection: connection
             )
         } else {
             try await sendBufferedChat(
-                request: chatRequest,
+                request: effectiveChatRequest,
                 stream: stream,
                 started: started,
                 connection: connection
@@ -655,6 +665,17 @@ public final class OpenAIServer: @unchecked Sendable {
         }
         try await connection.sendFinal(data: Data(chatStreamingDoneFrame.utf8))
         connection.cancel()
+    }
+
+    private func chatRequestByMergingMCPTools(_ request: OpenAIChatRequest) async -> OpenAIChatRequest {
+        guard let mcpManager else {
+            return request
+        }
+        let tools = await mcpManager.mergedOpenAITools(
+            userTools: request.tools,
+            toolChoice: request.toolChoice
+        )
+        return openAIChatRequestByReplacingTools(request, tools: tools)
     }
 
     private func sendStreamingChatWithTools(

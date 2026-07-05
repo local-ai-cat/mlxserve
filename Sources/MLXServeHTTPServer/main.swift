@@ -54,10 +54,19 @@ struct MLXServeHTTPServerMain {
             modelIDs: Array(discovered.keys),
             embeddingsBackend: embeddingBackend
         )
+        let mcpManager: MCPManager?
+        if let mcpConfigPath = config.mcpConfigPath {
+            let manager = try MCPManager.load(from: URL(fileURLWithPath: mcpConfigPath))
+            await manager.connectAll()
+            mcpManager = manager
+        } else {
+            mcpManager = nil
+        }
         let server = try OpenAIServer(
             host: config.host,
             port: config.port,
-            backend: backend
+            backend: backend,
+            mcpManager: mcpManager
         )
         if config.idleTimeout != nil {
             startIdleSweep(pool: pool, interval: config.idleTimeout ?? 0)
@@ -121,6 +130,7 @@ private struct ServerConfig {
     let memoryCeilingBytes: Int64?
     let idleTimeout: TimeInterval?
     let pinnedModelIDs: [String]
+    let mcpConfigPath: String?
 
     static func parse(_ arguments: [String]) throws -> ServerConfig {
         var host = "127.0.0.1"
@@ -134,6 +144,7 @@ private struct ServerConfig {
         var memoryCeilingBytes: Int64?
         var idleTimeout: TimeInterval?
         var pinnedModelIDs: [String] = []
+        var mcpConfigPath: String?
 
         var index = 1
         while index < arguments.count {
@@ -185,6 +196,9 @@ private struct ServerConfig {
             case "--pin":
                 index += 1
                 pinnedModelIDs.append(try value(arguments, at: index, for: argument))
+            case "--mcp-config":
+                index += 1
+                mcpConfigPath = try value(arguments, at: index, for: argument)
             case "--help", "-h":
                 printHelp()
                 Foundation.exit(0)
@@ -208,7 +222,8 @@ private struct ServerConfig {
             memoryGuardTier: memoryGuardTier,
             memoryCeilingBytes: memoryCeilingBytes,
             idleTimeout: idleTimeout,
-            pinnedModelIDs: pinnedModelIDs
+            pinnedModelIDs: pinnedModelIDs,
+            mcpConfigPath: mcpConfigPath
         )
     }
 
@@ -235,6 +250,7 @@ private struct ServerConfig {
               --memory-ceiling-bytes N          Explicit pool ceiling in bytes. Overrides memory guard tier when > 0.
               --idle-timeout SECONDS            Unload idle, unpinned models after this many seconds. Default: off.
               --pin ID                          Pin a discovered model in memory. Repeatable.
+              --mcp-config PATH                 Optional Claude Desktop-style MCP JSON config.
             """
         )
     }

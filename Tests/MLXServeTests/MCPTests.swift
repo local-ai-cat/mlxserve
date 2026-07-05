@@ -1,0 +1,210 @@
+import Foundation
+@testable import MLXServeHTTP
+import XCTest
+
+final class MCPTests: XCTestCase {
+    func testMCPConfigParsesClaudeDesktopShape() throws {
+        let config = try MCPConfig.parse(
+            [
+                "mcpServers": [
+                    "fake": [
+                        "command": "python3",
+                        "args": ["server.py"],
+                        "env": ["TOKEN": "abc"],
+                    ],
+                    "disabled": [
+                        "command": "ignored",
+                        "enabled": false,
+                    ],
+                    "sse": [
+                        "transport": "sse",
+                        "url": "http://127.0.0.1:1",
+                    ],
+                ]
+            ]
+        )
+
+        XCTAssertEqual(config.servers, [MCPServerConfig(name: "fake", command: "python3", args: ["server.py"], env: ["TOKEN": "abc"])])
+    }
+
+    func testMCPHandlerUnconfiguredEndpointShapes() async {
+        let handler = MCPHandler(manager: nil)
+
+        let tools = await handler.toolsResponse()
+        XCTAssertEqual(tools.status, 200)
+        XCTAssertEqual(tools.body["count"] as? Int, 0)
+        XCTAssertEqual((tools.body["tools"] as? [Any])?.count, 0)
+
+        let servers = await handler.serversResponse()
+        XCTAssertEqual(servers.status, 200)
+        XCTAssertEqual((servers.body["servers"] as? [Any])?.count, 0)
+
+        let execute = await handler.executeResponse(body: Data(#"{"tool":"fake__echo","arguments":{}}"#.utf8))
+        XCTAssertEqual(execute.status, 503)
+        XCTAssertNotNil(execute.body["error"])
+    }
+
+    func testMCPStdioClientDiscoversAndExecutesFakeServer() async throws {
+        let manager = try makeFakeMCPManager()
+        await manager.connectAll()
+
+        let statuses = await manager.serverStatuses()
+        XCTAssertEqual(statuses.first?.state, "connected")
+        XCTAssertEqual(statuses.first?.toolsCount, 1)
+
+        let tools = await manager.allTools()
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools[0].fullName, "fake__echo")
+        XCTAssertEqual(tools[0].description, "Echo input")
+
+        let result = await manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("hello")])
+        )
+        XCTAssertFalse(result.isError)
+        guard case .array(let content) = result.content,
+            case .object(let first)? = content.first,
+            case .string(let text)? = first["text"]
+        else {
+            XCTFail("expected MCP text content")
+            return
+        }
+        XCTAssertEqual(text, "hello")
+        await manager.shutdown()
+    }
+
+    func testMCPHandlerExecuteShapeWithFakeServer() async throws {
+        let manager = try makeFakeMCPManager()
+        await manager.connectAll()
+        let handler = MCPHandler(manager: manager)
+
+        let response = await handler.executeResponse(
+            body: Data(#"{"tool":"fake__echo","arguments":{"message":"route"}}"#.utf8)
+        )
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.body["tool_name"] as? String, "fake__echo")
+        XCTAssertEqual(response.body["is_error"] as? Bool, false)
+        let content = try XCTUnwrap(response.body["content"] as? [[String: Any]])
+        XCTAssertEqual(content.first?["text"] as? String, "route")
+        await manager.shutdown()
+    }
+
+    func testMergedOpenAIChatRequestAddsDiscoveredTools() async throws {
+        let manager = try makeFakeMCPManager()
+        await manager.connectAll()
+        let userTool = OpenAIJSONValue(
+            [
+                "type": "function",
+                "function": [
+                    "name": "user_tool",
+                    "parameters": ["type": "object", "properties": [:]],
+                ],
+            ]
+        )
+
+        let request = OpenAIChatRequest(
+            model: "test-model",
+            messages: [OpenAIChatMessage(role: "user", content: "hello")],
+            maxTokens: 1,
+            tools: userTool.map { [$0] }
+        )
+        let tools = await manager.mergedOpenAITools(
+            userTools: request.tools,
+            toolChoice: request.toolChoice
+        )
+        let mergedRequest = openAIChatRequestByReplacingTools(request, tools: tools)
+
+        let names = (mergedRequest.tools ?? []).compactMap(openAIToolFunctionName).sorted()
+        XCTAssertEqual(names, ["fake__echo", "user_tool"])
+        await manager.shutdown()
+    }
+
+    private func makeFakeMCPManager() throws -> MCPManager {
+        let scriptURL = try fakeMCPServerScriptURL()
+        return MCPManager(
+            config: MCPConfig(
+                servers: [
+                    MCPServerConfig(name: "fake", command: "python3", args: [scriptURL.path])
+                ]
+            )
+        )
+    }
+
+    private func fakeMCPServerScriptURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mlxserve-mcp-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let scriptURL = directory.appendingPathComponent("fake_mcp_server.py")
+        try fakeMCPServerScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+        return scriptURL
+    }
+
+    private var fakeMCPServerScript: String {
+        #"""
+        import json
+        import sys
+
+        def read_message():
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return None
+            return json.loads(line.decode("utf-8"))
+
+        def write_message(message):
+            body = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+            sys.stdout.buffer.write(body)
+            sys.stdout.buffer.flush()
+
+        while True:
+            message = read_message()
+            if message is None:
+                break
+            method = message.get("method")
+            request_id = message.get("id")
+            if request_id is None:
+                continue
+            if method == "initialize":
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": {"name": "fake", "version": "1"}
+                    }
+                })
+            elif method == "tools/list":
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "tools": [{
+                            "name": "echo",
+                            "description": "Echo input",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}}
+                            }
+                        }]
+                    }
+                })
+            elif method == "tools/call":
+                arguments = message.get("params", {}).get("arguments", {})
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "content": [{"type": "text", "text": arguments.get("message", "")}],
+                        "isError": False
+                    }
+                })
+            else:
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": "method not found"}
+                })
+        """#
+    }
+}
