@@ -155,6 +155,7 @@ final class OpenAIServerTests: XCTestCase {
                   "stream": true,
                   "stream_options": { "include_usage": true },
                   "enable_thinking": false,
+                  "thinking_budget": 24,
                   "chat_template_kwargs": {
                     "reasoning_effort": "low",
                     "budget": 16,
@@ -183,6 +184,7 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertTrue(request.stream)
         XCTAssertTrue(request.includeUsage)
         XCTAssertEqual(request.enableThinking, false)
+        XCTAssertEqual(request.thinkingBudget, 24)
         XCTAssertEqual(request.chatTemplateKwargs?["reasoning_effort"], .string("low"))
         XCTAssertEqual(request.chatTemplateKwargs?["budget"], .number(16))
         XCTAssertEqual(request.chatTemplateKwargs?["nested"], .object(["enabled": .bool(true)]))

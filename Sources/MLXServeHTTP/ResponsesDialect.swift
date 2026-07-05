@@ -12,6 +12,7 @@ public struct ResponsesRequest {
     public let store: Bool
     public let metadata: [String: Any]
     public let seed: Int?
+    public let thinkingBudget: Int?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
     public let tools: [OpenAIJSONValue]?
     public let toolChoice: OpenAIToolChoice?
@@ -44,6 +45,7 @@ public struct ResponsesRequest {
             store: object["store"] as? Bool ?? true,
             metadata: object["metadata"] as? [String: Any] ?? [:],
             seed: responsesIntValue(object["seed"]),
+            thinkingBudget: responsesIntValue(object["thinking_budget"]),
             chatTemplateKwargs: try responsesChatTemplateKwargs(from: object),
             tools: try responsesOpenAITools(from: object["tools"]),
             toolChoice: try responsesToolChoice(from: object["tool_choice"])
@@ -59,6 +61,7 @@ public struct ResponsesRequest {
             topP: topP,
             seed: seed,
             stream: stream ?? self.stream,
+            thinkingBudget: thinkingBudget,
             chatTemplateKwargs: chatTemplateKwargs,
             tools: tools,
             toolChoice: toolChoice

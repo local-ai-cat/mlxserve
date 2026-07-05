@@ -53,6 +53,7 @@ final class ResponsesDialectTests: XCTestCase {
                   "store": false,
                   "metadata": {"trace": "abc"},
                   "reasoning": {"effort": "low"},
+                  "thinking_budget": 12,
                   "seed": 123
                 }
                 """.utf8
@@ -72,7 +73,11 @@ final class ResponsesDialectTests: XCTestCase {
         XCTAssertFalse(request.store)
         XCTAssertEqual(request.metadata["trace"] as? String, "abc")
         XCTAssertEqual(request.seed, 123)
+        XCTAssertEqual(request.thinkingBudget, 12)
         XCTAssertEqual(request.chatTemplateKwargs?["reasoning"], .object(["effort": .string("low")]))
+
+        let chatRequest = request.openAIRequest()
+        XCTAssertEqual(chatRequest.thinkingBudget, 12)
     }
 
     func testResponsesRequestConvertsToolsAndToolChoice() throws {

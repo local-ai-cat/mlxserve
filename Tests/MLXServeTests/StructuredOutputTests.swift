@@ -298,4 +298,44 @@ final class StructuredOutputTests: XCTestCase {
 
         XCTAssertTrue([2, 4].contains(sampled.item(Int.self)))
     }
+
+    func testThinkingBudgetForcesCloseTokenBeforeSixthReasoningToken() throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        let logits = MLXArray([0.0, 10.0, -5.0].map(Float.init))
+        let parameters = SamplingParameters(temperature: 0)
+        var state: ThinkingBudgetState? = ThinkingBudgetState(
+            configuration: ThinkingBudgetConfiguration(
+                budget: 5,
+                closeTokenIDs: [2],
+                startsInThinking: true
+            )
+        )
+        var generatedTokens: [Int] = []
+
+        for _ in 0 ..< 5 {
+            let sampled = TokenSampler.sample(
+                logits: logits,
+                parameters: parameters,
+                generatedTokens: generatedTokens,
+                thinkingBudgetState: &state
+            )
+            let tokenID = sampled.item(Int.self)
+            XCTAssertEqual(tokenID, 1)
+            generatedTokens.append(tokenID)
+            state?.advance(tokenID: tokenID)
+        }
+
+        let closeToken = TokenSampler.sample(
+            logits: logits,
+            parameters: parameters,
+            generatedTokens: generatedTokens,
+            thinkingBudgetState: &state
+        ).item(Int.self)
+        XCTAssertEqual(closeToken, 2)
+        state?.advance(tokenID: closeToken)
+
+        XCTAssertEqual(state?.countedThinkingTokens, 5)
+        XCTAssertEqual(state?.isInThinking, false)
+    }
 }

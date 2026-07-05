@@ -101,6 +101,7 @@ public struct OpenAIChatRequest: Sendable {
     public let stream: Bool
     public let includeUsage: Bool
     public let enableThinking: Bool?
+    public let thinkingBudget: Int?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
     public let structuredOutput: StructuredOutputSpec
     public let tools: [OpenAIJSONValue]?
@@ -124,6 +125,7 @@ public struct OpenAIChatRequest: Sendable {
         stream: Bool = false,
         includeUsage: Bool = false,
         enableThinking: Bool? = nil,
+        thinkingBudget: Int? = nil,
         chatTemplateKwargs: [String: OpenAIJSONValue]? = nil,
         structuredOutput: StructuredOutputSpec = .none,
         tools: [OpenAIJSONValue]? = nil,
@@ -146,6 +148,7 @@ public struct OpenAIChatRequest: Sendable {
         self.stream = stream
         self.includeUsage = includeUsage
         self.enableThinking = enableThinking
+        self.thinkingBudget = thinkingBudget
         self.chatTemplateKwargs = chatTemplateKwargs
         self.structuredOutput = structuredOutput
         self.tools = tools
@@ -1402,6 +1405,7 @@ public extension OpenAIChatRequest {
             stream: object["stream"] as? Bool ?? false,
             includeUsage: streamOptions?["include_usage"] as? Bool ?? false,
             enableThinking: object["enable_thinking"] as? Bool,
+            thinkingBudget: intValue(object["thinking_budget"]),
             chatTemplateKwargs: chatTemplateKwargs,
             structuredOutput: structuredOutput,
             tools: tools,

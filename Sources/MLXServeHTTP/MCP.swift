@@ -253,6 +253,7 @@ public func openAIChatRequestByReplacingTools(
         stream: request.stream,
         includeUsage: request.includeUsage,
         enableThinking: request.enableThinking,
+        thinkingBudget: request.thinkingBudget,
         chatTemplateKwargs: request.chatTemplateKwargs,
         structuredOutput: request.structuredOutput,
         tools: tools,
@@ -302,6 +303,7 @@ public func anthropicMessagesRequestByReplacingTools(
         topP: request.topP,
         topK: request.topK,
         enableThinking: request.enableThinking,
+        thinkingBudget: request.thinkingBudget,
         chatTemplateKwargs: request.chatTemplateKwargs,
         tools: tools,
         toolChoice: request.toolChoice
@@ -338,6 +340,7 @@ public func responsesRequestByReplacingTools(
         store: request.store,
         metadata: request.metadata,
         seed: request.seed,
+        thinkingBudget: request.thinkingBudget,
         chatTemplateKwargs: request.chatTemplateKwargs,
         tools: tools,
         toolChoice: request.toolChoice

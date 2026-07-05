@@ -181,7 +181,8 @@ public actor Scheduler {
                         cache: row.cache,
                         lastToken: row.lastToken,
                         sampling: sampling,
-                        generatedTokens: generatedTokens
+                        generatedTokens: generatedTokens,
+                        thinkingBudgetState: row.initialGeneratedToken?.thinkingBudgetState
                     )
                     running[request.uid] = RunningRequest(
                         request: request,
@@ -419,13 +420,20 @@ public actor Scheduler {
     ) -> PreparedGeneratedToken {
         let nextTokenLogits = logits[0..., -1, 0...]
         let matcher = sampling.jsonGrammar?.makeMatcher()
+        var thinkingBudgetState = sampling.thinkingBudget.map(ThinkingBudgetState.init(configuration:))
         let token = TokenSampler.sample(
             logits: nextTokenLogits[0, 0...],
             parameters: sampling,
             generatedTokens: [],
-            jsonGrammarMatcher: matcher
+            jsonGrammarMatcher: matcher,
+            thinkingBudgetState: &thinkingBudgetState
         )
-        return PreparedGeneratedToken(token: token, tokenID: token.item(Int.self))
+        thinkingBudgetState?.advance(tokenID: token.item(Int.self))
+        return PreparedGeneratedToken(
+            token: token,
+            tokenID: token.item(Int.self),
+            thinkingBudgetState: thinkingBudgetState
+        )
     }
 
     private func isPrefixCacheEligible(_ input: LMInput) -> Bool {
@@ -476,4 +484,5 @@ private struct PreparedBatchRow {
 private struct PreparedGeneratedToken {
     let token: MLXArray
     let tokenID: Int
+    let thinkingBudgetState: ThinkingBudgetState?
 }

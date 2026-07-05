@@ -90,7 +90,8 @@ final class NativeModelEngine: @unchecked Sendable {
                         }
                         let text = self.context.tokenizer.decode(
                             tokenIds: [response.token],
-                            skipSpecialTokens: true
+                            skipSpecialTokens: response.finishReason != nil
+                                && self.eosTokenIds.contains(response.token)
                         )
                         continuation.yield(
                             OpenAIChatChunk(
@@ -149,7 +150,8 @@ final class NativeModelEngine: @unchecked Sendable {
             xtcSpecialTokens: xtcSpecialTokens(),
             seed: request.seed,
             allowedSequences: allowedSequences(from: request.structuredOutput),
-            jsonGrammar: jsonGrammar(from: request.structuredOutput)
+            jsonGrammar: jsonGrammar(from: request.structuredOutput),
+            thinkingBudget: thinkingBudgetConfiguration(from: request)
         )
     }
 
@@ -237,6 +239,32 @@ final class NativeModelEngine: @unchecked Sendable {
             return sequence
         }
         return sequences.isEmpty ? nil : sequences
+    }
+
+    private func thinkingBudgetConfiguration(from request: OpenAIChatRequest) -> ThinkingBudgetConfiguration? {
+        guard let budget = request.thinkingBudget else { return nil }
+
+        let closeTokenIDs: [Int]
+        let trailingTokenIDs: [Int]
+        if usesHarmonyChannels {
+            closeTokenIDs = context.tokenizer.encode(text: "<|end|>", addSpecialTokens: false)
+            trailingTokenIDs = context.tokenizer.encode(
+                text: "<|start|>assistant<|channel|>final<|message|>",
+                addSpecialTokens: false
+            )
+        } else {
+            closeTokenIDs = context.tokenizer.encode(text: "</think>", addSpecialTokens: false)
+            trailingTokenIDs = []
+        }
+
+        guard !closeTokenIDs.isEmpty else { return nil }
+        return ThinkingBudgetConfiguration(
+            budget: budget,
+            closeTokenIDs: closeTokenIDs,
+            startTokenIDs: context.tokenizer.encode(text: "<think>", addSpecialTokens: false),
+            trailingTokenIDs: trailingTokenIDs,
+            startsInThinking: true
+        )
     }
 
     private func canonicalEOSTokenId() -> Int? {
@@ -345,8 +373,15 @@ final class NativeModelEngine: @unchecked Sendable {
         }
         if let enableThinking = request.enableThinking {
             context["enable_thinking"] = enableThinking
+        } else if request.thinkingBudget != nil {
+            context["enable_thinking"] = true
         }
         return context.isEmpty ? nil : context
+    }
+
+    private var usesHarmonyChannels: Bool {
+        let normalized = modelID.lowercased()
+        return normalized.contains("gpt-oss") || normalized.contains("harmony")
     }
 
     private func toolSpecDictionaries(from tools: [OpenAIJSONValue]?) -> [[String: any Sendable]]? {

@@ -70,6 +70,7 @@ final class AnthropicDialectTests: XCTestCase {
         XCTAssertEqual(request.topP, 0.8, accuracy: 0.0001)
         XCTAssertEqual(request.topK, 20)
         XCTAssertEqual(request.enableThinking, true)
+        XCTAssertEqual(request.thinkingBudget, 16)
         XCTAssertEqual(request.chatTemplateKwargs?["tools"], .array([.object(["name": .string("lookup"), "description": .string("search")])]))
         XCTAssertEqual(request.chatTemplateKwargs?["tool_choice"], .object(["type": .string("tool"), "name": .string("lookup")]))
 
@@ -78,6 +79,7 @@ final class AnthropicDialectTests: XCTestCase {
         XCTAssertEqual(chatRequest.maxTokens, 64)
         XCTAssertEqual(chatRequest.stop, ["END"])
         XCTAssertEqual(chatRequest.enableThinking, true)
+        XCTAssertEqual(chatRequest.thinkingBudget, 16)
         XCTAssertNotNil(chatRequest.tools)
         XCTAssertEqual(chatRequest.toolChoice, .function("lookup"))
     }

@@ -10,6 +10,7 @@ public struct AnthropicMessagesRequest {
     public let topP: Float
     public let topK: Int
     public let enableThinking: Bool?
+    public let thinkingBudget: Int?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
     public let tools: [OpenAIJSONValue]?
     public let toolChoice: OpenAIToolChoice?
@@ -43,6 +44,7 @@ public struct AnthropicMessagesRequest {
             topP: anthropicFloatValue(object["top_p"]) ?? 0,
             topK: anthropicIntValue(object["top_k"]) ?? 0,
             enableThinking: enableThinking,
+            thinkingBudget: anthropicIntValue(thinking?["budget_tokens"]),
             chatTemplateKwargs: try anthropicChatTemplateKwargs(from: object),
             tools: try anthropicOpenAITools(from: object["tools"]),
             toolChoice: try anthropicToolChoice(from: object["tool_choice"])
@@ -60,6 +62,7 @@ public struct AnthropicMessagesRequest {
             stop: stopSequences,
             stream: stream ?? self.stream,
             enableThinking: enableThinking,
+            thinkingBudget: thinkingBudget,
             chatTemplateKwargs: chatTemplateKwargs,
             tools: tools,
             toolChoice: toolChoice

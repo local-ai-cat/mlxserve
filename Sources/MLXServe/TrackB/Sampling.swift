@@ -1,5 +1,128 @@
 import MLX
 
+public struct ThinkingBudgetConfiguration: Sendable, Equatable {
+    public var budget: Int
+    public var closeTokenIDs: [Int]
+    public var startTokenIDs: [Int]
+    public var leadingTokenIDs: [Int]
+    public var trailingTokenIDs: [Int]
+    public var startsInThinking: Bool
+
+    public init(
+        budget: Int,
+        closeTokenIDs: [Int],
+        startTokenIDs: [Int] = [],
+        leadingTokenIDs: [Int] = [],
+        trailingTokenIDs: [Int] = [],
+        startsInThinking: Bool = true
+    ) {
+        self.budget = max(0, budget)
+        self.closeTokenIDs = closeTokenIDs
+        self.startTokenIDs = startTokenIDs
+        self.leadingTokenIDs = leadingTokenIDs
+        self.trailingTokenIDs = trailingTokenIDs
+        self.startsInThinking = startsInThinking
+    }
+
+    var forceSequence: [Int] {
+        leadingTokenIDs + closeTokenIDs + trailingTokenIDs
+    }
+}
+
+public struct ThinkingBudgetState: Sendable, Equatable {
+    private let configuration: ThinkingBudgetConfiguration
+    private var thinkingTokens = 0
+    private var inThinking: Bool
+    private var forcing = false
+    private var forceIndex = 0
+    private var done = false
+    private var recentCloseTokens: [Int] = []
+    private var recentStartTokens: [Int] = []
+
+    public init(configuration: ThinkingBudgetConfiguration) {
+        self.configuration = configuration
+        self.inThinking = configuration.startsInThinking
+    }
+
+    public var countedThinkingTokens: Int {
+        thinkingTokens
+    }
+
+    public var isInThinking: Bool {
+        inThinking
+    }
+
+    public mutating func nextForcedTokenID() -> Int? {
+        guard !done else { return nil }
+        let sequence = configuration.forceSequence
+        guard !sequence.isEmpty else { return nil }
+        if forcing {
+            guard forceIndex < sequence.count else { return nil }
+            return sequence[forceIndex]
+        }
+        guard inThinking, thinkingTokens >= configuration.budget else { return nil }
+        forcing = true
+        forceIndex = 0
+        recentCloseTokens.removeAll()
+        return sequence[forceIndex]
+    }
+
+    public mutating func advance(tokenID: Int) {
+        if forcing {
+            forceIndex += 1
+            if forceIndex >= configuration.forceSequence.count {
+                forcing = false
+                inThinking = false
+                done = true
+                recentCloseTokens.removeAll()
+            }
+            return
+        }
+
+        if done {
+            detectThinkingStart(tokenID: tokenID)
+            return
+        }
+
+        if detectNaturalClose(tokenID: tokenID) {
+            inThinking = false
+            done = true
+            return
+        }
+
+        if inThinking {
+            thinkingTokens += 1
+        } else {
+            detectThinkingStart(tokenID: tokenID)
+        }
+    }
+
+    private mutating func detectNaturalClose(tokenID: Int) -> Bool {
+        let closeIDs = configuration.closeTokenIDs
+        guard !closeIDs.isEmpty else { return false }
+        recentCloseTokens.append(tokenID)
+        if recentCloseTokens.count > closeIDs.count {
+            recentCloseTokens.removeFirst()
+        }
+        return recentCloseTokens == closeIDs
+    }
+
+    private mutating func detectThinkingStart(tokenID: Int) {
+        let startIDs = configuration.startTokenIDs
+        guard !startIDs.isEmpty else { return }
+        recentStartTokens.append(tokenID)
+        if recentStartTokens.count > startIDs.count {
+            recentStartTokens.removeFirst()
+        }
+        if recentStartTokens == startIDs {
+            inThinking = true
+            done = false
+            thinkingTokens = 0
+            recentCloseTokens.removeAll()
+        }
+    }
+}
+
 public struct SamplingParameters: Sendable, Equatable {
     public var temperature: Float
     public var topP: Float
@@ -15,6 +138,7 @@ public struct SamplingParameters: Sendable, Equatable {
     public var logprobCount: Int?
     public var allowedSequences: [[Int]]?
     public var jsonGrammar: JSONGrammarConfiguration?
+    public var thinkingBudget: ThinkingBudgetConfiguration?
 
     public init(
         temperature: Float = 0,
@@ -30,7 +154,8 @@ public struct SamplingParameters: Sendable, Equatable {
         seed: Int? = nil,
         logprobCount: Int? = nil,
         allowedSequences: [[Int]]? = nil,
-        jsonGrammar: JSONGrammarConfiguration? = nil
+        jsonGrammar: JSONGrammarConfiguration? = nil,
+        thinkingBudget: ThinkingBudgetConfiguration? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
@@ -46,6 +171,7 @@ public struct SamplingParameters: Sendable, Equatable {
         self.logprobCount = logprobCount
         self.allowedSequences = allowedSequences
         self.jsonGrammar = jsonGrammar
+        self.thinkingBudget = thinkingBudget
     }
 
     var hasSamplingFiltersOrPenalties: Bool {
@@ -67,7 +193,27 @@ public enum TokenSampler {
         generatedTokens: [Int] = [],
         jsonGrammarMatcher: JSONGrammarMatcher? = nil
     ) -> MLXArray {
+        var noThinkingBudgetState: ThinkingBudgetState?
+        return sample(
+            logits: logits,
+            parameters: parameters,
+            generatedTokens: generatedTokens,
+            jsonGrammarMatcher: jsonGrammarMatcher,
+            thinkingBudgetState: &noThinkingBudgetState
+        )
+    }
+
+    public static func sample(
+        logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokens: [Int] = [],
+        jsonGrammarMatcher: JSONGrammarMatcher? = nil,
+        thinkingBudgetState: inout ThinkingBudgetState?
+    ) -> MLXArray {
         var logits = logits
+        if let forcedTokenID = thinkingBudgetState?.nextForcedTokenID() {
+            return MLXArray([Int32(forcedTokenID)])
+        }
         if let allowedSequences = parameters.allowedSequences,
             let allowedTokenIDs = allowedNextTokenIDs(
                 allowedSequences: allowedSequences,
