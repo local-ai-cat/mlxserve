@@ -113,7 +113,7 @@ final class RerankTests: XCTestCase {
                 )
             )
         ) { error in
-            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 400)
+            XCTAssertEqual(error as? OpenAIHTTPError, OpenAIHTTPError(status: 400, message: "Documents cannot be empty"))
         }
     }
 
