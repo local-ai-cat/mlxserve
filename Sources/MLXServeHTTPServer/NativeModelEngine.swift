@@ -16,6 +16,8 @@ final class NativeModelEngine: @unchecked Sendable {
     private let engine: MLXServeEngine
     private let parameters: GenerateParameters
     private let eosTokenIds: Set<Int>
+    private let grammarVocabularyLock = NSLock()
+    private var cachedGrammarVocabulary: JSONGrammarVocabulary?
 
     init(
         context: ModelContext,
@@ -146,7 +148,8 @@ final class NativeModelEngine: @unchecked Sendable {
             xtcThreshold: request.xtcThreshold,
             xtcSpecialTokens: xtcSpecialTokens(),
             seed: request.seed,
-            allowedSequences: allowedSequences(from: request.structuredOutput)
+            allowedSequences: allowedSequences(from: request.structuredOutput),
+            jsonGrammar: jsonGrammar(from: request.structuredOutput)
         )
     }
 
@@ -163,8 +166,63 @@ final class NativeModelEngine: @unchecked Sendable {
             xtcThreshold: 0.1,
             xtcSpecialTokens: xtcSpecialTokens(),
             seed: request.seed,
-            allowedSequences: allowedSequences(from: request.structuredOutput)
+            allowedSequences: allowedSequences(from: request.structuredOutput),
+            jsonGrammar: jsonGrammar(from: request.structuredOutput)
         )
+    }
+
+    private func jsonGrammar(from structuredOutput: StructuredOutputSpec) -> JSONGrammarConfiguration? {
+        switch structuredOutput {
+        case .none, .choice:
+            return nil
+        case .jsonObject:
+            return JSONGrammarConfiguration(vocabulary: grammarVocabulary(), schema: .jsonObject)
+        case .jsonSchema(_, let schema):
+            return JSONGrammarConfiguration(
+                vocabulary: grammarVocabulary(),
+                schema: JSONSchemaNode(openAISchema: schema)
+            )
+        }
+    }
+
+    private func grammarVocabulary() -> JSONGrammarVocabulary {
+        grammarVocabularyLock.lock()
+        defer { grammarVocabularyLock.unlock() }
+        if let cachedGrammarVocabulary {
+            return cachedGrammarVocabulary
+        }
+        let vocabulary = buildGrammarVocabulary()
+        cachedGrammarVocabulary = vocabulary
+        return vocabulary
+    }
+
+    private func buildGrammarVocabulary() -> JSONGrammarVocabulary {
+        // The tokenizer protocol exposes no vocabulary size; ids are dense, so scan until a
+        // long run of unmapped ids marks the end. Built once per loaded model, lazily on the
+        // first json_object/json_schema request.
+        let missRunLimit = 2048
+        let hardCap = 1_000_000
+        var tokens: [JSONGrammarToken] = []
+        var consecutiveMisses = 0
+        var id = 0
+        while id < hardCap && consecutiveMisses < missRunLimit {
+            defer { id += 1 }
+            guard context.tokenizer.convertIdToToken(id) != nil else {
+                consecutiveMisses += 1
+                continue
+            }
+            consecutiveMisses = 0
+            if eosTokenIds.contains(id) {
+                tokens.append(JSONGrammarToken(id: id, text: "", isEOS: true))
+                continue
+            }
+            let text = context.tokenizer.decode(tokenIds: [id], skipSpecialTokens: true)
+            // Skip specials (decode to empty) and byte-fragment tokens (replacement char):
+            // masking them keeps constrained output valid UTF-8 JSON.
+            guard !text.isEmpty, !text.contains("\u{FFFD}") else { continue }
+            tokens.append(JSONGrammarToken(id: id, text: text))
+        }
+        return JSONGrammarVocabulary(tokens: tokens)
     }
 
     private func allowedSequences(from structuredOutput: StructuredOutputSpec) -> [[Int]]? {

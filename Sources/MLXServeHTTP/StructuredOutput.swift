@@ -2,27 +2,15 @@ import Foundation
 
 /// Structured output modes observable at the HTTP layer.
 ///
-/// Only `.choice` can be implemented as true constrained decoding in the native
-/// sampler. JSON object/schema modes intentionally represent the omlx fallback:
-/// prompt injection plus a Warning response header when grammar compilation is
-/// unavailable. Grammar and regex requests fail at parse time because this port
-/// does not bind xgrammar.
+/// `.choice`, `.jsonObject`, and `.jsonSchema` all run as true constrained decoding in the
+/// native sampler (choice = prefix trie; json = JSON prefix-grammar token masking, with the
+/// prompt directive kept as a quality hint). Raw grammar and regex requests fail at parse
+/// time because this port does not bind xgrammar.
 public enum StructuredOutputSpec: Sendable, Equatable {
     case none
     case jsonObject
     case jsonSchema(name: String?, schema: [String: OpenAIJSONValue])
     case choice([String])
-
-    public var warningMessage: String? {
-        switch self {
-        case .jsonObject:
-            return "structured output json_object uses prompt-injection fallback; grammar-constrained decoding is unavailable"
-        case .jsonSchema:
-            return "structured output json_schema uses prompt-injection fallback; grammar-constrained decoding is unavailable"
-        case .none, .choice:
-            return nil
-        }
-    }
 }
 
 enum StructuredOutputParser {
