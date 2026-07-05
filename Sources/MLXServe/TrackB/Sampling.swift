@@ -138,6 +138,7 @@ public struct SamplingParameters: Sendable, Equatable {
     public var logprobCount: Int?
     public var allowedSequences: [[Int]]?
     public var jsonGrammar: JSONGrammarConfiguration?
+    public var regexGrammar: RegexGrammarConfiguration?
     public var thinkingBudget: ThinkingBudgetConfiguration?
 
     public init(
@@ -155,6 +156,7 @@ public struct SamplingParameters: Sendable, Equatable {
         logprobCount: Int? = nil,
         allowedSequences: [[Int]]? = nil,
         jsonGrammar: JSONGrammarConfiguration? = nil,
+        regexGrammar: RegexGrammarConfiguration? = nil,
         thinkingBudget: ThinkingBudgetConfiguration? = nil
     ) {
         self.temperature = temperature
@@ -171,6 +173,7 @@ public struct SamplingParameters: Sendable, Equatable {
         self.logprobCount = logprobCount
         self.allowedSequences = allowedSequences
         self.jsonGrammar = jsonGrammar
+        self.regexGrammar = regexGrammar
         self.thinkingBudget = thinkingBudget
     }
 
@@ -191,7 +194,8 @@ public enum TokenSampler {
         logits: MLXArray,
         parameters: SamplingParameters,
         generatedTokens: [Int] = [],
-        jsonGrammarMatcher: JSONGrammarMatcher? = nil
+        jsonGrammarMatcher: JSONGrammarMatcher? = nil,
+        regexGrammarMatcher: RegexGrammarMatcher? = nil
     ) -> MLXArray {
         var noThinkingBudgetState: ThinkingBudgetState?
         return sample(
@@ -199,6 +203,7 @@ public enum TokenSampler {
             parameters: parameters,
             generatedTokens: generatedTokens,
             jsonGrammarMatcher: jsonGrammarMatcher,
+            regexGrammarMatcher: regexGrammarMatcher,
             thinkingBudgetState: &noThinkingBudgetState
         )
     }
@@ -208,6 +213,7 @@ public enum TokenSampler {
         parameters: SamplingParameters,
         generatedTokens: [Int] = [],
         jsonGrammarMatcher: JSONGrammarMatcher? = nil,
+        regexGrammarMatcher: RegexGrammarMatcher? = nil,
         thinkingBudgetState: inout ThinkingBudgetState?
     ) -> MLXArray {
         var logits = logits
@@ -239,6 +245,18 @@ public enum TokenSampler {
             logits = applyAllowedTokenMask(
                 logits,
                 allowedTokenIDs: jsonGrammarMatcher.allowedTokenIDs()
+            )
+        }
+        if let regexGrammarMatcher {
+            if parameters.temperature == 0 && !parameters.hasSamplingFiltersOrPenalties {
+                let candidate = argMax(logits, axis: -1).reshaped([1])
+                if regexGrammarMatcher.accepts(tokenID: candidate.item(Int.self)) {
+                    return candidate
+                }
+            }
+            logits = applyAllowedTokenMask(
+                logits,
+                allowedTokenIDs: regexGrammarMatcher.allowedTokenIDs()
             )
         }
         return sampleUnconstrained(
