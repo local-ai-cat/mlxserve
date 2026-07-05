@@ -73,6 +73,12 @@ export layout.
   `https://github.com/atlas-open-sources/mlx-swift-lm.git` (remote `github`),
   then update mlxserve's `Package.swift` revision pin to the new SHA and run
   the full `swift test`.
+- Execution note: governor model sweep verified both
+  `mlx-community/gemma-4-E2B-it-qat-4bit` and the E4B QAT variant load and
+  generate coherently on this parity branch. Treat M2b as
+  cannot-reproduce/already-fixed after the fork pin; do not chase further.
+  Coverage remains through the fork gated QAT load test plus the recorded
+  mlxserve greedy smoke for both QAT checkpoints.
 - If the mismatch turns out to be quantization-semantics (not naming) and needs
   real dequant work: `NEEDS_INPUT` with your diagnosis instead of hacking.
 
