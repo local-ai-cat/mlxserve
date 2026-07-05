@@ -43,6 +43,28 @@ final class JSONGrammarMatcherTests: XCTestCase {
         XCTAssertTrue(matcher.isComplete)
     }
 
+    func testSurrogatePairEscapesSpanTokensAndSurviveBucketPruning() {
+        let matcher = JSONGrammarConfiguration(tokens: Self.tokens, schema: .jsonObject)
+            .makeMatcher()
+        for token in ["{", "\"name\"", ":"] {
+            matcher.advance(tokenID: Self.id(token))
+        }
+
+        // `"\uD83D` — a complete high surrogate awaiting its low half — is a legal prefix.
+        XCTAssertTrue(matcher.accepts(tokenID: Self.id("\"\\uD83D")))
+        matcher.advance(tokenID: Self.id("\"\\uD83D"))
+
+        // The continuation `\uDE00"` (low surrogate + close quote) must be reachable and
+        // must survive bucket pruning (probe `…\uD83D\` is incomplete, not invalid).
+        XCTAssertTrue(matcher.accepts(tokenID: Self.id("\\uDE00\"")))
+        XCTAssertTrue(matcher.allowedTokenIDs().contains(Self.id("\\uDE00\"")))
+
+        // A lone low surrogate is never a valid escape.
+        matcher.advance(tokenID: Self.id("\\uDE00\""))
+        matcher.advance(tokenID: Self.id("}"))
+        XCTAssertTrue(matcher.isComplete)
+    }
+
     func testGrammarWithTruncationFiltersMasksBeforeSampling() throws {
         try MLXMetalRuntime.requireAvailable()
 
@@ -230,6 +252,8 @@ final class JSONGrammarMatcherTests: XCTestCase {
         ("null", 18),
         ("\"\\", 19),
         ("u0041\"", 20),
+        ("\"\\uD83D", 21),
+        ("\\uDE00\"", 22),
     ]
 
     private static let tokens = tokenTable.map { text, id in

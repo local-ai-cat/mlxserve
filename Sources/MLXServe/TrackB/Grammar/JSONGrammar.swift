@@ -608,28 +608,72 @@ private struct JSONPrefixParser {
         case "t":
             return .complete("\t", cursor)
         case "u":
-            var scalar = ""
-            for _ in 0..<4 {
-                guard cursor < text.endIndex else {
-                    // A `\u` escape truncated by the end of text is a valid *prefix* —
-                    // the missing hex digits can still arrive in a later token. Treating
-                    // this as invalid would (via bucket pruning) mask every token that
-                    // continues the escape.
-                    return .incomplete
+            switch hexEscapeValue(cursor: &cursor) {
+            case .complete(let value, _):
+                if (0xD800...0xDBFF).contains(value) {
+                    return lowSurrogate(after: value, cursor: &cursor)
                 }
-                guard text[cursor].isHexDigit else {
+                guard !(0xDC00...0xDFFF).contains(value), let unicodeScalar = UnicodeScalar(value) else {
                     return .invalid
                 }
-                scalar.append(text[cursor])
-                cursor = text.index(after: cursor)
+                return .complete(Character(unicodeScalar), cursor)
+            case .incomplete:
+                return .incomplete
+            case .invalid:
+                return .invalid
             }
-            guard let value = UInt32(scalar, radix: 16),
-                let unicodeScalar = UnicodeScalar(value)
-            else {
+        default:
+            return .invalid
+        }
+    }
+
+    /// Parses the four hex digits of a `\u` escape. Truncation by the end of text is a
+    /// valid *prefix* — the missing digits can still arrive in a later token; treating it
+    /// as invalid would (via bucket pruning) mask every token that continues the escape.
+    private func hexEscapeValue(cursor: inout String.Index) -> JSONParseResult<UInt32> {
+        var scalar = ""
+        for _ in 0..<4 {
+            guard cursor < text.endIndex else {
+                return .incomplete
+            }
+            guard text[cursor].isHexDigit else {
+                return .invalid
+            }
+            scalar.append(text[cursor])
+            cursor = text.index(after: cursor)
+        }
+        guard let value = UInt32(scalar, radix: 16) else {
+            return .invalid
+        }
+        return .complete(value, cursor)
+    }
+
+    /// A high surrogate must be followed by a `\uDC00`–`\uDFFF` escape (JSON encodes
+    /// non-BMP characters as surrogate pairs). Truncation anywhere inside the second
+    /// escape is an incomplete prefix, not an error.
+    private func lowSurrogate(after highSurrogate: UInt32, cursor: inout String.Index) -> JSONParseResult<Character> {
+        for expected in ["\\", "u"] as [Character] {
+            guard cursor < text.endIndex else {
+                return .incomplete
+            }
+            guard text[cursor] == expected else {
+                return .invalid
+            }
+            cursor = text.index(after: cursor)
+        }
+        switch hexEscapeValue(cursor: &cursor) {
+        case .complete(let lowValue, _):
+            guard (0xDC00...0xDFFF).contains(lowValue) else {
+                return .invalid
+            }
+            let combined = 0x10000 + ((highSurrogate - 0xD800) << 10) + (lowValue - 0xDC00)
+            guard let unicodeScalar = UnicodeScalar(combined) else {
                 return .invalid
             }
             return .complete(Character(unicodeScalar), cursor)
-        default:
+        case .incomplete:
+            return .incomplete
+        case .invalid:
             return .invalid
         }
     }
