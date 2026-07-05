@@ -11,13 +11,17 @@ struct MLXServeHTTPServerMain {
     static func main() async throws {
         let config = try ServerConfig.parse(CommandLine.arguments)
         let modelRootURL = URL(fileURLWithPath: config.modelPath, isDirectory: true)
-        let discovered = try applyModelIDOverrideIfNeeded(
+        let allDiscovered = try applyModelIDOverrideIfNeeded(
             try ModelDiscovery.discoverModels(in: modelRootURL),
             override: config.modelID
         )
-        guard !discovered.isEmpty else {
+        guard !allDiscovered.isEmpty else {
             throw ServerConfigError.invalidArgument("no models discovered in \(config.modelPath)")
         }
+        let rerankDiscovered = allDiscovered.filter {
+            NativeRerankBackend.isRerankModelDirectory($0.value.modelURL)
+        }
+        let discovered = allDiscovered.filter { rerankDiscovered[$0.key] == nil }
 
         // M5 embeddings: a separate model class, NOT part of the LLM pool.
         let embeddingBackend: NativeEmbeddingsBackend?
@@ -34,6 +38,7 @@ struct MLXServeHTTPServerMain {
         } else {
             embeddingBackend = nil
         }
+        let rerankBackend = rerankDiscovered.isEmpty ? nil : NativeRerankBackend(models: rerankDiscovered)
 
         let effectiveCeiling = finalMemoryCeiling(
             overrideBytes: config.memoryCeilingBytes,
@@ -52,7 +57,8 @@ struct MLXServeHTTPServerMain {
         let backend = PoolBackedChatBackend(
             pool: pool,
             modelIDs: Array(discovered.keys),
-            embeddingsBackend: embeddingBackend
+            embeddingsBackend: embeddingBackend,
+            rerankBackend: rerankBackend
         )
         let mcpManager: MCPManager?
         if let mcpConfigPath = config.mcpConfigPath {
@@ -74,7 +80,7 @@ struct MLXServeHTTPServerMain {
 
         try await server.start()
         print("MLXServeHTTP listening on http://\(config.host):\(config.port)")
-        print("Discovered \(discovered.count) model(s); memory ceiling: \(ModelDiscovery.formatSize(effectiveCeiling.bytes)) (\(effectiveCeiling.source))")
+        print("Discovered \(allDiscovered.count) model(s) (\(discovered.count) chat, \(rerankDiscovered.count) rerank); memory ceiling: \(ModelDiscovery.formatSize(effectiveCeiling.bytes)) (\(effectiveCeiling.source))")
         fflush(stdout)
         server.waitForever()
     }
