@@ -55,8 +55,12 @@ public struct OpenAIRerankRequest: Sendable, Equatable {
 
         let query = try parseText(object["query"])
         let documents = try parseDocuments(object["documents"])
-        guard !query.text.isEmpty else { throw OpenAIServerError.invalidRequest }
-        guard !documents.isEmpty else { throw OpenAIServerError.invalidRequest }
+        guard !query.text.isEmpty else {
+            throw OpenAIHTTPError(status: 400, message: "Query cannot be empty")
+        }
+        guard !documents.isEmpty else {
+            throw OpenAIHTTPError(status: 400, message: "Documents cannot be empty")
+        }
 
         let topN = openAIIntValue(object["top_n"])
         if let topN, topN <= 0 {
