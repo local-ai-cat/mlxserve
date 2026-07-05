@@ -2,10 +2,11 @@ import Foundation
 import MLXServe
 import MLXServeHTTP
 
-final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIHealthProviding, @unchecked Sendable
+final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, OpenAIHealthProviding, @unchecked Sendable
 where Loader.Engine == NativeModelEngine {
     let models: [OpenAIModelInfo]
     var embeddingModels: [OpenAIModelInfo] { embeddingsBackend?.embeddingModels ?? [] }
+    var rerankModels: [OpenAIModelInfo] { rerankBackend?.rerankModels ?? [] }
     var healthInfo: OpenAIHealthInfo {
         OpenAIHealthInfo(
             defaultModel: models.first?.id,
@@ -15,14 +16,17 @@ where Loader.Engine == NativeModelEngine {
 
     private let pool: EnginePool<Loader>
     private let embeddingsBackend: (any OpenAIEmbeddingsBackend)?
+    private let rerankBackend: (any OpenAIRerankBackend)?
 
     init(
         pool: EnginePool<Loader>,
         modelIDs: [String],
-        embeddingsBackend: (any OpenAIEmbeddingsBackend)? = nil
+        embeddingsBackend: (any OpenAIEmbeddingsBackend)? = nil,
+        rerankBackend: (any OpenAIRerankBackend)? = nil
     ) {
         self.pool = pool
         self.embeddingsBackend = embeddingsBackend
+        self.rerankBackend = rerankBackend
         self.models = modelIDs.sorted().map { OpenAIModelInfo(id: $0, maxModelLength: nil) }
     }
 
@@ -80,6 +84,13 @@ where Loader.Engine == NativeModelEngine {
             throw OpenAIHTTPError(status: 404, message: "embeddings backend unavailable")
         }
         return try await embeddingsBackend.embed(request)
+    }
+
+    func rerank(_ request: OpenAIRerankRequest) async throws -> OpenAIRerankResult {
+        guard let rerankBackend else {
+            throw OpenAIHTTPError(status: 404, message: "rerank backend unavailable")
+        }
+        return try await rerankBackend.rerank(request)
     }
 
     func modelPoolStatus() async throws -> OpenAIModelPoolStatus {
