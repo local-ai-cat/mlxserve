@@ -171,24 +171,38 @@ final class StructuredOutputTests: XCTestCase {
         }
     }
 
-    func testStructuredOutputsGrammarAndRegexThrowBadRequest() {
-        for type in ["grammar", "regex"] {
-            XCTAssertThrowsError(
-                try OpenAIChatRequest.parse(
-                    Data(
-                        """
-                        {
-                          "model": "test-model",
-                          "messages": [{"role": "user", "content": "hello"}],
-                          "structured_outputs": {"type": "\(type)"}
-                        }
-                        """.utf8
-                    )
+    func testStructuredOutputsGrammarThrowsBadRequest() {
+        XCTAssertThrowsError(
+            try OpenAIChatRequest.parse(
+                Data(
+                    """
+                    {
+                      "model": "test-model",
+                      "messages": [{"role": "user", "content": "hello"}],
+                      "structured_outputs": {"type": "grammar"}
+                    }
+                    """.utf8
                 )
-            ) { error in
-                XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 400)
-            }
+            )
+        ) { error in
+            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 400)
         }
+    }
+
+    func testStructuredOutputsRegexParsesPattern() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "structured_outputs": {"type": "regex", "pattern": "[A-Z]{2}"}
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(request.structuredOutput, .regex(pattern: "[A-Z]{2}"))
     }
 
     func testCompletionRequestParsesStructuredOutputsChoice() throws {
