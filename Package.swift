@@ -76,6 +76,7 @@ let package = Package(
             dependencies: [
                 "MLXServe",
                 "MLXServeHTTP",
+                "MLXServeHTTPServer",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),

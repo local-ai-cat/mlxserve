@@ -151,10 +151,6 @@ public struct OpenAIChatRequest: Sendable {
         self.tools = tools
         self.toolChoice = toolChoice
     }
-
-    public var structuredOutputWarning: String? {
-        structuredOutput.warningMessage
-    }
 }
 
 public struct OpenAIChatChunk: Sendable {
@@ -531,15 +527,12 @@ public final class OpenAIServer: @unchecked Sendable {
         var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
         var thinkingParser = ThinkingParser()
         var stoppedByTextStop = false
-        var header = "HTTP/1.1 200 OK\r\n"
+        let header = "HTTP/1.1 200 OK\r\n"
             + "Content-Type: text/event-stream\r\n"
             + "Cache-Control: no-cache\r\n"
             + "Connection: close\r\n"
             + "X-Accel-Buffering: no\r\n"
-        if let warning = structuredOutputWarningHeaderValue(for: request) {
-            header += "Warning: \(warning)\r\n"
-        }
-        header += "\r\n"
+            + "\r\n"
 
         try await connection.send(
             data: Data(header.utf8)
@@ -910,7 +903,6 @@ public final class OpenAIServer: @unchecked Sendable {
                 ),
             ],
             status: 200,
-            headers: structuredOutputWarningHeaders(for: request),
             connection: connection
         )
     }
@@ -986,18 +978,6 @@ public final class OpenAIServer: @unchecked Sendable {
         try await connection.send(data: Data(line.utf8))
     }
 
-    private func structuredOutputWarningHeaders(for request: OpenAIChatRequest) -> [String: String] {
-        guard let value = structuredOutputWarningHeaderValue(for: request) else { return [:] }
-        return ["Warning": value]
-    }
-
-    private func structuredOutputWarningHeaderValue(for request: OpenAIChatRequest) -> String? {
-        guard let message = request.structuredOutputWarning else { return nil }
-        let escaped = message
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        return "199 - \"\(escaped)\""
-    }
 
     private func sendParserDelta(
         _ delta: (reasoning: String, content: String),

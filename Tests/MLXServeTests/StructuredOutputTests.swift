@@ -19,7 +19,6 @@ final class StructuredOutputTests: XCTestCase {
         )
 
         XCTAssertEqual(request.structuredOutput, .jsonObject)
-        XCTAssertNotNil(request.structuredOutputWarning)
     }
 
     func testChatResponseFormatJSONSchemaParsesToStructuredOutputSpec() throws {
@@ -60,7 +59,6 @@ final class StructuredOutputTests: XCTestCase {
                 ]
             )
         )
-        XCTAssertNotNil(request.structuredOutputWarning)
     }
 
     func testChatResponseFormatTextIsNoOp() throws {
@@ -77,7 +75,6 @@ final class StructuredOutputTests: XCTestCase {
         )
 
         XCTAssertEqual(request.structuredOutput, .none)
-        XCTAssertNil(request.structuredOutputWarning)
     }
 
     func testStructuredOutputsChoiceParses() throws {
@@ -97,7 +94,6 @@ final class StructuredOutputTests: XCTestCase {
         )
 
         XCTAssertEqual(request.structuredOutput, .choice(["yes", "no"]))
-        XCTAssertNil(request.structuredOutputWarning)
     }
 
     func testStructuredOutputsPrecedeResponseFormat() throws {
@@ -118,7 +114,6 @@ final class StructuredOutputTests: XCTestCase {
         )
 
         XCTAssertEqual(request.structuredOutput, .choice(["yes", "no"]))
-        XCTAssertNil(request.structuredOutputWarning)
     }
 
     func testStructuredOutputsJSONMapsToJSONObjectFallback() throws {
@@ -135,7 +130,6 @@ final class StructuredOutputTests: XCTestCase {
         )
 
         XCTAssertEqual(request.structuredOutput, .jsonObject)
-        XCTAssertNotNil(request.structuredOutputWarning)
     }
 
     func testStructuredOutputsEmptyChoiceThrowsBadRequest() {
