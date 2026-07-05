@@ -367,6 +367,12 @@ public final class OpenAIServer: @unchecked Sendable {
                     return
                 }
                 try await EmbeddingsHandler(backend: embeddingsBackend).handleEmbeddings(request, connection: connection)
+            case ("POST", "/v1/rerank"):
+                guard let rerankBackend = backend as? any OpenAIRerankBackend else {
+                    try await sendJSON(openAIErrorBody(message: "rerank backend unavailable", status: 404), status: 404, connection: connection)
+                    return
+                }
+                try await RerankHandler(backend: rerankBackend).handleRerank(request, connection: connection)
             case ("POST", "/v1/audio/transcriptions"):
                 guard let audioBackend = backend as? any AudioTranscriptionBackend, !audioBackend.transcriptionModels.isEmpty else {
                     try await sendJSON(
@@ -932,9 +938,17 @@ public final class OpenAIServer: @unchecked Sendable {
     }
 
     private func modelsResponse() -> [String: Any] {
-        [
+        var models = backend.models
+        if let embeddingsBackend = backend as? any OpenAIEmbeddingsBackend {
+            models.append(contentsOf: embeddingsBackend.embeddingModels)
+        }
+        if let rerankBackend = backend as? any OpenAIRerankBackend {
+            models.append(contentsOf: rerankBackend.rerankModels)
+        }
+
+        return [
             "object": "list",
-            "data": backend.models.map { model in
+            "data": models.map { model in
                 var payload: [String: Any] = [
                     "id": model.id,
                     "object": "model",
