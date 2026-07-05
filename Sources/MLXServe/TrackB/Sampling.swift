@@ -78,18 +78,17 @@ public enum TokenSampler {
             logits = applyAllowedTokenMask(logits, allowedTokenIDs: allowedTokenIDs)
         }
         if let jsonGrammarMatcher {
-            // Rejection fast path: validating one sampled candidate costs a single prefix
-            // parse; the full vocabulary mask costs one per token. Models mostly emit
-            // grammar-valid JSON, so try the unconstrained draw first. Resampling from the
-            // masked distribution on rejection keeps the constrained distribution exact:
-            // p(t) + (1-Z)·(p(t)/Z) = p(t)/Z.
-            let candidate = sampleUnconstrained(
-                logits: logits,
-                parameters: parameters,
-                generatedTokens: generatedTokens
-            )
-            if jsonGrammarMatcher.accepts(tokenID: candidate.item(Int.self)) {
-                return candidate
+            // Rejection fast path, greedy only: validating the argmax candidate costs a
+            // single prefix parse; the full vocabulary mask costs one per token. Restricted
+            // to temp-0 with no filters because there it is trivially exact (a valid argmax
+            // equals the masked argmax). With truncation filters (top-p/k/min-p/xtc) or
+            // temperature the retry would sample from a differently-truncated candidate
+            // set, skewing the constrained distribution — those always mask first.
+            if parameters.temperature == 0 && !parameters.hasSamplingFiltersOrPenalties {
+                let candidate = argMax(logits, axis: -1).reshaped([1])
+                if jsonGrammarMatcher.accepts(tokenID: candidate.item(Int.self)) {
+                    return candidate
+                }
             }
             logits = applyAllowedTokenMask(
                 logits,

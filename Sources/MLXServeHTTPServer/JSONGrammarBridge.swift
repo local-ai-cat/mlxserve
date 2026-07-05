@@ -40,7 +40,17 @@ extension JSONSchemaNode {
 
         var additionalPropertiesAllowed = true
         if case .bool(false)? = schema["additionalProperties"] {
-            additionalPropertiesAllowed = false
+            // Keywords we don't implement can widen the allowed key set beyond
+            // `properties` (patternProperties keys, combinator branches, $ref targets).
+            // Enforcing additionalProperties:false alongside them would forbid keys the
+            // schema allows — keep the key set open whenever any are present.
+            let keySetWideningKeywords = [
+                "patternProperties", "propertyNames", "unevaluatedProperties",
+                "anyOf", "oneOf", "allOf", "if", "$ref",
+            ]
+            if keySetWideningKeywords.allSatisfy({ schema[$0] == nil }) {
+                additionalPropertiesAllowed = false
+            }
         }
 
         return .schema(

@@ -474,10 +474,14 @@ private struct JSONPrefixParser {
                 guard cursor < text.endIndex else {
                     return prefixAllowed(value, allowedPrefixes: allowedPrefixes) ? .incomplete : .invalid
                 }
-                guard let escaped = escapedCharacter(at: cursor, cursor: &cursor) else {
+                switch escapedCharacter(at: cursor, cursor: &cursor) {
+                case .complete(let escaped, _):
+                    value.append(escaped)
+                case .incomplete:
+                    return prefixAllowed(value, allowedPrefixes: allowedPrefixes) ? .incomplete : .invalid
+                case .invalid:
                     return .invalid
                 }
-                value.append(escaped)
             } else {
                 guard character >= " " else {
                     return .invalid
@@ -587,30 +591,34 @@ private struct JSONPrefixParser {
         return .complete(JSONParsedValue(kind: kind, literal: literal), end)
     }
 
-    private func escapedCharacter(at index: String.Index, cursor: inout String.Index) -> Character? {
+    private func escapedCharacter(at index: String.Index, cursor: inout String.Index) -> JSONParseResult<Character> {
         let character = text[index]
         cursor = text.index(after: index)
         switch character {
         case "\"", "\\", "/":
-            return character
+            return .complete(character, cursor)
         case "b":
-            return "\u{08}"
+            return .complete("\u{08}", cursor)
         case "f":
-            return "\u{0C}"
+            return .complete("\u{0C}", cursor)
         case "n":
-            return "\n"
+            return .complete("\n", cursor)
         case "r":
-            return "\r"
+            return .complete("\r", cursor)
         case "t":
-            return "\t"
+            return .complete("\t", cursor)
         case "u":
             var scalar = ""
             for _ in 0..<4 {
                 guard cursor < text.endIndex else {
-                    return nil
+                    // A `\u` escape truncated by the end of text is a valid *prefix* —
+                    // the missing hex digits can still arrive in a later token. Treating
+                    // this as invalid would (via bucket pruning) mask every token that
+                    // continues the escape.
+                    return .incomplete
                 }
                 guard text[cursor].isHexDigit else {
-                    return nil
+                    return .invalid
                 }
                 scalar.append(text[cursor])
                 cursor = text.index(after: cursor)
@@ -618,11 +626,11 @@ private struct JSONPrefixParser {
             guard let value = UInt32(scalar, radix: 16),
                 let unicodeScalar = UnicodeScalar(value)
             else {
-                return nil
+                return .invalid
             }
-            return Character(unicodeScalar)
+            return .complete(Character(unicodeScalar), cursor)
         default:
-            return nil
+            return .invalid
         }
     }
 

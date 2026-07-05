@@ -21,6 +21,47 @@ final class JSONGrammarMatcherTests: XCTestCase {
         XCTAssertTrue(matcher.allowedTokenIDs().contains(Self.eosID))
     }
 
+    func testTruncatedUnicodeEscapeIsIncompleteNotInvalid() {
+        let matcher = JSONGrammarConfiguration(tokens: Self.tokens, schema: .jsonObject)
+            .makeMatcher()
+        for token in ["{", "\"name\"", ":"] {
+            matcher.advance(tokenID: Self.id(token))
+        }
+
+        // Token ends mid-escape: `"\` — must be a legal prefix state.
+        XCTAssertTrue(matcher.accepts(tokenID: Self.id("\"\\")))
+        matcher.advance(tokenID: Self.id("\"\\"))
+
+        // Continuing the escape (`u0041"`) must stay reachable — and, critically, must
+        // survive bucket pruning: the one-character probe `…"\u` is an incomplete escape,
+        // not an invalid one.
+        XCTAssertTrue(matcher.accepts(tokenID: Self.id("u0041\"")))
+        XCTAssertTrue(matcher.allowedTokenIDs().contains(Self.id("u0041\"")))
+
+        matcher.advance(tokenID: Self.id("u0041\""))
+        matcher.advance(tokenID: Self.id("}"))
+        XCTAssertTrue(matcher.isComplete)
+    }
+
+    func testGrammarWithTruncationFiltersMasksBeforeSampling() throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        let matcher = JSONGrammarConfiguration(tokens: Self.tokens, schema: .jsonObject)
+            .makeMatcher()
+        // topK=1 with an invalid argmax: the fast path must NOT run (filters active);
+        // masking first leaves "{" as the sole survivor of the truncation.
+        var logits = [Float](repeating: -10, count: 20)
+        logits[3] = 99
+        logits[1] = 5
+        let sampled = TokenSampler.sample(
+            logits: MLXArray(logits),
+            parameters: SamplingParameters(temperature: 0.7, topK: 1),
+            jsonGrammarMatcher: matcher
+        )
+
+        XCTAssertEqual(sampled.item(Int.self), 1)
+    }
+
     func testGrammarMaskConstrainsGreedyArgmaxWhenCandidateIsInvalid() throws {
         try MLXMetalRuntime.requireAvailable()
 
@@ -187,6 +228,8 @@ final class JSONGrammarMatcherTests: XCTestCase {
         ("1", 16),
         ("true", 17),
         ("null", 18),
+        ("\"\\", 19),
+        ("u0041\"", 20),
     ]
 
     private static let tokens = tokenTable.map { text, id in

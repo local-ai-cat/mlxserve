@@ -80,6 +80,17 @@ final class JSONGrammarBridgeTests: XCTestCase {
             .schema(JSONSchema())
         )
 
+        // patternProperties can allow keys beyond `properties`; enforcing
+        // additionalProperties:false alongside it would forbid them.
+        XCTAssertEqual(
+            JSONSchemaNode(openAISchema: [
+                "type": .string("object"),
+                "patternProperties": .object(["^x_": .object([:])]),
+                "additionalProperties": .bool(false),
+            ]),
+            .schema(JSONSchema(allowedTypes: [.object]))
+        )
+
         // Non-object subschema (e.g. boolean "items": true) degrades to .any.
         XCTAssertEqual(
             JSONSchemaNode(openAISchema: [
