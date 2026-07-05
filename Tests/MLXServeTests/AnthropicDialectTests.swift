@@ -78,6 +78,51 @@ final class AnthropicDialectTests: XCTestCase {
         XCTAssertEqual(chatRequest.maxTokens, 64)
         XCTAssertEqual(chatRequest.stop, ["END"])
         XCTAssertEqual(chatRequest.enableThinking, true)
+        XCTAssertNotNil(chatRequest.tools)
+        XCTAssertEqual(chatRequest.toolChoice, .function("lookup"))
+    }
+
+    func testMessagesRequestConvertsAnthropicToolsAndToolChoice() throws {
+        let toolRequest = try anthropicRequestWithToolChoice(
+            """
+            {"type": "tool", "name": "get_weather"}
+            """
+        )
+        let toolChatRequest = toolRequest.openAIRequest()
+
+        XCTAssertEqual(toolChatRequest.toolChoice, .function("get_weather"))
+        let tools = try XCTUnwrap(toolChatRequest.tools)
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(
+            tools[0],
+            .object(
+                [
+                    "type": .string("function"),
+                    "function": .object(
+                        [
+                            "name": .string("get_weather"),
+                            "description": .string("Get weather"),
+                            "parameters": .object(
+                                [
+                                    "type": .string("object"),
+                                    "properties": .object(
+                                        [
+                                            "city": .object(["type": .string("string")])
+                                        ]
+                                    ),
+                                ]
+                            ),
+                        ]
+                    ),
+                ]
+            )
+        )
+
+        let anyRequest = try anthropicRequestWithToolChoice(#"{"type": "any"}"#)
+        XCTAssertEqual(anyRequest.openAIRequest().toolChoice, .required)
+
+        let autoRequest = try anthropicRequestWithToolChoice(#"{"type": "auto"}"#)
+        XCTAssertEqual(autoRequest.openAIRequest().toolChoice, .auto)
     }
 
     func testMessagesRequestParsesSystemArrayAndContentBlocks() throws {
@@ -151,6 +196,32 @@ final class AnthropicDialectTests: XCTestCase {
         XCTAssertEqual(usage["output_tokens"], 3)
     }
 
+    func testBuildAnthropicMessageResponseEmitsToolUseBlock() throws {
+        let request = try anthropicRequestWithToolChoice(#"{"type": "auto"}"#)
+        let completion = AnthropicBufferedCompletion(
+            text: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#,
+            completionTokens: 3,
+            finishReason: "stop",
+            stoppedByTextStop: false,
+            stopSequence: nil
+        )
+
+        let response = buildAnthropicMessageResponse(
+            request: request,
+            completion: completion,
+            promptTokens: 5,
+            id: "msg_test"
+        )
+
+        XCTAssertEqual(response["stop_reason"] as? String, "tool_use")
+        let content = try XCTUnwrap(response["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1)
+        XCTAssertEqual(content[0]["type"] as? String, "tool_use")
+        XCTAssertEqual(content[0]["name"] as? String, "get_weather")
+        let input = try XCTUnwrap(content[0]["input"] as? [String: Any])
+        XCTAssertEqual(input["city"] as? String, "Paris")
+    }
+
     func testStreamingFormatterEventOrderForThinkingThenText() {
         var formatter = AnthropicStreamFormatter(
             id: "msg_test",
@@ -203,5 +274,78 @@ final class AnthropicDialectTests: XCTestCase {
         let delta = try XCTUnwrap(events.first { $0.name == "message_delta" }?.payload["delta"] as? [String: Any])
         XCTAssertEqual(delta["stop_reason"] as? String, "stop_sequence")
         XCTAssertEqual(delta["stop_sequence"] as? String, "END")
+    }
+
+    func testStreamingFormatterEmitsToolUseBlock() throws {
+        var formatter = AnthropicStreamFormatter(
+            id: "msg_test",
+            model: "test-model",
+            promptTokens: 5,
+            stopSequences: [],
+            toolsRequested: true
+        )
+
+        var events = formatter.startEvents()
+        events.append(
+            contentsOf: formatter.feed(
+                OpenAIChatChunk(
+                    text: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#,
+                    tokenID: 1,
+                    finishReason: "stop"
+                )
+            )
+        )
+        events.append(contentsOf: formatter.finishEvents())
+
+        XCTAssertEqual(
+            events.map(\.name),
+            [
+                "message_start",
+                "ping",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        )
+
+        let toolBlock = try XCTUnwrap(events[2].payload["content_block"] as? [String: Any])
+        XCTAssertEqual(toolBlock["type"] as? String, "tool_use")
+        XCTAssertEqual(toolBlock["name"] as? String, "get_weather")
+
+        let delta = try XCTUnwrap(events[3].payload["delta"] as? [String: Any])
+        XCTAssertEqual(delta["type"] as? String, "input_json_delta")
+        XCTAssertEqual(delta["partial_json"] as? String, #"{"city":"Paris"}"#)
+
+        let messageDelta = try XCTUnwrap(events[5].payload["delta"] as? [String: Any])
+        XCTAssertEqual(messageDelta["stop_reason"] as? String, "tool_use")
+    }
+
+    private func anthropicRequestWithToolChoice(_ toolChoice: String) throws -> AnthropicMessagesRequest {
+        try AnthropicMessagesRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "max_tokens": 16,
+                  "messages": [{"role": "user", "content": "weather"}],
+                  "tools": [
+                    {
+                      "name": "get_weather",
+                      "description": "Get weather",
+                      "input_schema": {
+                        "type": "object",
+                        "properties": {
+                          "city": {"type": "string"}
+                        }
+                      }
+                    }
+                  ],
+                  "tool_choice": \(toolChoice)
+                }
+                """.utf8
+            )
+        )
     }
 }

@@ -57,7 +57,8 @@ struct AnthropicMessagesHandler {
             id: "msg_\(UUID().uuidString.prefix(8))",
             model: request.model,
             promptTokens: stream.promptTokens,
-            stopSequences: request.stopSequences
+            stopSequences: request.stopSequences,
+            toolsRequested: request.tools != nil
         )
         for event in formatter.startEvents() {
             try await sendSSE(event, connection: connection)

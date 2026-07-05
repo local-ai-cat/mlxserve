@@ -11,6 +11,8 @@ public struct AnthropicMessagesRequest {
     public let topK: Int
     public let enableThinking: Bool?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
+    public let tools: [OpenAIJSONValue]?
+    public let toolChoice: OpenAIToolChoice?
 
     public static func parse(_ body: Data) throws -> AnthropicMessagesRequest {
         let parsed = try anthropicParsedBase(body)
@@ -41,7 +43,9 @@ public struct AnthropicMessagesRequest {
             topP: anthropicFloatValue(object["top_p"]) ?? 0,
             topK: anthropicIntValue(object["top_k"]) ?? 0,
             enableThinking: enableThinking,
-            chatTemplateKwargs: try anthropicChatTemplateKwargs(from: object)
+            chatTemplateKwargs: try anthropicChatTemplateKwargs(from: object),
+            tools: try anthropicOpenAITools(from: object["tools"]),
+            toolChoice: try anthropicToolChoice(from: object["tool_choice"])
         )
     }
 
@@ -56,7 +60,9 @@ public struct AnthropicMessagesRequest {
             stop: stopSequences,
             stream: stream ?? self.stream,
             enableThinking: enableThinking,
-            chatTemplateKwargs: chatTemplateKwargs
+            chatTemplateKwargs: chatTemplateKwargs,
+            tools: tools,
+            toolChoice: toolChoice
         )
     }
 
@@ -196,13 +202,22 @@ public struct AnthropicStreamFormatter {
     private var finishReason = "length"
     private var stoppedByTextStop = false
     private var stopSequence: String?
+    private let toolsRequested: Bool
+    private var bufferedContent = ""
 
-    public init(id: String, model: String, promptTokens: Int, stopSequences: [String]) {
+    public init(
+        id: String,
+        model: String,
+        promptTokens: Int,
+        stopSequences: [String],
+        toolsRequested: Bool = false
+    ) {
         self.id = id
         self.model = model
         self.promptTokens = promptTokens
         self.stopSequences = stopSequences
         self.stopMatcher = AnthropicStopSequenceMatcher(stopSequences: stopSequences)
+        self.toolsRequested = toolsRequested
     }
 
     public mutating func startEvents() -> [AnthropicSSEEvent] {
@@ -259,6 +274,28 @@ public struct AnthropicStreamFormatter {
         }
 
         events.append(contentsOf: parserEvents(for: thinkingParser.finish()))
+        if toolsRequested {
+            let parsed = parseToolCalls(from: bufferedContent)
+            if !parsed.toolCalls.isEmpty {
+                if let activeBlock {
+                    events.append(blockStop(index: activeBlock.index))
+                    self.activeBlock = nil
+                }
+                if !parsed.content.isEmpty {
+                    events.append(contentsOf: deltaEvents(kind: .text, text: parsed.content))
+                    if let activeBlock {
+                        events.append(blockStop(index: activeBlock.index))
+                        self.activeBlock = nil
+                    }
+                }
+                events.append(contentsOf: toolUseEvents(from: parsed.toolCalls))
+                finishReason = "tool_use"
+                stoppedByTextStop = false
+                stopSequence = nil
+            } else if !bufferedContent.isEmpty {
+                events.append(contentsOf: deltaEvents(kind: .text, text: bufferedContent))
+            }
+        }
         if let activeBlock {
             events.append(blockStop(index: activeBlock.index))
             self.activeBlock = nil
@@ -290,7 +327,50 @@ public struct AnthropicStreamFormatter {
             events.append(contentsOf: deltaEvents(kind: .thinking, text: delta.reasoning))
         }
         if !delta.content.isEmpty {
+            if toolsRequested {
+                // Tool-call parsers need the complete content; buffer text so raw tool syntax is never streamed.
+                bufferedContent += delta.content
+                return events
+            }
             events.append(contentsOf: deltaEvents(kind: .text, text: delta.content))
+        }
+        return events
+    }
+
+    private mutating func toolUseEvents(from toolCalls: [ParsedToolCall]) -> [AnthropicSSEEvent] {
+        var events: [AnthropicSSEEvent] = []
+        for toolCall in toolCalls {
+            let index = nextBlockIndex
+            nextBlockIndex += 1
+            events.append(
+                AnthropicSSEEvent(
+                    name: "content_block_start",
+                    payload: [
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": [
+                            "type": "tool_use",
+                            "id": toolCall.id,
+                            "name": toolCall.name,
+                            "input": [String: Any](),
+                        ],
+                    ]
+                )
+            )
+            events.append(
+                AnthropicSSEEvent(
+                    name: "content_block_delta",
+                    payload: [
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": [
+                            "type": "input_json_delta",
+                            "partial_json": toolCall.arguments,
+                        ],
+                    ]
+                )
+            )
+            events.append(blockStop(index: index))
         }
         return events
     }
@@ -356,12 +436,25 @@ public func buildAnthropicMessageResponse(
     id: String = "msg_\(UUID().uuidString.prefix(8))"
 ) -> [String: Any] {
     let extracted = extractThinking(completion.text)
+    let parsed = request.tools == nil
+        ? ToolCallParseResult(content: extracted.content, toolCalls: [])
+        : parseToolCalls(from: extracted.content)
     var content: [[String: Any]] = []
     if !extracted.reasoning.isEmpty {
         content.append(["type": "thinking", "thinking": extracted.reasoning])
     }
-    if !extracted.content.isEmpty {
-        content.append(["type": "text", "text": extracted.content])
+    if !parsed.content.isEmpty {
+        content.append(["type": "text", "text": parsed.content])
+    }
+    for toolCall in parsed.toolCalls {
+        content.append(
+            [
+                "type": "tool_use",
+                "id": toolCall.id,
+                "name": toolCall.name,
+                "input": anthropicToolInput(from: toolCall.arguments),
+            ]
+        )
     }
 
     return [
@@ -371,10 +464,10 @@ public func buildAnthropicMessageResponse(
         "model": request.model,
         "content": content,
         "stop_reason": anthropicStopReason(
-            finishReason: completion.finishReason,
-            stoppedByTextStop: completion.stoppedByTextStop
+            finishReason: parsed.toolCalls.isEmpty ? completion.finishReason : "tool_use",
+            stoppedByTextStop: parsed.toolCalls.isEmpty ? completion.stoppedByTextStop : false
         ),
-        "stop_sequence": completion.stopSequence as Any? ?? NSNull(),
+        "stop_sequence": parsed.toolCalls.isEmpty ? (completion.stopSequence as Any? ?? NSNull()) : NSNull(),
         "usage": ["input_tokens": promptTokens, "output_tokens": completion.completionTokens],
     ]
 }
@@ -484,6 +577,69 @@ private func anthropicChatTemplateKwargs(from object: [String: Any]) throws -> [
     }
 
     return kwargs.isEmpty ? nil : kwargs
+}
+
+private func anthropicOpenAITools(from value: Any?) throws -> [OpenAIJSONValue]? {
+    guard let value else { return nil }
+    guard let tools = value as? [[String: Any]] else {
+        throw OpenAIServerError.invalidJSON
+    }
+
+    var converted: [OpenAIJSONValue] = []
+    for tool in tools {
+        guard let name = tool["name"] as? String, !name.isEmpty else {
+            throw OpenAIServerError.invalidJSON
+        }
+
+        var function: [String: Any] = ["name": name]
+        if let description = tool["description"] as? String {
+            function["description"] = description
+        }
+        if let inputSchema = tool["input_schema"] {
+            function["parameters"] = inputSchema
+        }
+
+        guard let jsonValue = OpenAIJSONValue(["type": "function", "function": function]) else {
+            throw OpenAIServerError.invalidJSON
+        }
+        converted.append(jsonValue)
+    }
+
+    return converted.isEmpty ? nil : converted
+}
+
+private func anthropicToolChoice(from value: Any?) throws -> OpenAIToolChoice? {
+    guard let value else { return nil }
+    if value is NSNull {
+        return nil
+    }
+    guard let object = value as? [String: Any], let type = object["type"] as? String else {
+        throw OpenAIServerError.invalidJSON
+    }
+
+    switch type {
+    case "auto":
+        return .auto
+    case "any":
+        return .required
+    case "tool":
+        guard let name = object["name"] as? String, !name.isEmpty else {
+            throw OpenAIServerError.invalidJSON
+        }
+        return .function(name)
+    default:
+        throw OpenAIServerError.invalidJSON
+    }
+}
+
+private func anthropicToolInput(from arguments: String) -> [String: Any] {
+    guard
+        let data = arguments.data(using: .utf8),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else {
+        return [:]
+    }
+    return object
 }
 
 private func anthropicStringArray(_ value: Any?) throws -> [String] {
