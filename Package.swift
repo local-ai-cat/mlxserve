@@ -16,6 +16,10 @@ let package = Package(
             name: "MLXServeHTTP",
             targets: ["MLXServeHTTP"]
         ),
+        .library(
+            name: "MLXServeSpeech",
+            targets: ["MLXServeSpeech"]
+        ),
         .executable(
             name: "mlxserve-bench",
             targets: ["MLXServeBench"]
@@ -57,11 +61,16 @@ let package = Package(
             name: "MLXServeHTTP",
             dependencies: []
         ),
+        .target(
+            name: "MLXServeSpeech",
+            dependencies: []
+        ),
         .executableTarget(
             name: "MLXServeHTTPServer",
             dependencies: [
                 "MLXServe",
                 "MLXServeHTTP",
+                "MLXServeSpeech",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
@@ -77,6 +86,7 @@ let package = Package(
                 "MLXServe",
                 "MLXServeHTTP",
                 "MLXServeHTTPServer",
+                "MLXServeSpeech",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
