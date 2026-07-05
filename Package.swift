@@ -26,10 +26,8 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(
-            url: "https://github.com/atlas-open-sources/mlx-swift-lm.git",
-            revision: "1679b2555eb585200f8a1594e034251cf244b861"
-        ),
+        // LOCAL OVERRIDE — do not merge/push; awaiting fork upstreaming.
+        .package(name: "mlx-swift-lm", path: "/Users/timapple/Documents/Github/mlx-swift-lm-vlmfix"),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],

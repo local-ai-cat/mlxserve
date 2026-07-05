@@ -145,12 +145,10 @@ public actor Scheduler {
     private func admitWaiting() -> [Response] {
         var admittedResponses: [Response] = []
         while running.count < maxConcurrentRequests, !waiting.isEmpty {
-            // VLM models such as Qwen2-VL currently apply RoPE with scalar
-            // cache.offset in MLXVLM/Models/Qwen2VL.swift:102 instead of the
-            // per-row cache.ropeOffset used by LLM Qwen2/Qwen3. Mixed-offset
-            // batches corrupt all but the row matching the scalar offset, so
-            // serialize the whole VLM engine until VLM attention consumes
-            // BatchPositionedKVCache.ropeOffset.
+            // Some model architectures still derive RoPE position ids or
+            // shared-KV offsets from scalar cache.offset. Their loaders pass
+            // serializedDecode=true so mixed-offset rows are not admitted into
+            // the same decode batch.
             if serializedDecode, !running.isEmpty || !generator.isEmpty || !admittedResponses.isEmpty {
                 return admittedResponses
             }
