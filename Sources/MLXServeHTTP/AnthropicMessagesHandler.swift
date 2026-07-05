@@ -3,6 +3,12 @@ import Network
 
 struct AnthropicMessagesHandler {
     let backend: any OpenAIChatBackend
+    let mcpManager: MCPManager?
+
+    init(backend: any OpenAIChatBackend, mcpManager: MCPManager? = nil) {
+        self.backend = backend
+        self.mcpManager = mcpManager
+    }
 
     func handleMessages(_ request: HTTPRequest, connection: NWConnection) async throws {
         let messagesRequest: AnthropicMessagesRequest
@@ -14,14 +20,15 @@ struct AnthropicMessagesHandler {
             return
         }
 
-        let stream = try await backend.startChatCompletion(messagesRequest.openAIRequest())
-        if messagesRequest.stream {
-            try await sendStreaming(request: messagesRequest, stream: stream, connection: connection)
+        let effectiveRequest = await anthropicMessagesRequestByMergingMCPTools(messagesRequest, manager: mcpManager)
+        let stream = try await backend.startChatCompletion(effectiveRequest.openAIRequest())
+        if effectiveRequest.stream {
+            try await sendStreaming(request: effectiveRequest, stream: stream, connection: connection)
         } else {
-            let completion = try await collectBufferedCompletion(stream: stream, stopSequences: messagesRequest.stopSequences)
+            let completion = try await collectBufferedCompletion(stream: stream, stopSequences: effectiveRequest.stopSequences)
             try await sendJSON(
                 buildAnthropicMessageResponse(
-                    request: messagesRequest,
+                    request: effectiveRequest,
                     completion: completion,
                     promptTokens: stream.promptTokens
                 ),

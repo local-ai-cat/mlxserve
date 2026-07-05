@@ -139,6 +139,64 @@ final class MCPTests: XCTestCase {
         await manager.shutdown()
     }
 
+    func testMergedAnthropicMessagesRequestAddsDiscoveredTools() async throws {
+        let manager = try makeFakeMCPManager()
+        await manager.connectAll()
+        let request = try AnthropicMessagesRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "max_tokens": 16,
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "tools": [
+                    {
+                      "name": "user_tool",
+                      "description": "User tool",
+                      "input_schema": {"type": "object", "properties": {}}
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        let mergedRequest = await anthropicMessagesRequestByMergingMCPTools(request, manager: manager)
+        let names = (mergedRequest.openAIRequest().tools ?? []).compactMap(openAIToolFunctionName).sorted()
+
+        XCTAssertEqual(names, ["fake__echo", "user_tool"])
+        await manager.shutdown()
+    }
+
+    func testMergedResponsesRequestAddsDiscoveredTools() async throws {
+        let manager = try makeFakeMCPManager()
+        await manager.connectAll()
+        let request = try ResponsesRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "input": "hello",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "user_tool",
+                      "description": "User tool",
+                      "parameters": {"type": "object", "properties": {}}
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        let mergedRequest = await responsesRequestByMergingMCPTools(request, manager: manager)
+        let names = (mergedRequest.openAIRequest().tools ?? []).compactMap(openAIToolFunctionName).sorted()
+
+        XCTAssertEqual(names, ["fake__echo", "user_tool"])
+        await manager.shutdown()
+    }
+
     func testMCPStdioTimeoutReturnsToolErrorWithinDeadline() async throws {
         let manager = try makeFakeMCPManager(mode: "hang-call", timeoutMs: 150)
         await manager.connectAll()

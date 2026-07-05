@@ -375,11 +375,11 @@ public final class OpenAIServer: @unchecked Sendable {
                 }
                 try await AudioTranscriptionHandler(backend: audioBackend).handleTranscription(request, connection: connection)
             case ("POST", "/v1/messages"):
-                try await AnthropicMessagesHandler(backend: backend).handleMessages(request, connection: connection)
+                try await AnthropicMessagesHandler(backend: backend, mcpManager: mcpManager).handleMessages(request, connection: connection)
             case ("POST", "/v1/messages/count_tokens"):
                 try await AnthropicMessagesHandler(backend: backend).handleCountTokens(request, connection: connection)
             case ("POST", "/v1/responses"):
-                try await ResponsesHandler(backend: backend, store: responsesStore).handleCreate(request, connection: connection)
+                try await ResponsesHandler(backend: backend, store: responsesStore, mcpManager: mcpManager).handleCreate(request, connection: connection)
             default:
                 if request.method == "GET", let id = responseID(from: request.path) {
                     try await ResponsesHandler(backend: backend, store: responsesStore).handleGet(id: id, connection: connection)

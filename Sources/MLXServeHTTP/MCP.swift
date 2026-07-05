@@ -260,6 +260,90 @@ public func openAIChatRequestByReplacingTools(
     )
 }
 
+public func openAIChatRequestByMergingMCPTools(
+    _ request: OpenAIChatRequest,
+    manager: MCPManager?
+) async -> OpenAIChatRequest {
+    guard let manager else {
+        return request
+    }
+    let tools = await manager.mergedOpenAITools(
+        userTools: request.tools,
+        toolChoice: request.toolChoice
+    )
+    return openAIChatRequestByReplacingTools(request, tools: tools)
+}
+
+public func anthropicMessagesRequestByMergingMCPTools(
+    _ request: AnthropicMessagesRequest,
+    manager: MCPManager?
+) async -> AnthropicMessagesRequest {
+    guard let manager else {
+        return request
+    }
+    let tools = await manager.mergedOpenAITools(
+        userTools: request.tools,
+        toolChoice: request.toolChoice
+    )
+    return anthropicMessagesRequestByReplacingTools(request, tools: tools)
+}
+
+public func anthropicMessagesRequestByReplacingTools(
+    _ request: AnthropicMessagesRequest,
+    tools: [OpenAIJSONValue]?
+) -> AnthropicMessagesRequest {
+    AnthropicMessagesRequest(
+        model: request.model,
+        maxTokens: request.maxTokens,
+        messages: request.messages,
+        stopSequences: request.stopSequences,
+        stream: request.stream,
+        temperature: request.temperature,
+        topP: request.topP,
+        topK: request.topK,
+        enableThinking: request.enableThinking,
+        chatTemplateKwargs: request.chatTemplateKwargs,
+        tools: tools,
+        toolChoice: request.toolChoice
+    )
+}
+
+public func responsesRequestByMergingMCPTools(
+    _ request: ResponsesRequest,
+    manager: MCPManager?
+) async -> ResponsesRequest {
+    guard let manager else {
+        return request
+    }
+    let tools = await manager.mergedOpenAITools(
+        userTools: request.tools,
+        toolChoice: request.toolChoice
+    )
+    return responsesRequestByReplacingTools(request, tools: tools)
+}
+
+public func responsesRequestByReplacingTools(
+    _ request: ResponsesRequest,
+    tools: [OpenAIJSONValue]?
+) -> ResponsesRequest {
+    ResponsesRequest(
+        model: request.model,
+        inputMessages: request.inputMessages,
+        temperature: request.temperature,
+        topP: request.topP,
+        maxOutputTokens: request.maxOutputTokens,
+        stream: request.stream,
+        text: request.text,
+        previousResponseID: request.previousResponseID,
+        store: request.store,
+        metadata: request.metadata,
+        seed: request.seed,
+        chatTemplateKwargs: request.chatTemplateKwargs,
+        tools: tools,
+        toolChoice: request.toolChoice
+    )
+}
+
 private actor MCPStdioClient {
     private let config: MCPServerConfig
     private var process: Process?

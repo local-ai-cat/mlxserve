@@ -4,6 +4,13 @@ import Network
 struct ResponsesHandler {
     let backend: any OpenAIChatBackend
     let store: ResponsesStore
+    private let mcpManager: MCPManager?
+
+    init(backend: any OpenAIChatBackend, store: ResponsesStore, mcpManager: MCPManager? = nil) {
+        self.backend = backend
+        self.store = store
+        self.mcpManager = mcpManager
+    }
 
     func handleCreate(_ request: HTTPRequest, connection: NWConnection) async throws {
         let responsesRequest: ResponsesRequest
@@ -22,12 +29,13 @@ struct ResponsesHandler {
             previousMessages = []
         }
 
+        let effectiveRequest = await responsesRequestByMergingMCPTools(responsesRequest, manager: mcpManager)
         let stream = try await backend.startChatCompletion(
-            responsesRequest.openAIRequest(previousMessages: previousMessages)
+            effectiveRequest.openAIRequest(previousMessages: previousMessages)
         )
-        if responsesRequest.stream {
+        if effectiveRequest.stream {
             try await sendStreaming(
-                request: responsesRequest,
+                request: effectiveRequest,
                 previousMessages: previousMessages,
                 stream: stream,
                 connection: connection
@@ -36,18 +44,18 @@ struct ResponsesHandler {
             let completion = try await collectBufferedCompletion(stream: stream)
             let id = "resp_\(UUID().uuidString.prefix(8))"
             let response = buildResponsesObject(
-                request: responsesRequest,
+                request: effectiveRequest,
                 id: id,
                 promptTokens: stream.promptTokens,
                 completion: completion
             )
             let data = try responsesJSONData(response)
-            if responsesRequest.store {
+            if effectiveRequest.store {
                 let extracted = extractThinking(completion.text)
                 await store.put(
                     id: id,
                     responseData: data,
-                    contextMessages: previousMessages + responsesRequest.inputMessages + [
+                    contextMessages: previousMessages + effectiveRequest.inputMessages + [
                         OpenAIChatMessage(
                             role: "assistant",
                             content: extracted.content,
