@@ -40,10 +40,34 @@ final class RerankTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(request.query, .object(["text": "capital of France"]))
-        XCTAssertEqual(request.documents[0], .object(["text": "Paris", "title": "France"]))
+        XCTAssertEqual(request.query, .object(["text": .string("capital of France")]))
+        XCTAssertEqual(request.documents[0], .object(["text": .string("Paris"), "title": .string("France")]))
         XCTAssertEqual(request.topN, 1)
         XCTAssertFalse(request.returnDocuments)
+    }
+
+    func testRerankObjectDocumentsPreserveJSONValues() throws {
+        let request = try OpenAIRerankRequest.parse(
+            Data(
+                """
+                {
+                  "model": "rerank-model",
+                  "query": "capital of France",
+                  "documents": [{"text": "Paris", "rank": 1, "fresh": true}]
+                }
+                """.utf8
+            )
+        )
+        let response = buildRerankResponse(
+            request: request,
+            result: OpenAIRerankResult(scores: [1], indices: [0], totalTokens: 3)
+        )
+
+        let results = try XCTUnwrap(response["results"] as? [[String: Any]])
+        let document = try XCTUnwrap(results[0]["document"] as? [String: Any])
+        XCTAssertEqual(document["text"] as? String, "Paris")
+        XCTAssertEqual(document["rank"] as? Double, 1)
+        XCTAssertEqual(document["fresh"] as? Bool, true)
     }
 
     func testRerankResponseShapeSortAndTopN() async throws {
