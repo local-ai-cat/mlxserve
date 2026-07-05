@@ -2,23 +2,26 @@ import Foundation
 
 public enum OpenAIRerankText: Sendable, Equatable {
     case string(String)
-    case object([String: String])
+    case object([String: OpenAIJSONValue])
 
     public var text: String {
         switch self {
         case .string(let value):
             return value
         case .object(let value):
-            return value["text"] ?? ""
+            guard case .string(let text)? = value["text"] else {
+                return ""
+            }
+            return text
         }
     }
 
-    public var documentPayload: [String: String] {
+    public var documentPayload: [String: Any] {
         switch self {
         case .string(let value):
             return ["text": value]
         case .object(let value):
-            return value
+            return value.mapValues { jsonObject(from: $0) }
         }
     }
 }
@@ -81,9 +84,6 @@ public struct OpenAIRerankRequest: Sendable, Equatable {
         if let strings = value as? [String] {
             return strings.map(OpenAIRerankText.string)
         }
-        if let objects = value as? [[String: String]] {
-            return objects.map(OpenAIRerankText.object)
-        }
         if let values = value as? [Any] {
             return try values.map(parseText)
         }
@@ -94,8 +94,15 @@ public struct OpenAIRerankRequest: Sendable, Equatable {
         if let string = value as? String {
             return .string(string)
         }
-        if let object = value as? [String: String] {
-            return .object(object)
+        if let object = value as? [String: Any] {
+            var converted: [String: OpenAIJSONValue] = [:]
+            for (key, value) in object {
+                guard let jsonValue = OpenAIJSONValue(value) else {
+                    throw OpenAIServerError.invalidJSON
+                }
+                converted[key] = jsonValue
+            }
+            return .object(converted)
         }
         throw OpenAIServerError.invalidJSON
     }
