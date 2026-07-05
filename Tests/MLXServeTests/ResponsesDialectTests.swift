@@ -75,6 +75,50 @@ final class ResponsesDialectTests: XCTestCase {
         XCTAssertEqual(request.chatTemplateKwargs?["reasoning"], .object(["effort": .string("low")]))
     }
 
+    func testResponsesRequestConvertsToolsAndToolChoice() throws {
+        let request = try responsesRequestWithToolChoice(
+            """
+            {"type": "function", "name": "get_weather"}
+            """
+        )
+        let chatRequest = request.openAIRequest()
+
+        XCTAssertEqual(chatRequest.toolChoice, .function("get_weather"))
+        let tools = try XCTUnwrap(chatRequest.tools)
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(
+            tools[0],
+            .object(
+                [
+                    "type": .string("function"),
+                    "function": .object(
+                        [
+                            "name": .string("get_weather"),
+                            "description": .string("Get weather"),
+                            "parameters": .object(
+                                [
+                                    "type": .string("object"),
+                                    "properties": .object(
+                                        [
+                                            "city": .object(["type": .string("string")])
+                                        ]
+                                    ),
+                                ]
+                            ),
+                            "strict": .bool(true),
+                        ]
+                    ),
+                ]
+            )
+        )
+
+        let requiredRequest = try responsesRequestWithToolChoice(#""required""#)
+        XCTAssertEqual(requiredRequest.openAIRequest().toolChoice, .required)
+
+        let autoRequest = try responsesRequestWithToolChoice(#""auto""#)
+        XCTAssertEqual(autoRequest.openAIRequest().toolChoice, .auto)
+    }
+
     func testResponsesRequestRejectsMissingInput() {
         let body = Data(
             """
@@ -138,6 +182,34 @@ final class ResponsesDialectTests: XCTestCase {
         XCTAssertEqual(usage["total_tokens"] as? Int, 9)
         let details = try XCTUnwrap(usage["output_tokens_details"] as? [String: Int])
         XCTAssertEqual(details["reasoning_tokens"], 2)
+    }
+
+    func testBuildResponsesObjectEmitsFunctionCallItem() throws {
+        let request = try responsesRequestWithToolChoice(#""auto""#)
+        let response = buildResponsesObject(
+            request: request,
+            id: "resp_test",
+            createdAt: 123,
+            promptTokens: 5,
+            completion: ResponsesBufferedCompletion(
+                text: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#,
+                completionTokens: 4
+            )
+        )
+
+        XCTAssertEqual(response["status"] as? String, "completed")
+        let output = try XCTUnwrap(response["output"] as? [[String: Any]])
+        XCTAssertEqual(output.count, 2)
+        XCTAssertEqual(output[0]["type"] as? String, "message")
+        let content = try XCTUnwrap(output[0]["content"] as? [[String: Any]])
+        XCTAssertEqual(content[0]["text"] as? String, "")
+        XCTAssertEqual(output[1]["type"] as? String, "function_call")
+        XCTAssertEqual(output[1]["id"] as? String, "resp_test_fc_0")
+        let callID = try XCTUnwrap(output[1]["call_id"] as? String)
+        XCTAssertTrue(callID.hasPrefix("call_"))
+        XCTAssertEqual(output[1]["name"] as? String, "get_weather")
+        XCTAssertEqual(output[1]["arguments"] as? String, #"{"city":"Paris"}"#)
+        XCTAssertEqual(output[1]["status"] as? String, "completed")
     }
 
     func testStreamingFormatterEventOrderWithoutReasoning() throws {
@@ -231,6 +303,68 @@ final class ResponsesDialectTests: XCTestCase {
         XCTAssertEqual(secondItem["type"] as? String, "message")
     }
 
+    func testStreamingFormatterBuffersAndEmitsFunctionCallEvents() throws {
+        let request = try responsesRequestWithToolChoice(#""auto""#)
+        var formatter = ResponsesStreamFormatter(
+            id: "resp_test",
+            model: "test-model",
+            createdAt: 123,
+            promptTokens: 5,
+            request: request
+        )
+
+        var events = formatter.startEvents()
+        events.append(
+            contentsOf: formatter.feed(
+                OpenAIChatChunk(
+                    text: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#,
+                    tokenID: 1
+                )
+            )
+        )
+        events.append(contentsOf: formatter.finishEvents())
+
+        XCTAssertEqual(
+            events.map(\.name),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        )
+
+        let addedFunction = try XCTUnwrap(events[7].payload["item"] as? [String: Any])
+        XCTAssertEqual(addedFunction["type"] as? String, "function_call")
+        XCTAssertEqual(addedFunction["id"] as? String, "resp_test_fc_0")
+        let callID = try XCTUnwrap(addedFunction["call_id"] as? String)
+        XCTAssertTrue(callID.hasPrefix("call_"))
+        XCTAssertEqual(addedFunction["name"] as? String, "get_weather")
+        XCTAssertEqual(addedFunction["arguments"] as? String, "")
+        XCTAssertEqual(addedFunction["status"] as? String, "in_progress")
+
+        XCTAssertEqual(events[8].payload["delta"] as? String, #"{"city":"Paris"}"#)
+        XCTAssertEqual(events[9].payload["arguments"] as? String, #"{"city":"Paris"}"#)
+
+        let doneFunction = try XCTUnwrap(events[10].payload["item"] as? [String: Any])
+        XCTAssertEqual(doneFunction["call_id"] as? String, callID)
+        XCTAssertEqual(doneFunction["arguments"] as? String, #"{"city":"Paris"}"#)
+        XCTAssertEqual(doneFunction["status"] as? String, "completed")
+
+        let completed = try XCTUnwrap(events[11].payload["response"] as? [String: Any])
+        let output = try XCTUnwrap(completed["output"] as? [[String: Any]])
+        XCTAssertEqual(output.last?["type"] as? String, "function_call")
+        XCTAssertEqual(output.last?["call_id"] as? String, callID)
+    }
+
     func testResponsesStoreRoundTrip() async throws {
         let store = ResponsesStore()
         let response: [String: Any] = [
@@ -255,5 +389,37 @@ final class ResponsesDialectTests: XCTestCase {
         XCTAssertTrue(firstDelete)
         XCTAssertNil(dataAfterDelete)
         XCTAssertFalse(secondDelete)
+    }
+
+    private func responsesRequestWithToolChoice(_ toolChoice: String) throws -> ResponsesRequest {
+        try ResponsesRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "input": "weather",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "get_weather",
+                      "description": "Get weather",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "city": {"type": "string"}
+                        }
+                      },
+                      "strict": true
+                    },
+                    {
+                      "type": "web_search",
+                      "name": "web_search"
+                    }
+                  ],
+                  "tool_choice": \(toolChoice)
+                }
+                """.utf8
+            )
+        )
     }
 }

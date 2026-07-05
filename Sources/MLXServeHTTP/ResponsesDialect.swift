@@ -13,6 +13,8 @@ public struct ResponsesRequest {
     public let metadata: [String: Any]
     public let seed: Int?
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
+    public let tools: [OpenAIJSONValue]?
+    public let toolChoice: OpenAIToolChoice?
 
     public static func parse(_ body: Data) throws -> ResponsesRequest {
         guard
@@ -42,7 +44,9 @@ public struct ResponsesRequest {
             store: object["store"] as? Bool ?? true,
             metadata: object["metadata"] as? [String: Any] ?? [:],
             seed: responsesIntValue(object["seed"]),
-            chatTemplateKwargs: try responsesChatTemplateKwargs(from: object)
+            chatTemplateKwargs: try responsesChatTemplateKwargs(from: object),
+            tools: try responsesOpenAITools(from: object["tools"]),
+            toolChoice: try responsesToolChoice(from: object["tool_choice"])
         )
     }
 
@@ -55,7 +59,9 @@ public struct ResponsesRequest {
             topP: topP,
             seed: seed,
             stream: stream ?? self.stream,
-            chatTemplateKwargs: chatTemplateKwargs
+            chatTemplateKwargs: chatTemplateKwargs,
+            tools: tools,
+            toolChoice: toolChoice
         )
     }
 
@@ -127,6 +133,8 @@ public struct ResponsesStreamFormatter {
     private var completionTokens = 0
     private var reasoningText = ""
     private var outputText = ""
+    private var bufferedContent = ""
+    private var completedToolCalls: [ParsedToolCall] = []
     private var reasoningStarted = false
     private var reasoningDone = false
     private var messageStarted = false
@@ -171,6 +179,17 @@ public struct ResponsesStreamFormatter {
 
     public mutating func finishEvents() -> [ResponseSSEEvent] {
         var events = parserEvents(for: parser.finish())
+        if toolsRequested {
+            let parsed = parseToolCalls(from: bufferedContent)
+            completedToolCalls = parsed.toolCalls
+            if !parsed.toolCalls.isEmpty {
+                if !parsed.content.isEmpty {
+                    events.append(contentsOf: outputTextDeltaEvents(parsed.content))
+                }
+            } else if !bufferedContent.isEmpty {
+                events.append(contentsOf: outputTextDeltaEvents(bufferedContent))
+            }
+        }
         if reasoningStarted && !reasoningDone {
             events.append(reasoningDoneEvent())
         }
@@ -180,6 +199,7 @@ public struct ResponsesStreamFormatter {
         events.append(outputTextDoneEvent())
         events.append(contentPartDoneEvent())
         events.append(outputItemDoneEvent())
+        events.append(contentsOf: functionCallEvents(from: completedToolCalls))
         events.append(
             event(
                 "response.completed",
@@ -198,7 +218,8 @@ public struct ResponsesStreamFormatter {
             id: id ?? self.id,
             createdAt: createdAt ?? self.createdAt,
             promptTokens: promptTokens,
-            completion: ResponsesBufferedCompletion(text: fullText, completionTokens: completionTokens)
+            completion: ResponsesBufferedCompletion(text: fullText, completionTokens: completionTokens),
+            parsedToolCalls: ToolCallParseResult(content: outputText, toolCalls: completedToolCalls)
         )
     }
 
@@ -216,26 +237,38 @@ public struct ResponsesStreamFormatter {
             events.append(contentsOf: reasoningDeltaEvents(delta.reasoning))
         }
         if !delta.content.isEmpty {
-            if reasoningStarted && !reasoningDone {
-                events.append(reasoningDoneEvent())
+            if toolsRequested {
+                // Tool-call parsers need the complete content; buffer text so raw tool syntax is never streamed.
+                bufferedContent += delta.content
+            } else {
+                events.append(contentsOf: outputTextDeltaEvents(delta.content))
             }
-            if !messageStarted {
-                events.append(contentsOf: startMessageEvents())
-            }
-            outputText += delta.content
-            events.append(
-                event(
-                    "response.output_text.delta",
-                    [
-                        "type": "response.output_text.delta",
-                        "item_id": messageItemID,
-                        "output_index": outputIndex,
-                        "content_index": 0,
-                        "delta": delta.content,
-                    ]
-                )
-            )
         }
+        return events
+    }
+
+    private mutating func outputTextDeltaEvents(_ text: String) -> [ResponseSSEEvent] {
+        guard !text.isEmpty else { return [] }
+        var events: [ResponseSSEEvent] = []
+        if reasoningStarted && !reasoningDone {
+            events.append(reasoningDoneEvent())
+        }
+        if !messageStarted {
+            events.append(contentsOf: startMessageEvents())
+        }
+        outputText += text
+        events.append(
+            event(
+                "response.output_text.delta",
+                [
+                    "type": "response.output_text.delta",
+                    "item_id": messageItemID,
+                    "output_index": outputIndex,
+                    "content_index": 0,
+                    "delta": text,
+                ]
+            )
+        )
         return events
     }
 
@@ -343,6 +376,67 @@ public struct ResponsesStreamFormatter {
         )
     }
 
+    private mutating func functionCallEvents(from toolCalls: [ParsedToolCall]) -> [ResponseSSEEvent] {
+        var events: [ResponseSSEEvent] = []
+        for (index, toolCall) in toolCalls.enumerated() {
+            let outputIndex = functionCallOutputIndex(offset: index)
+            let itemID = functionCallItemID(index: index)
+            events.append(
+                event(
+                    "response.output_item.added",
+                    [
+                        "type": "response.output_item.added",
+                        "output_index": outputIndex,
+                        "item": functionCallItem(
+                            toolCall,
+                            itemID: itemID,
+                            status: "in_progress",
+                            arguments: ""
+                        ),
+                    ]
+                )
+            )
+            events.append(
+                event(
+                    "response.function_call_arguments.delta",
+                    [
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": itemID,
+                        "output_index": outputIndex,
+                        "delta": toolCall.arguments,
+                    ]
+                )
+            )
+            events.append(
+                event(
+                    "response.function_call_arguments.done",
+                    [
+                        "type": "response.function_call_arguments.done",
+                        "item_id": itemID,
+                        "output_index": outputIndex,
+                        "arguments": toolCall.arguments,
+                    ]
+                )
+            )
+            events.append(
+                event(
+                    "response.output_item.done",
+                    [
+                        "type": "response.output_item.done",
+                        "output_index": outputIndex,
+                        "item": functionCallItem(
+                            toolCall,
+                            itemID: itemID,
+                            status: "completed",
+                            arguments: toolCall.arguments
+                        ),
+                    ]
+                )
+            )
+        }
+        return events
+    }
+
     private mutating func event(_ name: String, _ payload: [String: Any]) -> ResponseSSEEvent {
         var payload = payload
         payload["sequence_number"] = sequenceNumber
@@ -354,12 +448,24 @@ public struct ResponsesStreamFormatter {
         reasoningText.isEmpty && !reasoningStarted ? 0 : 1
     }
 
+    private var toolsRequested: Bool {
+        selectOpenAITools(tools: request.tools, toolChoice: request.toolChoice) != nil
+    }
+
     private var messageItemID: String {
         "\(id)_msg"
     }
 
     private var reasoningItemID: String {
         "\(id)_reasoning"
+    }
+
+    private func functionCallOutputIndex(offset: Int) -> Int {
+        outputIndex + 1 + offset
+    }
+
+    private func functionCallItemID(index: Int) -> String {
+        "\(id)_fc_\(index)"
     }
 
     private func baseResponse(status: String, output: [[String: Any]], usage: Any) -> [String: Any] {
@@ -401,6 +507,22 @@ public struct ResponsesStreamFormatter {
         }
         return item
     }
+
+    private func functionCallItem(
+        _ toolCall: ParsedToolCall,
+        itemID: String,
+        status: String,
+        arguments: String
+    ) -> [String: Any] {
+        [
+            "type": "function_call",
+            "id": itemID,
+            "call_id": toolCall.id,
+            "name": toolCall.name,
+            "arguments": arguments,
+            "status": status,
+        ]
+    }
 }
 
 public func buildResponsesObject(
@@ -408,9 +530,14 @@ public func buildResponsesObject(
     id: String = "resp_\(UUID().uuidString.prefix(8))",
     createdAt: Int = Int(Date().timeIntervalSince1970),
     promptTokens: Int,
-    completion: ResponsesBufferedCompletion
+    completion: ResponsesBufferedCompletion,
+    parsedToolCalls: ToolCallParseResult? = nil
 ) -> [String: Any] {
     let extracted = extractThinking(completion.text)
+    let parsed = parsedToolCalls
+        ?? (selectOpenAITools(tools: request.tools, toolChoice: request.toolChoice) == nil
+            ? ToolCallParseResult(content: extracted.content, toolCalls: [])
+            : parseToolCalls(from: extracted.content))
     let reasoningTokens = responsesEstimatedTokenCount(extracted.reasoning)
     var output: [[String: Any]] = []
     if !extracted.reasoning.isEmpty {
@@ -429,9 +556,21 @@ public func buildResponsesObject(
             "id": "\(id)_msg",
             "role": "assistant",
             "status": "completed",
-            "content": [["type": "output_text", "text": extracted.content, "annotations": []]],
+            "content": [["type": "output_text", "text": parsed.content, "annotations": []]],
         ]
     )
+    for (index, toolCall) in parsed.toolCalls.enumerated() {
+        output.append(
+            [
+                "type": "function_call",
+                "id": "\(id)_fc_\(index)",
+                "call_id": toolCall.id,
+                "name": toolCall.name,
+                "arguments": toolCall.arguments,
+                "status": "completed",
+            ]
+        )
+    }
 
     return [
         "id": id,
@@ -521,6 +660,71 @@ private func responsesChatTemplateKwargs(from object: [String: Any]) throws -> [
         kwargs[key] = jsonValue
     }
     return kwargs.isEmpty ? nil : kwargs
+}
+
+private func responsesOpenAITools(from value: Any?) throws -> [OpenAIJSONValue]? {
+    guard let value else { return nil }
+    guard let tools = value as? [[String: Any]] else {
+        throw OpenAIServerError.invalidJSON
+    }
+
+    var converted: [OpenAIJSONValue] = []
+    for tool in tools {
+        let type = tool["type"] as? String ?? "function"
+        guard type == "function" else {
+            continue
+        }
+        guard let name = tool["name"] as? String, !name.isEmpty else {
+            throw OpenAIServerError.invalidJSON
+        }
+
+        var function: [String: Any] = ["name": name]
+        if let description = tool["description"] as? String {
+            function["description"] = description
+        }
+        if let parameters = tool["parameters"] {
+            function["parameters"] = parameters
+        }
+        if let strict = tool["strict"] as? Bool {
+            function["strict"] = strict
+        }
+
+        guard let jsonValue = OpenAIJSONValue(["type": "function", "function": function]) else {
+            throw OpenAIServerError.invalidJSON
+        }
+        converted.append(jsonValue)
+    }
+
+    return converted.isEmpty ? nil : converted
+}
+
+private func responsesToolChoice(from value: Any?) throws -> OpenAIToolChoice? {
+    guard let value else { return nil }
+    if value is NSNull {
+        return nil
+    }
+    if value is String {
+        return try OpenAIToolChoice.parse(value)
+    }
+
+    guard let object = value as? [String: Any], let type = object["type"] as? String else {
+        throw OpenAIServerError.invalidJSON
+    }
+    switch type {
+    case "none":
+        return OpenAIToolChoice.none
+    case "auto":
+        return .auto
+    case "required":
+        return .required
+    case "function":
+        if let name = object["name"] as? String, !name.isEmpty {
+            return .function(name)
+        }
+        return try OpenAIToolChoice.parse(value)
+    default:
+        throw OpenAIServerError.invalidJSON
+    }
 }
 
 private func responsesCanonicalJSONString(_ object: [String: Any]) throws -> String {
