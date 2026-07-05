@@ -5,12 +5,14 @@ public struct MCPServerConfig: Sendable, Equatable {
     public let command: String
     public let args: [String]
     public let env: [String: String]
+    public let timeoutMs: Int
 
-    public init(name: String, command: String, args: [String] = [], env: [String: String] = [:]) {
+    public init(name: String, command: String, args: [String] = [], env: [String: String] = [:], timeoutMs: Int = 30_000) {
         self.name = name
         self.command = command
         self.args = args
         self.env = env
+        self.timeoutMs = timeoutMs
     }
 }
 
@@ -49,7 +51,11 @@ public struct MCPConfig: Sendable, Equatable {
             }
             let args = serverObject["args"] as? [String] ?? []
             let env = serverObject["env"] as? [String: String] ?? [:]
-            servers.append(MCPServerConfig(name: name, command: command, args: args, env: env))
+            let timeoutMs = serverObject["timeoutMs"] as? Int ?? 30_000
+            guard timeoutMs > 0 else {
+                throw OpenAIServerError.invalidJSON
+            }
+            servers.append(MCPServerConfig(name: name, command: command, args: args, env: env, timeoutMs: timeoutMs))
         }
         return MCPConfig(servers: servers)
     }
@@ -263,6 +269,11 @@ private actor MCPStdioClient {
     private var state = "disconnected"
     private var error: String?
     private var discoveredTools: [MCPTool] = []
+    private var readBuffer = Data()
+    private var queuedLines: [Data] = []
+    private var pendingRead: (id: UUID, continuation: CheckedContinuation<Data, Error>)?
+    private var streamError: Error?
+    private var activeRequestID: UUID?
 
     init(config: MCPServerConfig) {
         self.config = config
@@ -289,12 +300,8 @@ private actor MCPStdioClient {
     }
 
     func shutdown() {
-        input?.closeFile()
-        output?.closeFile()
-        process?.terminate()
+        closeProcess()
         process = nil
-        input = nil
-        output = nil
         state = "disconnected"
     }
 
@@ -302,10 +309,13 @@ private actor MCPStdioClient {
         discoveredTools.contains { $0.name == name || $0.fullName == name }
     }
 
-    func connect() throws {
+    func connect() async throws {
         guard process == nil else { return }
         state = "connecting"
         error = nil
+        streamError = nil
+        readBuffer = Data()
+        queuedLines = []
 
         let process = Process()
         let stdinPipe = Pipe()
@@ -330,8 +340,12 @@ private actor MCPStdioClient {
         self.process = process
         input = stdinPipe.fileHandleForWriting
         output = stdoutPipe.fileHandleForReading
+        output?.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            Task { await self?.receiveOutputData(data) }
+        }
 
-        _ = try sendRequest(
+        _ = try await sendRequest(
             method: "initialize",
             params: [
                 "protocolVersion": "2024-11-05",
@@ -340,17 +354,17 @@ private actor MCPStdioClient {
             ]
         )
         try sendNotification(method: "notifications/initialized", params: [:])
-        let toolsResult = try sendRequest(method: "tools/list", params: [:])
+        let toolsResult = try await sendRequest(method: "tools/list", params: [:])
         discoveredTools = parseTools(from: toolsResult)
         state = "connected"
     }
 
-    func callTool(fullName: String, localName: String, arguments: OpenAIJSONValue) -> MCPToolExecutionResult {
+    func callTool(fullName: String, localName: String, arguments: OpenAIJSONValue) async -> MCPToolExecutionResult {
         do {
             if process == nil {
-                try connect()
+                try await connect()
             }
-            let result = try sendRequest(
+            let result = try await sendRequest(
                 method: "tools/call",
                 params: [
                     "name": localName,
@@ -377,7 +391,7 @@ private actor MCPStdioClient {
         }
     }
 
-    private func sendRequest(method: String, params: [String: Any]) throws -> Any {
+    private func sendRequest(method: String, params: [String: Any]) async throws -> Any {
         let id = nextID
         nextID += 1
         try writeMessage(
@@ -389,8 +403,44 @@ private actor MCPStdioClient {
             ]
         )
 
+        let requestID = UUID()
+        activeRequestID = requestID
+        let timeoutMs = config.timeoutMs
+        let timeoutTask = Task {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+            } catch {
+                return
+            }
+            self.timeoutActiveRequest(id: requestID, timeoutMs: timeoutMs)
+        }
+        defer {
+            timeoutTask.cancel()
+            if activeRequestID == requestID {
+                activeRequestID = nil
+            }
+        }
+
+        do {
+            return try await readMatchingResponse(id: id)
+        } catch let error as MCPStdioError {
+            if case .timeout = error {
+                resetAfterTimeout(error.description)
+            }
+            throw error
+        }
+    }
+
+    private func timeoutActiveRequest(id: UUID, timeoutMs: Int) {
+        guard activeRequestID == id else { return }
+        let error = MCPStdioError.timeout(timeoutMs)
+        streamError = error
+        finishPendingRead(.failure(error))
+    }
+
+    private func readMatchingResponse(id: Int) async throws -> Any {
         while true {
-            let response = try readMessage()
+            let response = try await readMessage()
             guard let responseID = response["id"] as? Int, responseID == id else {
                 continue
             }
@@ -419,34 +469,107 @@ private actor MCPStdioClient {
         input.write(body + Data("\n".utf8))
     }
 
-    private func readMessage() throws -> [String: Any] {
-        guard let output else {
+    private func readMessage() async throws -> [String: Any] {
+        guard output != nil else {
             throw MCPStdioError.notConnected
         }
+        if !queuedLines.isEmpty {
+            return try parseMessageLine(queuedLines.removeFirst())
+        }
+        if let streamError {
+            throw streamError
+        }
 
-        while true {
-            var line = Data()
-            while true {
-                let byte = output.readData(ofLength: 1)
-                guard !byte.isEmpty else {
-                    throw MCPStdioError.closed
+        let readID = UUID()
+        return try await withTaskCancellationHandler(
+            operation: {
+                let line = try await withCheckedThrowingContinuation { continuation in
+                    pendingRead = (readID, continuation)
                 }
-                if byte == Data("\n".utf8) {
-                    break
-                }
-                line.append(byte)
+                return try parseMessageLine(line)
+            },
+            onCancel: {
+                Task { await self.cancelPendingRead(id: readID) }
             }
+        )
+    }
+
+    private func receiveOutputData(_ data: Data) {
+        guard !data.isEmpty else {
+            streamError = MCPStdioError.closed
+            finishPendingRead(.failure(MCPStdioError.closed))
+            return
+        }
+
+        readBuffer.append(data)
+        while let newline = readBuffer.firstIndex(of: UInt8(ascii: "\n")) {
+            let lineRange = readBuffer.startIndex..<newline
+            var line = Data(readBuffer[lineRange])
+            let nextIndex = readBuffer.index(after: newline)
+            readBuffer.removeSubrange(readBuffer.startIndex..<nextIndex)
             if line.last == UInt8(ascii: "\r") {
                 line.removeLast()
             }
             guard !line.isEmpty else {
                 continue
             }
-            guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-                throw MCPStdioError.invalidMessage
-            }
-            return object
+            enqueueLine(line)
         }
+    }
+
+    private func enqueueLine(_ line: Data) {
+        if let pendingRead {
+            self.pendingRead = nil
+            pendingRead.continuation.resume(returning: line)
+        } else {
+            queuedLines.append(line)
+        }
+    }
+
+    private func finishPendingRead(_ result: Result<Data, Error>) {
+        guard let pendingRead else { return }
+        self.pendingRead = nil
+        switch result {
+        case .success(let line):
+            pendingRead.continuation.resume(returning: line)
+        case .failure(let error):
+            pendingRead.continuation.resume(throwing: error)
+        }
+    }
+
+    private func cancelPendingRead(id: UUID) {
+        guard let pendingRead, pendingRead.id == id else { return }
+        self.pendingRead = nil
+        pendingRead.continuation.resume(throwing: CancellationError())
+    }
+
+    private func resetAfterTimeout(_ message: String) {
+        closeProcess()
+        process = nil
+        readBuffer = Data()
+        queuedLines = []
+        streamError = nil
+        state = "error"
+        error = message
+    }
+
+    private func closeProcess() {
+        output?.readabilityHandler = nil
+        input?.closeFile()
+        output?.closeFile()
+        if let process, process.isRunning {
+            process.terminate()
+        }
+        input = nil
+        output = nil
+        finishPendingRead(.failure(MCPStdioError.closed))
+    }
+
+    private func parseMessageLine(_ line: Data) throws -> [String: Any] {
+        guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+            throw MCPStdioError.invalidMessage
+        }
+        return object
     }
 
     private func parseTools(from result: Any) -> [MCPTool] {
@@ -498,6 +621,7 @@ private enum MCPStdioError: Error, CustomStringConvertible {
     case closed
     case invalidMessage
     case rpcError(String)
+    case timeout(Int)
 
     var description: String {
         switch self {
@@ -509,6 +633,8 @@ private enum MCPStdioError: Error, CustomStringConvertible {
             return "invalid MCP stdio message"
         case .rpcError(let message):
             return "MCP JSON-RPC error: \(message)"
+        case .timeout(let timeoutMs):
+            return "tool failed: timeout after \(timeoutMs)ms"
         }
     }
 }

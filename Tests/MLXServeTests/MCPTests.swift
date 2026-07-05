@@ -24,7 +24,26 @@ final class MCPTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(config.servers, [MCPServerConfig(name: "fake", command: "python3", args: ["server.py"], env: ["TOKEN": "abc"])])
+        XCTAssertEqual(
+            config.servers,
+            [MCPServerConfig(name: "fake", command: "python3", args: ["server.py"], env: ["TOKEN": "abc"])]
+        )
+    }
+
+    func testMCPConfigParsesPerServerTimeout() throws {
+        let config = try MCPConfig.parse(
+            [
+                "mcpServers": [
+                    "fake": [
+                        "command": "python3",
+                        "args": ["server.py"],
+                        "timeoutMs": 250,
+                    ]
+                ]
+            ]
+        )
+
+        XCTAssertEqual(config.servers.first?.timeoutMs, 250)
     }
 
     func testMCPHandlerUnconfiguredEndpointShapes() async {
@@ -120,12 +139,88 @@ final class MCPTests: XCTestCase {
         await manager.shutdown()
     }
 
-    private func makeFakeMCPManager() throws -> MCPManager {
+    func testMCPStdioTimeoutReturnsToolErrorWithinDeadline() async throws {
+        let manager = try makeFakeMCPManager(mode: "hang-call", timeoutMs: 150)
+        await manager.connectAll()
+
+        let started = Date()
+        let result = await manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("never")])
+        )
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.errorMessage, "tool failed: timeout after 150ms")
+        XCTAssertLessThan(elapsed, 1.5)
+        let statuses = await manager.serverStatuses()
+        XCTAssertEqual(statuses.first?.state, "error")
+        XCTAssertEqual(statuses.first?.error, "tool failed: timeout after 150ms")
+        await manager.shutdown()
+    }
+
+    func testMCPStdioSlowReplyWithinTimeoutSucceeds() async throws {
+        let manager = try makeFakeMCPManager(mode: "slow-call", timeoutMs: 800)
+        await manager.connectAll()
+
+        let result = await manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("slow")])
+        )
+
+        XCTAssertFalse(result.isError)
+        guard case .array(let content) = result.content,
+            case .object(let first)? = content.first,
+            case .string(let text)? = first["text"]
+        else {
+            XCTFail("expected MCP text content")
+            return
+        }
+        XCTAssertEqual(text, "slow")
+        await manager.shutdown()
+    }
+
+    func testMCPStdioTimeoutRespawnsServerOnNextUse() async throws {
+        let markerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mlxserve-mcp-respawn-\(UUID().uuidString)")
+        let manager = try makeFakeMCPManager(mode: "hang-once", timeoutMs: 150, markerURL: markerURL)
+        await manager.connectAll()
+
+        let timedOut = await manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("first")])
+        )
+        XCTAssertTrue(timedOut.isError)
+        XCTAssertEqual(timedOut.errorMessage, "tool failed: timeout after 150ms")
+
+        let respawned = await manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("second")])
+        )
+        XCTAssertFalse(respawned.isError)
+        guard case .array(let content) = respawned.content,
+            case .object(let first)? = content.first,
+            case .string(let text)? = first["text"]
+        else {
+            XCTFail("expected MCP text content")
+            return
+        }
+        XCTAssertEqual(text, "second")
+        let statuses = await manager.serverStatuses()
+        XCTAssertEqual(statuses.first?.state, "connected")
+        await manager.shutdown()
+    }
+
+    private func makeFakeMCPManager(mode: String = "echo", timeoutMs: Int = 30_000, markerURL: URL? = nil) throws -> MCPManager {
         let scriptURL = try fakeMCPServerScriptURL()
+        var args = [scriptURL.path, mode]
+        if let markerURL {
+            args.append(markerURL.path)
+        }
         return MCPManager(
             config: MCPConfig(
                 servers: [
-                    MCPServerConfig(name: "fake", command: "python3", args: [scriptURL.path])
+                    MCPServerConfig(name: "fake", command: "python3", args: args, timeoutMs: timeoutMs)
                 ]
             )
         )
@@ -143,7 +238,12 @@ final class MCPTests: XCTestCase {
     private var fakeMCPServerScript: String {
         #"""
         import json
+        import os
         import sys
+        import time
+
+        mode = sys.argv[1] if len(sys.argv) > 1 else "echo"
+        marker_path = sys.argv[2] if len(sys.argv) > 2 else None
 
         def read_message():
             line = sys.stdin.buffer.readline()
@@ -191,6 +291,16 @@ final class MCPTests: XCTestCase {
                 })
             elif method == "tools/call":
                 arguments = message.get("params", {}).get("arguments", {})
+                if mode == "hang-call":
+                    while True:
+                        time.sleep(1)
+                if mode == "slow-call":
+                    time.sleep(0.2)
+                if mode == "hang-once" and marker_path and not os.path.exists(marker_path):
+                    with open(marker_path, "w", encoding="utf-8") as marker:
+                        marker.write("hung")
+                    while True:
+                        time.sleep(1)
                 write_message({
                     "jsonrpc": "2.0",
                     "id": request_id,
