@@ -112,6 +112,7 @@ public final class ContinuousBatchGenerator {
     private var rowUIDs: [String] = []
     private var samplers: [SamplingParameters] = []
     private var jsonGrammarMatchers: [JSONGrammarMatcher?] = []
+    private var regexGrammarMatchers: [RegexGrammarMatcher?] = []
     private var thinkingBudgetStates: [ThinkingBudgetState?] = []
     private var generatedTokenHistory: [[Int]] = []
     private var state: LMOutput.State?
@@ -202,15 +203,18 @@ public final class ContinuousBatchGenerator {
         rowUIDs.append(uid)
         samplers.append(sampling)
         let matcher = sampling.jsonGrammar?.makeMatcher()
+        let regexMatcher = sampling.regexGrammar?.makeMatcher()
         var thinkingBudgetState = initialThinkingBudgetState
             ?? sampling.thinkingBudget.map(ThinkingBudgetState.init(configuration:))
         for token in generatedTokens {
             matcher?.advance(tokenID: token)
+            regexMatcher?.advance(tokenID: token)
             if initialThinkingBudgetState == nil {
                 thinkingBudgetState?.advance(tokenID: token)
             }
         }
         jsonGrammarMatchers.append(matcher)
+        regexGrammarMatchers.append(regexMatcher)
         thinkingBudgetStates.append(thinkingBudgetState)
         generatedTokenHistory.append(generatedTokens)
         state = nil
@@ -234,6 +238,7 @@ public final class ContinuousBatchGenerator {
             rowUIDs.removeAll()
             samplers.removeAll()
             jsonGrammarMatchers.removeAll()
+            regexGrammarMatchers.removeAll()
             thinkingBudgetStates.removeAll()
             generatedTokenHistory.removeAll()
             currentTokens = MLXArray([Int32]())
@@ -249,6 +254,7 @@ public final class ContinuousBatchGenerator {
         rowUIDs = rows.map { rowUIDs[$0] }
         samplers = rows.map { samplers[$0] }
         jsonGrammarMatchers = rows.map { jsonGrammarMatchers[$0] }
+        regexGrammarMatchers = rows.map { regexGrammarMatchers[$0] }
         thinkingBudgetStates = rows.map { thinkingBudgetStates[$0] }
         generatedTokenHistory = rows.map { generatedTokenHistory[$0] }
         state = nil
@@ -274,6 +280,7 @@ public final class ContinuousBatchGenerator {
                 parameters: samplers[row],
                 generatedTokens: generatedTokenHistory[row],
                 jsonGrammarMatcher: jsonGrammarMatchers[row],
+                regexGrammarMatcher: regexGrammarMatchers[row],
                 thinkingBudgetState: &thinkingBudgetStates[row]
             )
             sampledRows.append(token)
@@ -288,6 +295,7 @@ public final class ContinuousBatchGenerator {
         for row in generatedTokenHistory.indices {
             generatedTokenHistory[row].append(tokenIds[row])
             jsonGrammarMatchers[row]?.advance(tokenID: tokenIds[row])
+            regexGrammarMatchers[row]?.advance(tokenID: tokenIds[row])
             thinkingBudgetStates[row]?.advance(tokenID: tokenIds[row])
         }
         return rowUIDs.enumerated().map { row, uid in
@@ -319,14 +327,17 @@ public final class ContinuousBatchGenerator {
     ) -> PreparedSampledToken {
         let nextTokenLogits = logits[0..., -1, 0...]
         let matcher = sampling.jsonGrammar?.makeMatcher()
+        let regexMatcher = sampling.regexGrammar?.makeMatcher()
         var thinkingBudgetState = sampling.thinkingBudget.map(ThinkingBudgetState.init(configuration:))
         let token = TokenSampler.sample(
             logits: nextTokenLogits[0, 0...],
             parameters: sampling,
             generatedTokens: [],
             jsonGrammarMatcher: matcher,
+            regexGrammarMatcher: regexMatcher,
             thinkingBudgetState: &thinkingBudgetState
         )
+        regexMatcher?.advance(tokenID: token.item(Int.self))
         thinkingBudgetState?.advance(tokenID: token.item(Int.self))
         return PreparedSampledToken(token: token, thinkingBudgetState: thinkingBudgetState)
     }
