@@ -111,6 +111,7 @@ public final class ContinuousBatchGenerator {
     private var currentTokens = MLXArray([Int32]())
     private var rowUIDs: [String] = []
     private var samplers: [SamplingParameters] = []
+    private var jsonGrammarMatchers: [JSONGrammarMatcher?] = []
     private var generatedTokenHistory: [[Int]] = []
     private var state: LMOutput.State?
 
@@ -197,6 +198,11 @@ public final class ContinuousBatchGenerator {
 
         rowUIDs.append(uid)
         samplers.append(sampling)
+        let matcher = sampling.jsonGrammar?.makeMatcher()
+        for token in generatedTokens {
+            matcher?.advance(tokenID: token)
+        }
+        jsonGrammarMatchers.append(matcher)
         generatedTokenHistory.append(generatedTokens)
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
@@ -218,6 +224,7 @@ public final class ContinuousBatchGenerator {
             cache.removeAll()
             rowUIDs.removeAll()
             samplers.removeAll()
+            jsonGrammarMatchers.removeAll()
             generatedTokenHistory.removeAll()
             currentTokens = MLXArray([Int32]())
             state = nil
@@ -231,6 +238,7 @@ public final class ContinuousBatchGenerator {
         currentTokens = currentTokens.take(rowIndices, axis: 0)
         rowUIDs = rows.map { rowUIDs[$0] }
         samplers = rows.map { samplers[$0] }
+        jsonGrammarMatchers = rows.map { jsonGrammarMatchers[$0] }
         generatedTokenHistory = rows.map { generatedTokenHistory[$0] }
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
@@ -251,7 +259,8 @@ public final class ContinuousBatchGenerator {
             TokenSampler.sample(
                 logits: logits[row, 0...],
                 parameters: samplers[row],
-                generatedTokens: generatedTokenHistory[row]
+                generatedTokens: generatedTokenHistory[row],
+                jsonGrammarMatcher: jsonGrammarMatchers[row]
             )
         }
         let nextTokens = concatenated(sampledRows, axis: 0)
@@ -263,6 +272,7 @@ public final class ContinuousBatchGenerator {
         let tokenIds = nextTokens.asArray(Int.self)
         for row in generatedTokenHistory.indices {
             generatedTokenHistory[row].append(tokenIds[row])
+            jsonGrammarMatchers[row]?.advance(tokenID: tokenIds[row])
         }
         return rowUIDs.enumerated().map { row, uid in
             Response(uid: uid, token: tokenIds[row])
@@ -289,10 +299,12 @@ public final class ContinuousBatchGenerator {
 
     private func sampledToken(from logits: MLXArray, sampling: SamplingParameters) -> MLXArray {
         let nextTokenLogits = logits[0..., -1, 0...]
+        let matcher = sampling.jsonGrammar?.makeMatcher()
         return TokenSampler.sample(
             logits: nextTokenLogits[0, 0...],
             parameters: sampling,
-            generatedTokens: []
+            generatedTokens: [],
+            jsonGrammarMatcher: matcher
         )
     }
 }

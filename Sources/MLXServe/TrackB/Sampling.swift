@@ -14,6 +14,7 @@ public struct SamplingParameters: Sendable, Equatable {
     public var seed: Int?
     public var logprobCount: Int?
     public var allowedSequences: [[Int]]?
+    public var jsonGrammar: JSONGrammarConfiguration?
 
     public init(
         temperature: Float = 0,
@@ -28,7 +29,8 @@ public struct SamplingParameters: Sendable, Equatable {
         xtcSpecialTokens: [Int] = [],
         seed: Int? = nil,
         logprobCount: Int? = nil,
-        allowedSequences: [[Int]]? = nil
+        allowedSequences: [[Int]]? = nil,
+        jsonGrammar: JSONGrammarConfiguration? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
@@ -43,6 +45,7 @@ public struct SamplingParameters: Sendable, Equatable {
         self.seed = seed
         self.logprobCount = logprobCount
         self.allowedSequences = allowedSequences
+        self.jsonGrammar = jsonGrammar
     }
 
     var hasSamplingFiltersOrPenalties: Bool {
@@ -61,7 +64,8 @@ public enum TokenSampler {
     public static func sample(
         logits: MLXArray,
         parameters: SamplingParameters,
-        generatedTokens: [Int] = []
+        generatedTokens: [Int] = [],
+        jsonGrammarMatcher: JSONGrammarMatcher? = nil
     ) -> MLXArray {
         var logits = logits
         if let allowedSequences = parameters.allowedSequences,
@@ -73,7 +77,38 @@ public enum TokenSampler {
             // TRUE constrained decode (prefix trie); choice mode.
             logits = applyAllowedTokenMask(logits, allowedTokenIDs: allowedTokenIDs)
         }
+        if let jsonGrammarMatcher {
+            // Rejection fast path: validating one sampled candidate costs a single prefix
+            // parse; the full vocabulary mask costs one per token. Models mostly emit
+            // grammar-valid JSON, so try the unconstrained draw first. Resampling from the
+            // masked distribution on rejection keeps the constrained distribution exact:
+            // p(t) + (1-Z)·(p(t)/Z) = p(t)/Z.
+            let candidate = sampleUnconstrained(
+                logits: logits,
+                parameters: parameters,
+                generatedTokens: generatedTokens
+            )
+            if jsonGrammarMatcher.accepts(tokenID: candidate.item(Int.self)) {
+                return candidate
+            }
+            logits = applyAllowedTokenMask(
+                logits,
+                allowedTokenIDs: jsonGrammarMatcher.allowedTokenIDs()
+            )
+        }
+        return sampleUnconstrained(
+            logits: logits,
+            parameters: parameters,
+            generatedTokens: generatedTokens
+        )
+    }
 
+    private static func sampleUnconstrained(
+        logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokens: [Int]
+    ) -> MLXArray {
+        var logits = logits
         if parameters.temperature == 0 && !parameters.hasSamplingFiltersOrPenalties {
             return argMax(logits, axis: -1).reshaped([1])
         }

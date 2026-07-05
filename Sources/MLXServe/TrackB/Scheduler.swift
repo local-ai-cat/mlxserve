@@ -420,10 +420,12 @@ public actor Scheduler {
         sampling: SamplingParameters
     ) -> PreparedGeneratedToken {
         let nextTokenLogits = logits[0..., -1, 0...]
+        let matcher = sampling.jsonGrammar?.makeMatcher()
         let token = TokenSampler.sample(
             logits: nextTokenLogits[0, 0...],
             parameters: sampling,
-            generatedTokens: []
+            generatedTokens: [],
+            jsonGrammarMatcher: matcher
         )
         return PreparedGeneratedToken(token: token, tokenID: token.item(Int.self))
     }
