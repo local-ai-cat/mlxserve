@@ -9,7 +9,9 @@ struct RerankHandler {
         do {
             rerankRequest = try OpenAIRerankRequest.parse(request.body)
         } catch {
-            let status = (error as? OpenAIServerError)?.httpStatus ?? 422
+            let status = (error as? OpenAIHTTPError)?.status
+                ?? (error as? OpenAIServerError)?.httpStatus
+                ?? 422
             try await sendJSON(
                 openAIErrorBody(message: String(describing: error), status: status),
                 status: status,
