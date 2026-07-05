@@ -49,7 +49,7 @@ final class NativeModelEngine: @unchecked Sendable {
             uid: uid,
             input: input,
             maxTokens: request.maxTokens,
-            sampling: samplingParameters(from: request),
+            sampling: try samplingParameters(from: request),
             eosTokenIds: eosTokenIds
         )
 
@@ -67,7 +67,7 @@ final class NativeModelEngine: @unchecked Sendable {
             uid: uid,
             input: input,
             maxTokens: request.maxTokens,
-            sampling: samplingParameters(from: request),
+            sampling: try samplingParameters(from: request),
             eosTokenIds: eosTokenIds
         )
         return makeStream(from: mlxRequest, promptTokens: tokenIDs.count)
@@ -136,7 +136,7 @@ final class NativeModelEngine: @unchecked Sendable {
         )
     }
 
-    private func samplingParameters(from request: OpenAIChatRequest) -> SamplingParameters {
+    private func samplingParameters(from request: OpenAIChatRequest) throws -> SamplingParameters {
         SamplingParameters(
             temperature: request.temperature,
             topP: request.topP,
@@ -151,11 +151,12 @@ final class NativeModelEngine: @unchecked Sendable {
             seed: request.seed,
             allowedSequences: allowedSequences(from: request.structuredOutput),
             jsonGrammar: jsonGrammar(from: request.structuredOutput),
+            regexGrammar: try regexGrammar(from: request.structuredOutput),
             thinkingBudget: thinkingBudgetConfiguration(from: request)
         )
     }
 
-    private func samplingParameters(from request: OpenAICompletionRequest) -> SamplingParameters {
+    private func samplingParameters(from request: OpenAICompletionRequest) throws -> SamplingParameters {
         SamplingParameters(
             temperature: request.temperature,
             topP: request.topP,
@@ -169,13 +170,14 @@ final class NativeModelEngine: @unchecked Sendable {
             xtcSpecialTokens: xtcSpecialTokens(),
             seed: request.seed,
             allowedSequences: allowedSequences(from: request.structuredOutput),
-            jsonGrammar: jsonGrammar(from: request.structuredOutput)
+            jsonGrammar: jsonGrammar(from: request.structuredOutput),
+            regexGrammar: try regexGrammar(from: request.structuredOutput)
         )
     }
 
     private func jsonGrammar(from structuredOutput: StructuredOutputSpec) -> JSONGrammarConfiguration? {
         switch structuredOutput {
-        case .none, .choice:
+        case .none, .choice, .regex:
             return nil
         case .jsonObject:
             return JSONGrammarConfiguration(vocabulary: grammarVocabulary(), schema: .jsonObject)
@@ -184,6 +186,15 @@ final class NativeModelEngine: @unchecked Sendable {
                 vocabulary: grammarVocabulary(),
                 schema: JSONSchemaNode(openAISchema: schema)
             )
+        }
+    }
+
+    private func regexGrammar(from structuredOutput: StructuredOutputSpec) throws -> RegexGrammarConfiguration? {
+        guard case .regex(let pattern) = structuredOutput else { return nil }
+        do {
+            return try RegexGrammarConfiguration(vocabulary: grammarVocabulary(), pattern: pattern)
+        } catch let error as RegexGrammarError {
+            throw OpenAIServerError.invalidStructuredOutput(error.description)
         }
     }
 
@@ -281,6 +292,8 @@ final class NativeModelEngine: @unchecked Sendable {
         case .jsonSchema(_, let schema):
             let schemaJSON = try serializedJSONSchema(schema)
             directive = "You must respond with only a single valid JSON object conforming to this JSON Schema: \(schemaJSON). Output only the JSON."
+        case .regex(let pattern):
+            directive = "You must respond with text matching this regular expression and no other text: \(pattern)"
         case .none, .choice:
             directive = nil
         }

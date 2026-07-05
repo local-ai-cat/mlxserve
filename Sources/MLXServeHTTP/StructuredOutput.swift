@@ -2,15 +2,15 @@ import Foundation
 
 /// Structured output modes observable at the HTTP layer.
 ///
-/// `.choice`, `.jsonObject`, and `.jsonSchema` all run as true constrained decoding in the
-/// native sampler (choice = prefix trie; json = JSON prefix-grammar token masking, with the
-/// prompt directive kept as a quality hint). Raw grammar and regex requests fail at parse
-/// time because this port does not bind xgrammar.
+/// `.choice`, `.jsonObject`, `.jsonSchema`, and `.regex` all run as true constrained decoding
+/// in the native sampler. Raw grammar requests still fail at parse time because this port does
+/// not bind xgrammar.
 public enum StructuredOutputSpec: Sendable, Equatable {
     case none
     case jsonObject
     case jsonSchema(name: String?, schema: [String: OpenAIJSONValue])
     case choice([String])
+    case regex(pattern: String)
 }
 
 enum StructuredOutputParser {
@@ -76,9 +76,16 @@ enum StructuredOutputParser {
                 throw OpenAIServerError.invalidStructuredOutput("structured_outputs.choice requires at least one choice")
             }
             return .choice(choices)
-        case "grammar", "regex":
+        case "regex":
+            guard let pattern = object["pattern"] as? String ?? object["regex"] as? String,
+                !pattern.isEmpty
+            else {
+                throw OpenAIServerError.invalidJSON
+            }
+            return .regex(pattern: pattern)
+        case "grammar":
             throw OpenAIServerError.invalidStructuredOutput(
-                "structured_outputs.\(type) requires grammar compilation, which is unavailable"
+                "structured_outputs.grammar requires grammar compilation, which is unavailable"
             )
         default:
             throw OpenAIServerError.invalidJSON
