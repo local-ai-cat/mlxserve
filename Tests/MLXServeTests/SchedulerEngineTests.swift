@@ -1,4 +1,5 @@
 import CoreImage
+import Foundation
 import MLX
 import MLXHuggingFace
 import MLXLLM
@@ -272,6 +273,9 @@ final class SchedulerEngineTests: XCTestCase {
         guard let resolution = TestModelResolver.resolveVLM() else {
             throw XCTSkip("Set MLXSERVE_VLM_TEST_MODEL to run VLM concurrent engine gate.")
         }
+        guard try Self.modelType(in: resolution.url) == "qwen2_vl" else {
+            throw XCTSkip("VLM batch-equality gate is pinned to Qwen2-VL.")
+        }
 
         let container = try await VLMModelFactory.shared.loadContainer(
             from: resolution.url,
@@ -283,6 +287,7 @@ final class SchedulerEngineTests: XCTestCase {
             let inputs = try await [
                 Self.testImage(width: 96, height: 96),
                 Self.testImage(width: 160, height: 112),
+                Self.testImage(width: 112, height: 160),
             ].mapAsync { image in
                 try await context.processor.prepare(
                     input: UserInput(
@@ -291,41 +296,41 @@ final class SchedulerEngineTests: XCTestCase {
                     )
                 )
             }
-            let engine = MLXServeEngine(
+            let parameters = GenerateParameters(maxTokens: 24, temperature: 0)
+            let requests = inputs.enumerated().map { index, input in
+                Request(
+                    uid: "vlm-\(index)",
+                    input: input,
+                    maxTokens: parameters.maxTokens ?? 24,
+                    sampling: SamplingParameters(temperature: 0),
+                    eosTokenIds: eosTokenIds
+                )
+            }
+            var serial: [[Int]] = []
+            for request in requests {
+                let serialEngine = MLXServeEngine(
+                    model: context.model,
+                    parameters: parameters,
+                    maxConcurrentRequests: 1
+                )
+                let output = try await serialEngine.generate([request])
+                serial.append(output[request.uid, default: []])
+            }
+
+            let batchedEngine = MLXServeEngine(
                 model: context.model,
-                parameters: GenerateParameters(maxTokens: 24, temperature: 0),
-                maxConcurrentRequests: 2,
-                serializedDecode: true
+                parameters: parameters,
+                maxConcurrentRequests: 3,
+                serializedDecode: false
             )
-            let request0 = Request(
-                uid: "vlm-0",
-                input: inputs[0],
-                maxTokens: 24,
-                sampling: SamplingParameters(temperature: 0),
-                eosTokenIds: eosTokenIds
-            )
-            let request1 = Request(
-                uid: "vlm-1",
-                input: inputs[1],
-                maxTokens: 24,
-                sampling: SamplingParameters(temperature: 0),
-                eosTokenIds: eosTokenIds
-            )
+            let batched = try await batchedEngine.generate(requests)
 
-            async let responses0 = Self.collectResponses(
-                from: engine.stream(request0)
-            )
-            async let responses1 = Self.collectResponses(
-                from: engine.stream(request1)
-            )
-
-            let allResponses = try await [responses0, responses1]
-            for (index, responses) in allResponses.enumerated() {
+            for index in requests.indices {
                 let uid = "vlm-\(index)"
-                let nonEOSTokens = responses.filter { $0.token >= 0 && !eosTokenIds.contains($0.token) }
-                XCTAssertGreaterThan(nonEOSTokens.count, 1)
-                XCTAssertTrue(responses.allSatisfy { $0.uid == uid })
-                XCTAssertNotNil(responses.last?.finishReason)
+                let tokens = batched[uid, default: []]
+                let nonEOSTokens = tokens.filter { !eosTokenIds.contains($0) }
+                XCTAssertEqual(tokens, serial[index], uid)
+                XCTAssertGreaterThan(nonEOSTokens.count, 1, uid)
             }
         }
     }
@@ -571,10 +576,25 @@ final class SchedulerEngineTests: XCTestCase {
         return eosTokenIds
     }
 
+    private static func modelType(in modelURL: URL) throws -> String {
+        let configURL = modelURL.appendingPathComponent("config.json")
+        let configData = try Data(contentsOf: configURL)
+        let config = try JSONDecoder.json5().decode(ModelKindConfiguration.self, from: configData)
+        return config.modelType.lowercased()
+    }
+
     private static func topOneTopTwoMargin(_ logits: MLXArray) -> Float {
         let topValues = top(logits.asType(.float32), k: 2, axis: -1).asArray(Float.self)
         let sorted = topValues.sorted(by: >)
         return sorted[0] - sorted[1]
+    }
+}
+
+private struct ModelKindConfiguration: Decodable {
+    let modelType: String
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
     }
 }
 

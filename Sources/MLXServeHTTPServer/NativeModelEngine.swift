@@ -331,7 +331,8 @@ struct NativeModelLoader: EnginePoolModelLoader {
     let maxConcurrentRequests: Int
 
     func loadModel(id: String, modelURL: URL) async throws -> NativeModelEngine {
-        let isVLM = try isVLMModelDirectory(modelURL)
+        let modelType = try modelType(in: modelURL)
+        let isVLM = try isVLMModelDirectory(modelURL, modelType: modelType)
         let container =
             if isVLM {
                 try await VLMModelFactory.shared.loadContainer(
@@ -349,7 +350,7 @@ struct NativeModelLoader: EnginePoolModelLoader {
                 context: context,
                 modelID: id,
                 maxConcurrentRequests: maxConcurrentRequests,
-                serializedDecode: isVLM
+                serializedDecode: isVLM && Self.requiresSerializedDecode(modelType: modelType)
             )
         }
     }
@@ -358,12 +359,14 @@ struct NativeModelLoader: EnginePoolModelLoader {
         Memory.clearCache()
     }
 
-    private func isVLMModelDirectory(_ modelURL: URL) throws -> Bool {
+    private func modelType(in modelURL: URL) throws -> String {
         let configURL = modelURL.appending(component: "config.json")
         let configData = try Data(contentsOf: configURL)
         let config = try JSONDecoder.json5().decode(ModelKindConfiguration.self, from: configData)
-        let modelType = config.modelType.lowercased()
+        return config.modelType.lowercased()
+    }
 
+    private func isVLMModelDirectory(_ modelURL: URL, modelType: String) throws -> Bool {
         if let processorClass = processorClass(in: modelURL),
             Self.vlmProcessorClasses.contains(processorClass)
         {
@@ -374,6 +377,10 @@ struct NativeModelLoader: EnginePoolModelLoader {
             return false
         }
         return hasProcessorConfiguration(in: modelURL)
+    }
+
+    private static func requiresSerializedDecode(modelType: String) -> Bool {
+        scalarOffsetVLMModelTypes.contains(modelType.lowercased())
     }
 
     private func processorClass(in modelURL: URL) -> String? {
@@ -437,6 +444,20 @@ struct NativeModelLoader: EnginePoolModelLoader {
         "mistral3",
         "lfm2_vl",
         "lfm2-vl",
+        "glm_ocr",
+    ]
+
+    private static let scalarOffsetVLMModelTypes: Set<String> = [
+        // These VLMs still derive MRoPE position ids, mask lengths, attention
+        // scaling, or shared-KV RoPE offsets from scalar cache.offset values.
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "gemma4",
+        "mistral3",
+        // GlmOcr builds scalar MRoPE position ids from cache.offset in
+        // GlmOcr.swift:308, :356, and :383.
         "glm_ocr",
     ]
 
