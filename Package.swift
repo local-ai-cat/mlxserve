@@ -28,7 +28,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/atlas-open-sources/mlx-swift-lm.git",
-            revision: "1fb53ddf4373bb7646b86af8d2c01f2daee298f9"
+            revision: "098cf970a96c26dca1fb5b036abbf198c0b74ad4"
         ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
