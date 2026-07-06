@@ -6,19 +6,22 @@ public struct Request: @unchecked Sendable {
     public let maxTokens: Int
     public let sampling: SamplingParameters
     public let eosTokenIds: Set<Int>
+    public let cacheSession: String?
 
     public init(
         uid: String,
         input: LMInput,
         maxTokens: Int,
         sampling: SamplingParameters = SamplingParameters(),
-        eosTokenIds: Set<Int> = []
+        eosTokenIds: Set<Int> = [],
+        cacheSession: String? = nil
     ) {
         self.uid = uid
         self.input = input
         self.maxTokens = maxTokens
         self.sampling = sampling
         self.eosTokenIds = eosTokenIds
+        self.cacheSession = cacheSession
     }
 }
 

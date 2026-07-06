@@ -108,6 +108,7 @@ public struct OpenAIChatRequest: Sendable {
     public let structuredOutput: StructuredOutputSpec
     public let tools: [OpenAIJSONValue]?
     public let toolChoice: OpenAIToolChoice?
+    public let cacheSession: String?
 
     public init(
         model: String,
@@ -131,7 +132,8 @@ public struct OpenAIChatRequest: Sendable {
         chatTemplateKwargs: [String: OpenAIJSONValue]? = nil,
         structuredOutput: StructuredOutputSpec = .none,
         tools: [OpenAIJSONValue]? = nil,
-        toolChoice: OpenAIToolChoice? = nil
+        toolChoice: OpenAIToolChoice? = nil,
+        cacheSession: String? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -155,6 +157,7 @@ public struct OpenAIChatRequest: Sendable {
         self.structuredOutput = structuredOutput
         self.tools = tools
         self.toolChoice = toolChoice
+        self.cacheSession = cacheSession
     }
 }
 
@@ -177,6 +180,36 @@ public struct OpenAIChatStream: Sendable {
     public init(promptTokens: Int, chunks: AsyncThrowingStream<OpenAIChatChunk, Error>) {
         self.promptTokens = promptTokens
         self.chunks = chunks
+    }
+}
+
+public extension OpenAIChatRequest {
+    func withCacheSession(_ cacheSession: String?) -> OpenAIChatRequest {
+        OpenAIChatRequest(
+            model: model,
+            messages: messages,
+            maxTokens: maxTokens,
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            repetitionPenalty: repetitionPenalty,
+            minP: minP,
+            xtcProbability: xtcProbability,
+            xtcThreshold: xtcThreshold,
+            presencePenalty: presencePenalty,
+            frequencyPenalty: frequencyPenalty,
+            stop: stop,
+            seed: seed,
+            stream: stream,
+            includeUsage: includeUsage,
+            enableThinking: enableThinking,
+            thinkingBudget: thinkingBudget,
+            chatTemplateKwargs: chatTemplateKwargs,
+            structuredOutput: structuredOutput,
+            tools: tools,
+            toolChoice: toolChoice,
+            cacheSession: cacheSession
+        )
     }
 }
 
@@ -504,7 +537,10 @@ public final class OpenAIServer: @unchecked Sendable {
             )
             return
         }
-        let effectiveChatRequest = await chatRequestByMergingMCPTools(chatRequest)
+        let headerCacheSession = request.headers["x-cache-session"]
+        let effectiveChatRequest = await chatRequestByMergingMCPTools(
+            chatRequest.withCacheSession(headerCacheSession ?? chatRequest.cacheSession)
+        )
         let started = DispatchTime.now().uptimeNanoseconds
         let stream = try await backend.startChatCompletion(effectiveChatRequest)
 
@@ -1434,7 +1470,8 @@ public extension OpenAIChatRequest {
             chatTemplateKwargs: chatTemplateKwargs,
             structuredOutput: structuredOutput,
             tools: tools,
-            toolChoice: toolChoice
+            toolChoice: toolChoice,
+            cacheSession: stringValue(object["cache_session"])
         )
     }
 
@@ -1477,6 +1514,11 @@ public extension OpenAIChatRequest {
         default:
             return nil
         }
+    }
+
+    private static func stringValue(_ value: Any?) -> String? {
+        guard let value = value as? String, !value.isEmpty else { return nil }
+        return value
     }
 
     private static func stopValues(_ value: Any?) throws -> [String] {

@@ -127,7 +127,10 @@ where Loader.Engine == NativeModelEngine {
     }
 
     func modelPoolStatus() async throws -> OpenAIModelPoolStatus {
-        var status = OpenAIModelPoolStatus(await pool.status())
+        let prefixMemory = (await pool.loadedEngines()).reduce(Int64(0)) { total, loaded in
+            total + loaded.engine.prefixCacheStats().currentBytes
+        }
+        var status = OpenAIModelPoolStatus(await pool.status()).addingPrefixCacheMemory(prefixMemory)
         if let speechBackend = speechBackend as? RegistrySpeechBackend {
             let speechModels = await speechBackend.speechModelStatuses()
             let speechMemory = speechModels.compactMap(\.actualSize).reduce(Int64(0), +)
@@ -275,6 +278,16 @@ private extension OpenAIModelPoolStatus {
                 if lhs.id == rhs.id { return lhs.modelType < rhs.modelType }
                 return lhs.id < rhs.id
             }
+        )
+    }
+
+    func addingPrefixCacheMemory(_ prefixMemory: Int64) -> OpenAIModelPoolStatus {
+        OpenAIModelPoolStatus(
+            finalCeiling: finalCeiling,
+            currentModelMemory: currentModelMemory + prefixMemory,
+            modelCount: modelCount,
+            loadedCount: loadedCount,
+            models: models
         )
     }
 }

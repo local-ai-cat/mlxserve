@@ -257,7 +257,8 @@ public func openAIChatRequestByReplacingTools(
         chatTemplateKwargs: request.chatTemplateKwargs,
         structuredOutput: request.structuredOutput,
         tools: tools,
-        toolChoice: request.toolChoice
+        toolChoice: request.toolChoice,
+        cacheSession: request.cacheSession
     )
 }
 

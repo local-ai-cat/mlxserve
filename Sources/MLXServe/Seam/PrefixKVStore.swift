@@ -17,7 +17,7 @@ public struct SerializedKVLayer: @unchecked Sendable {
 public final class PrefixKVStoreHit: @unchecked Sendable {
     public let matchedTokenCount: Int
     public let blockCount: Int
-    fileprivate let storage: Any
+    let storage: Any
 
     init(matchedTokenCount: Int, blockCount: Int, storage: Any) {
         self.matchedTokenCount = matchedTokenCount
@@ -27,12 +27,22 @@ public final class PrefixKVStoreHit: @unchecked Sendable {
 }
 
 public protocol PrefixKVStore: AnyObject, Sendable {
-    func fetch(tokens: [Int]) -> PrefixKVStoreHit?
+    func fetch(tokens: [Int], sessionKey: String?) -> PrefixKVStoreHit?
     func preload(_ hit: PrefixKVStoreHit) throws
     func reconstructCache(from hit: PrefixKVStoreHit) throws -> [SerializedKVLayer]
-    func store(tokens: [Int], cache: [SerializedKVLayer]) throws
+    func store(tokens: [Int], sessionKey: String?, cache: [SerializedKVLayer]) throws
     func release(_ hit: PrefixKVStoreHit)
     func clearEntry(_ hit: PrefixKVStoreHit)
+}
+
+public extension PrefixKVStore {
+    func fetch(tokens: [Int]) -> PrefixKVStoreHit? {
+        fetch(tokens: tokens, sessionKey: nil)
+    }
+
+    func store(tokens: [Int], cache: [SerializedKVLayer]) throws {
+        try store(tokens: tokens, sessionKey: nil, cache: cache)
+    }
 }
 
 public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
@@ -63,7 +73,7 @@ public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
         self.prefixCache = prefixCache
     }
 
-    public func fetch(tokens: [Int]) -> PrefixKVStoreHit? {
+    public func fetch(tokens: [Int], sessionKey: String?) -> PrefixKVStoreHit? {
         withLock {
             guard let hit = prefixCache.fetchCache(tokens: tokens) else { return nil }
             _fetchHitCount += 1
@@ -97,7 +107,7 @@ public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
         }
     }
 
-    public func store(tokens: [Int], cache: [SerializedKVLayer]) throws {
+    public func store(tokens: [Int], sessionKey: String?, cache: [SerializedKVLayer]) throws {
         try withLock {
             let layerCaches = try cache.map { layer in
                 try Self.cache(from: layer)
@@ -129,7 +139,9 @@ public final class BlockAwarePrefixKVStore: PrefixKVStore, @unchecked Sendable {
 
         let cache = KVCacheSimple()
         cache.state = layer.state
-        cache.metaState = layer.metaState
+        if !layer.metaState.isEmpty {
+            cache.metaState = layer.metaState
+        }
         return cache
     }
 

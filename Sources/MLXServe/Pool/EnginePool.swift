@@ -49,6 +49,16 @@ public struct EnginePoolModelStatus: Equatable, Sendable {
     public let inUse: Int
 }
 
+public struct EnginePoolLoadedEngine<Engine: Sendable>: Sendable {
+    public let modelID: String
+    public let engine: Engine
+
+    fileprivate init(modelID: String, engine: Engine) {
+        self.modelID = modelID
+        self.engine = engine
+    }
+}
+
 public struct EnginePoolStatus: Equatable, Sendable {
     public let finalCeiling: Int64
     public let currentModelMemory: Int64
@@ -236,6 +246,13 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             loadedCount: modelStatuses.filter(\.loaded).count,
             models: modelStatuses
         )
+    }
+
+    public func loadedEngines() -> [EnginePoolLoadedEngine<Loader.Engine>] {
+        entries.values.compactMap { entry in
+            guard let engine = entry.engine else { return nil }
+            return EnginePoolLoadedEngine(modelID: entry.modelID, engine: engine)
+        }
     }
 
     public func admitWaitingRequest() throws -> EnginePoolQueueTicket {

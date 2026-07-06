@@ -50,6 +50,29 @@ final class PrefixSchedulerIntegrationTests: XCTestCase {
         XCTAssertEqual(result.refAfterBatch, result.refBaseline)
     }
 
+    func testSessionPrefixCacheReusesExtendedPrompt() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run M10a session prefix gate.")
+        }
+        guard resolution.url.lastPathComponent == "Qwen3-0.6B-4bit" else {
+            throw XCTSkip("M10a session prefix gate is pinned to Qwen3-0.6B-4bit.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+        let stats = try await container.perform { context in
+            try await Self.evaluateSessionReuseGate(context: context)
+        }
+
+        XCTAssertEqual(stats.fetchHitCount, 1)
+        XCTAssertGreaterThanOrEqual(stats.storeCount, 2)
+        XCTAssertEqual(stats.clearCount, 0)
+    }
+
     private static func evaluateGate(context: ModelContext) async throws -> PrefixSchedulerGateResult {
         let model = context.model
         let blockSize = 256
@@ -140,6 +163,48 @@ final class PrefixSchedulerIntegrationTests: XCTestCase {
             refBaseline: refBaseline,
             refAfterBatch: manager.totalRefCount
         )
+    }
+
+    private static func evaluateSessionReuseGate(context: ModelContext) async throws -> SessionPrefixKVStoreStats {
+        let parameters = GenerateParameters(maxTokens: 2, temperature: 0)
+        let prefixTokens = try await makePrefixTokens(context: context, blockSize: 256)
+        let first = prefixTokens + (try await tokenIDs(
+            for: " First request.",
+            context: context,
+            parameters: parameters
+        ))
+        let second = first + (try await tokenIDs(
+            for: " Second request extends the first.",
+            context: context,
+            parameters: parameters
+        ))
+        let prefixStore = SessionPrefixKVStore()
+        let engine = MLXServeEngine(
+            model: context.model,
+            parameters: parameters,
+            maxConcurrentRequests: 1,
+            prefixStore: prefixStore
+        )
+
+        _ = try await engine.generate([
+            Request(
+                uid: "session-1",
+                input: LMInput(text: LMInput.Text(tokens: MLXArray(first.map(Int32.init)))),
+                maxTokens: parameters.maxTokens ?? 2,
+                sampling: SamplingParameters(temperature: 0),
+                cacheSession: "session-a"
+            )
+        ])
+        _ = try await engine.generate([
+            Request(
+                uid: "session-2",
+                input: LMInput(text: LMInput.Text(tokens: MLXArray(second.map(Int32.init)))),
+                maxTokens: parameters.maxTokens ?? 2,
+                sampling: SamplingParameters(temperature: 0),
+                cacheSession: "session-a"
+            )
+        ])
+        return prefixStore.stats
     }
 
     private static func serialTrace(

@@ -228,7 +228,7 @@ public actor Scheduler {
         var responses: [Response] = []
         for uid in pendingCancellation {
             guard running[uid] != nil else { continue }
-            clearPrefixEntry(uid: uid)
+            releasePrefixHit(uid: uid)
             generator.remove(uid: uid)
             running.removeValue(forKey: uid)
             let response = Response(uid: uid, token: -1, finishReason: .cancelled)
@@ -269,7 +269,7 @@ public actor Scheduler {
         if prefixCacheEnabled,
             prefixCacheEligible,
             let prefixStore,
-            let hit = prefixStore.fetch(tokens: promptTokens)
+            let hit = prefixStore.fetch(tokens: promptTokens, sessionKey: request.cacheSession)
         {
             do {
                 let serialized = try prefixStore.reconstructCache(from: hit)
@@ -379,7 +379,11 @@ public actor Scheduler {
             )
         }
         do {
-            try prefixStore.store(tokens: runningRequest.promptTokens, cache: serialized)
+            try prefixStore.store(
+                tokens: runningRequest.promptTokens,
+                sessionKey: runningRequest.request.cacheSession,
+                cache: serialized
+            )
         } catch {
             logCacheFailure("prompt cache store failed", error)
         }
@@ -388,11 +392,6 @@ public actor Scheduler {
     private func releasePrefixHit(uid: String) {
         guard let hit = running[uid]?.prefixHit else { return }
         prefixStore?.release(hit)
-    }
-
-    private func clearPrefixEntry(uid: String) {
-        guard let hit = running[uid]?.prefixHit else { return }
-        prefixStore?.clearEntry(hit)
     }
 
     private func logCacheFailure(_ message: String, _ error: Error) {

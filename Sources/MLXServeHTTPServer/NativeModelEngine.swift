@@ -15,6 +15,7 @@ final class NativeModelEngine: @unchecked Sendable {
     private let context: ModelContext
     private let engine: MLXServeEngine
     private let parameters: GenerateParameters
+    private let prefixStore: SessionPrefixKVStore
     private let eosTokenIds: Set<Int>
     private let grammarVocabularyLock = NSLock()
     private var cachedGrammarVocabulary: JSONGrammarVocabulary?
@@ -28,10 +29,12 @@ final class NativeModelEngine: @unchecked Sendable {
         self.context = context
         self.modelID = modelID
         self.parameters = GenerateParameters(maxTokens: 16, temperature: 0)
+        self.prefixStore = SessionPrefixKVStore(maxBytes: Self.prefixCacheMaxBytes())
         self.engine = MLXServeEngine(
             model: context.model,
             parameters: parameters,
             maxConcurrentRequests: maxConcurrentRequests,
+            prefixStore: prefixStore,
             serializedDecode: serializedDecode
         )
         var eosTokenIds = context.configuration.eosTokenIds
@@ -50,7 +53,8 @@ final class NativeModelEngine: @unchecked Sendable {
             input: input,
             maxTokens: request.maxTokens,
             sampling: try samplingParameters(from: request),
-            eosTokenIds: eosTokenIds
+            eosTokenIds: eosTokenIds,
+            cacheSession: request.cacheSession
         )
 
         return makeStream(from: mlxRequest, promptTokens: promptTokens)
@@ -71,6 +75,10 @@ final class NativeModelEngine: @unchecked Sendable {
             eosTokenIds: eosTokenIds
         )
         return makeStream(from: mlxRequest, promptTokens: tokenIDs.count)
+    }
+
+    func prefixCacheStats() -> SessionPrefixKVStoreStats {
+        prefixStore.stats
     }
 
     func countPromptTokens(for request: OpenAIChatRequest) async throws -> Int {
@@ -124,6 +132,11 @@ final class NativeModelEngine: @unchecked Sendable {
 
     private func countPromptTokens(_ input: LMInput) throws -> Int {
         input.text.tokens.size
+    }
+
+    private static func prefixCacheMaxBytes() -> Int64 {
+        let raw = ProcessInfo.processInfo.environment["MLXSERVE_PREFIX_CACHE_MAX_BYTES"]
+        return raw.flatMap(Int64.init) ?? 0
     }
 
     private func xtcSpecialTokens() -> [Int] {

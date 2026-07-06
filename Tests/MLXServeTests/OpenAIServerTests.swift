@@ -31,6 +31,23 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertTrue(error["code"] is NSNull)
     }
 
+    func testHTTPRequestParsesCacheSessionHeaderCaseInsensitively() throws {
+        let rawRequest = Data(
+            """
+            POST /v1/chat/completions HTTP/1.1\r
+            Host: localhost\r
+            X-Cache-Session: header-session\r
+            Content-Length: 2\r
+            \r
+            {}
+            """.utf8
+        )
+
+        let request = try HTTPRequest.parseComplete(rawRequest)
+
+        XCTAssertEqual(request.headers["x-cache-session"], "header-session")
+    }
+
     func testOpenAIErrorTypeMapping() {
         XCTAssertEqual(openAIErrorType(status: 401), "authentication_error")
         XCTAssertEqual(openAIErrorType(status: 400), "invalid_request_error")
@@ -167,6 +184,7 @@ final class OpenAIServerTests: XCTestCase {
                   "stream_options": { "include_usage": true },
                   "enable_thinking": false,
                   "thinking_budget": 24,
+                  "cache_session": "body-session",
                   "chat_template_kwargs": {
                     "reasoning_effort": "low",
                     "budget": 16,
@@ -196,6 +214,7 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertTrue(request.includeUsage)
         XCTAssertEqual(request.enableThinking, false)
         XCTAssertEqual(request.thinkingBudget, 24)
+        XCTAssertEqual(request.cacheSession, "body-session")
         XCTAssertEqual(request.chatTemplateKwargs?["reasoning_effort"], .string("low"))
         XCTAssertEqual(request.chatTemplateKwargs?["budget"], .number(16))
         XCTAssertEqual(request.chatTemplateKwargs?["nested"], .object(["enabled": .bool(true)]))
