@@ -146,6 +146,7 @@ public struct SamplingParameters: Sendable, Equatable {
     public var allowedSequences: [[Int]]?
     public var jsonGrammar: JSONGrammarConfiguration?
     public var regexGrammar: RegexGrammarConfiguration?
+    public var gbnfGrammar: GBNFGrammarConfiguration?
     public var thinkingBudget: ThinkingBudgetConfiguration?
 
     public init(
@@ -164,6 +165,7 @@ public struct SamplingParameters: Sendable, Equatable {
         allowedSequences: [[Int]]? = nil,
         jsonGrammar: JSONGrammarConfiguration? = nil,
         regexGrammar: RegexGrammarConfiguration? = nil,
+        gbnfGrammar: GBNFGrammarConfiguration? = nil,
         thinkingBudget: ThinkingBudgetConfiguration? = nil
     ) {
         self.temperature = temperature
@@ -181,6 +183,7 @@ public struct SamplingParameters: Sendable, Equatable {
         self.allowedSequences = allowedSequences
         self.jsonGrammar = jsonGrammar
         self.regexGrammar = regexGrammar
+        self.gbnfGrammar = gbnfGrammar
         self.thinkingBudget = thinkingBudget
     }
 
@@ -202,7 +205,8 @@ public enum TokenSampler {
         parameters: SamplingParameters,
         generatedTokens: [Int] = [],
         jsonGrammarMatcher: JSONGrammarMatcher? = nil,
-        regexGrammarMatcher: RegexGrammarMatcher? = nil
+        regexGrammarMatcher: RegexGrammarMatcher? = nil,
+        gbnfGrammarMatcher: GBNFGrammarMatcher? = nil
     ) -> MLXArray {
         var noThinkingBudgetState: ThinkingBudgetState?
         return sample(
@@ -211,6 +215,7 @@ public enum TokenSampler {
             generatedTokens: generatedTokens,
             jsonGrammarMatcher: jsonGrammarMatcher,
             regexGrammarMatcher: regexGrammarMatcher,
+            gbnfGrammarMatcher: gbnfGrammarMatcher,
             thinkingBudgetState: &noThinkingBudgetState
         )
     }
@@ -221,6 +226,7 @@ public enum TokenSampler {
         generatedTokens: [Int] = [],
         jsonGrammarMatcher: JSONGrammarMatcher? = nil,
         regexGrammarMatcher: RegexGrammarMatcher? = nil,
+        gbnfGrammarMatcher: GBNFGrammarMatcher? = nil,
         thinkingBudgetState: inout ThinkingBudgetState?
     ) -> MLXArray {
         var logits = logits
@@ -230,7 +236,8 @@ public enum TokenSampler {
                 parameters: parameters,
                 generatedTokens: generatedTokens,
                 jsonGrammarMatcher: jsonGrammarMatcher,
-                regexGrammarMatcher: regexGrammarMatcher
+                regexGrammarMatcher: regexGrammarMatcher,
+                gbnfGrammarMatcher: gbnfGrammarMatcher
             ) {
                 return MLXArray([Int32(forcedTokenID)])
             }
@@ -275,6 +282,18 @@ public enum TokenSampler {
                 allowedTokenIDs: regexGrammarMatcher.allowedTokenIDs()
             )
         }
+        if let gbnfGrammarMatcher {
+            if parameters.temperature == 0 && !parameters.hasSamplingFiltersOrPenalties {
+                let candidate = argMax(logits, axis: -1).reshaped([1])
+                if gbnfGrammarMatcher.accepts(tokenID: candidate.item(Int.self)) {
+                    return candidate
+                }
+            }
+            logits = applyAllowedTokenMask(
+                logits,
+                allowedTokenIDs: gbnfGrammarMatcher.allowedTokenIDs()
+            )
+        }
         return sampleUnconstrained(
             logits: logits,
             parameters: parameters,
@@ -287,7 +306,8 @@ public enum TokenSampler {
         parameters: SamplingParameters,
         generatedTokens: [Int],
         jsonGrammarMatcher: JSONGrammarMatcher?,
-        regexGrammarMatcher: RegexGrammarMatcher?
+        regexGrammarMatcher: RegexGrammarMatcher?,
+        gbnfGrammarMatcher: GBNFGrammarMatcher?
     ) -> Bool {
         if let allowedSequences = parameters.allowedSequences,
             let allowedTokenIDs = allowedNextTokenIDs(
@@ -302,6 +322,9 @@ public enum TokenSampler {
             return false
         }
         if let regexGrammarMatcher, !regexGrammarMatcher.accepts(tokenID: tokenID) {
+            return false
+        }
+        if let gbnfGrammarMatcher, !gbnfGrammarMatcher.accepts(tokenID: tokenID) {
             return false
         }
         return true

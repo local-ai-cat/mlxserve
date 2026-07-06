@@ -2,21 +2,24 @@ import Foundation
 
 /// Structured output modes observable at the HTTP layer.
 ///
-/// `.choice`, `.jsonObject`, `.jsonSchema`, and `.regex` all run as true constrained decoding
-/// in the native sampler. Raw grammar requests still fail at parse time because this port does
-/// not bind xgrammar.
+/// `.choice`, `.jsonObject`, `.jsonSchema`, `.regex`, and `.grammar` all run as true
+/// constrained decoding in the native sampler.
 public enum StructuredOutputSpec: Sendable, Equatable {
     case none
     case jsonObject
     case jsonSchema(name: String?, schema: [String: OpenAIJSONValue])
     case choice([String])
     case regex(pattern: String)
+    case grammar(String)
 }
 
 enum StructuredOutputParser {
     static func parse(from object: [String: Any]) throws -> StructuredOutputSpec {
         if hasNonNullValue(object["guided_grammar"]) {
-            throw OpenAIServerError.invalidStructuredOutput("guided_grammar requires grammar compilation, which is unavailable")
+            guard let grammar = object["guided_grammar"] as? String, !grammar.isEmpty else {
+                throw OpenAIServerError.invalidJSON
+            }
+            return .grammar(grammar)
         }
 
         // omlx-specific guided controls are more explicit than OpenAI response_format.
@@ -84,9 +87,12 @@ enum StructuredOutputParser {
             }
             return .regex(pattern: pattern)
         case "grammar":
-            throw OpenAIServerError.invalidStructuredOutput(
-                "structured_outputs.grammar requires grammar compilation, which is unavailable"
-            )
+            guard let grammar = object["grammar"] as? String ?? object["gbnf"] as? String,
+                !grammar.isEmpty
+            else {
+                throw OpenAIServerError.invalidJSON
+            }
+            return .grammar(grammar)
         default:
             throw OpenAIServerError.invalidJSON
         }

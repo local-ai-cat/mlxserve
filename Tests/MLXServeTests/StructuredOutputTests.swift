@@ -153,25 +153,23 @@ final class StructuredOutputTests: XCTestCase {
         }
     }
 
-    func testGuidedGrammarThrowsBadRequest() {
-        XCTAssertThrowsError(
-            try OpenAIChatRequest.parse(
-                Data(
-                    """
-                    {
-                      "model": "test-model",
-                      "messages": [{"role": "user", "content": "hello"}],
-                      "guided_grammar": "root ::= \\"yes\\""
-                    }
-                    """.utf8
-                )
+    func testGuidedGrammarParses() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "guided_grammar": "root ::= \\"yes\\""
+                }
+                """.utf8
             )
-        ) { error in
-            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 400)
-        }
+        )
+
+        XCTAssertEqual(request.structuredOutput, .grammar("root ::= \"yes\""))
     }
 
-    func testStructuredOutputsGrammarThrowsBadRequest() {
+    func testStructuredOutputsGrammarWithoutGrammarFieldThrowsInvalidJSON() {
         XCTAssertThrowsError(
             try OpenAIChatRequest.parse(
                 Data(
@@ -185,8 +183,46 @@ final class StructuredOutputTests: XCTestCase {
                 )
             )
         ) { error in
-            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 400)
+            XCTAssertEqual((error as? OpenAIServerError)?.httpStatus, 422)
         }
+    }
+
+    func testStructuredOutputsGrammarParsesGrammarField() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "structured_outputs": {
+                    "type": "grammar",
+                    "grammar": "root ::= [0-9]+"
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(request.structuredOutput, .grammar("root ::= [0-9]+"))
+    }
+
+    func testStructuredOutputsGrammarParsesGBNFField() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "structured_outputs": {
+                    "type": "grammar",
+                    "gbnf": "root ::= \\"ok\\""
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(request.structuredOutput, .grammar("root ::= \"ok\""))
     }
 
     func testStructuredOutputsRegexParsesPattern() throws {

@@ -421,6 +421,7 @@ public actor Scheduler {
         let nextTokenLogits = logits[0..., -1, 0...]
         let matcher = sampling.jsonGrammar?.makeMatcher()
         let regexMatcher = sampling.regexGrammar?.makeMatcher()
+        let gbnfMatcher = sampling.gbnfGrammar?.makeMatcher()
         var thinkingBudgetState = sampling.thinkingBudget.map(ThinkingBudgetState.init(configuration:))
         let token = TokenSampler.sample(
             logits: nextTokenLogits[0, 0...],
@@ -428,6 +429,7 @@ public actor Scheduler {
             generatedTokens: [],
             jsonGrammarMatcher: matcher,
             regexGrammarMatcher: regexMatcher,
+            gbnfGrammarMatcher: gbnfMatcher,
             thinkingBudgetState: &thinkingBudgetState
         )
         let tokenID = token.item(Int.self)
@@ -436,6 +438,9 @@ public actor Scheduler {
         }
         if regexMatcher?.accepts(tokenID: tokenID) == true {
             regexMatcher?.advance(tokenID: tokenID)
+        }
+        if gbnfMatcher?.accepts(tokenID: tokenID) == true {
+            gbnfMatcher?.advance(tokenID: tokenID)
         }
         thinkingBudgetState?.advance(tokenID: tokenID)
         return PreparedGeneratedToken(

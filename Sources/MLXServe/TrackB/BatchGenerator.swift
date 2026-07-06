@@ -113,6 +113,7 @@ public final class ContinuousBatchGenerator {
     private var samplers: [SamplingParameters] = []
     private var jsonGrammarMatchers: [JSONGrammarMatcher?] = []
     private var regexGrammarMatchers: [RegexGrammarMatcher?] = []
+    private var gbnfGrammarMatchers: [GBNFGrammarMatcher?] = []
     private var thinkingBudgetStates: [ThinkingBudgetState?] = []
     private var generatedTokenHistory: [[Int]] = []
     private var state: LMOutput.State?
@@ -204,17 +205,20 @@ public final class ContinuousBatchGenerator {
         samplers.append(sampling)
         let matcher = sampling.jsonGrammar?.makeMatcher()
         let regexMatcher = sampling.regexGrammar?.makeMatcher()
+        let gbnfMatcher = sampling.gbnfGrammar?.makeMatcher()
         var thinkingBudgetState = initialThinkingBudgetState
             ?? sampling.thinkingBudget.map(ThinkingBudgetState.init(configuration:))
         for token in generatedTokens {
             matcher?.advance(tokenID: token)
             regexMatcher?.advance(tokenID: token)
+            gbnfMatcher?.advance(tokenID: token)
             if initialThinkingBudgetState == nil {
                 thinkingBudgetState?.advance(tokenID: token)
             }
         }
         jsonGrammarMatchers.append(matcher)
         regexGrammarMatchers.append(regexMatcher)
+        gbnfGrammarMatchers.append(gbnfMatcher)
         thinkingBudgetStates.append(thinkingBudgetState)
         generatedTokenHistory.append(generatedTokens)
         state = nil
@@ -239,6 +243,7 @@ public final class ContinuousBatchGenerator {
             samplers.removeAll()
             jsonGrammarMatchers.removeAll()
             regexGrammarMatchers.removeAll()
+            gbnfGrammarMatchers.removeAll()
             thinkingBudgetStates.removeAll()
             generatedTokenHistory.removeAll()
             currentTokens = MLXArray([Int32]())
@@ -255,6 +260,7 @@ public final class ContinuousBatchGenerator {
         samplers = rows.map { samplers[$0] }
         jsonGrammarMatchers = rows.map { jsonGrammarMatchers[$0] }
         regexGrammarMatchers = rows.map { regexGrammarMatchers[$0] }
+        gbnfGrammarMatchers = rows.map { gbnfGrammarMatchers[$0] }
         thinkingBudgetStates = rows.map { thinkingBudgetStates[$0] }
         generatedTokenHistory = rows.map { generatedTokenHistory[$0] }
         state = nil
@@ -281,6 +287,7 @@ public final class ContinuousBatchGenerator {
                 generatedTokens: generatedTokenHistory[row],
                 jsonGrammarMatcher: jsonGrammarMatchers[row],
                 regexGrammarMatcher: regexGrammarMatchers[row],
+                gbnfGrammarMatcher: gbnfGrammarMatchers[row],
                 thinkingBudgetState: &thinkingBudgetStates[row]
             )
             sampledRows.append(token)
@@ -300,6 +307,9 @@ public final class ContinuousBatchGenerator {
             }
             if regexGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
                 regexGrammarMatchers[row]?.advance(tokenID: tokenID)
+            }
+            if gbnfGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
+                gbnfGrammarMatchers[row]?.advance(tokenID: tokenID)
             }
             thinkingBudgetStates[row]?.advance(tokenID: tokenID)
         }
@@ -333,6 +343,7 @@ public final class ContinuousBatchGenerator {
         let nextTokenLogits = logits[0..., -1, 0...]
         let matcher = sampling.jsonGrammar?.makeMatcher()
         let regexMatcher = sampling.regexGrammar?.makeMatcher()
+        let gbnfMatcher = sampling.gbnfGrammar?.makeMatcher()
         var thinkingBudgetState = sampling.thinkingBudget.map(ThinkingBudgetState.init(configuration:))
         let token = TokenSampler.sample(
             logits: nextTokenLogits[0, 0...],
@@ -340,6 +351,7 @@ public final class ContinuousBatchGenerator {
             generatedTokens: [],
             jsonGrammarMatcher: matcher,
             regexGrammarMatcher: regexMatcher,
+            gbnfGrammarMatcher: gbnfMatcher,
             thinkingBudgetState: &thinkingBudgetState
         )
         let tokenID = token.item(Int.self)
@@ -348,6 +360,9 @@ public final class ContinuousBatchGenerator {
         }
         if regexMatcher?.accepts(tokenID: tokenID) == true {
             regexMatcher?.advance(tokenID: tokenID)
+        }
+        if gbnfMatcher?.accepts(tokenID: tokenID) == true {
+            gbnfMatcher?.advance(tokenID: tokenID)
         }
         thinkingBudgetState?.advance(tokenID: tokenID)
         return PreparedSampledToken(token: token, thinkingBudgetState: thinkingBudgetState)

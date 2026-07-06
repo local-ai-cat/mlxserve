@@ -152,6 +152,7 @@ final class NativeModelEngine: @unchecked Sendable {
             allowedSequences: allowedSequences(from: request.structuredOutput),
             jsonGrammar: jsonGrammar(from: request.structuredOutput),
             regexGrammar: try regexGrammar(from: request.structuredOutput),
+            gbnfGrammar: try gbnfGrammar(from: request.structuredOutput),
             thinkingBudget: thinkingBudgetConfiguration(from: request)
         )
     }
@@ -171,13 +172,14 @@ final class NativeModelEngine: @unchecked Sendable {
             seed: request.seed,
             allowedSequences: allowedSequences(from: request.structuredOutput),
             jsonGrammar: jsonGrammar(from: request.structuredOutput),
-            regexGrammar: try regexGrammar(from: request.structuredOutput)
+            regexGrammar: try regexGrammar(from: request.structuredOutput),
+            gbnfGrammar: try gbnfGrammar(from: request.structuredOutput)
         )
     }
 
     private func jsonGrammar(from structuredOutput: StructuredOutputSpec) -> JSONGrammarConfiguration? {
         switch structuredOutput {
-        case .none, .choice, .regex:
+        case .none, .choice, .regex, .grammar:
             return nil
         case .jsonObject:
             return JSONGrammarConfiguration(vocabulary: grammarVocabulary(), schema: .jsonObject)
@@ -194,6 +196,15 @@ final class NativeModelEngine: @unchecked Sendable {
         do {
             return try RegexGrammarConfiguration(vocabulary: grammarVocabulary(), pattern: pattern)
         } catch let error as RegexGrammarError {
+            throw OpenAIServerError.invalidStructuredOutput(error.description)
+        }
+    }
+
+    private func gbnfGrammar(from structuredOutput: StructuredOutputSpec) throws -> GBNFGrammarConfiguration? {
+        guard case .grammar(let grammar) = structuredOutput else { return nil }
+        do {
+            return try GBNFGrammarConfiguration(vocabulary: grammarVocabulary(), grammar: grammar)
+        } catch let error as GBNFGrammarError {
             throw OpenAIServerError.invalidStructuredOutput(error.description)
         }
     }
@@ -294,6 +305,8 @@ final class NativeModelEngine: @unchecked Sendable {
             directive = "You must respond with only a single valid JSON object conforming to this JSON Schema: \(schemaJSON). Output only the JSON."
         case .regex(let pattern):
             directive = "You must respond with text matching this regular expression and no other text: \(pattern)"
+        case .grammar(let grammar):
+            directive = "You must respond with text matching this GBNF grammar and no other text: \(grammar)"
         case .none, .choice:
             directive = nil
         }
