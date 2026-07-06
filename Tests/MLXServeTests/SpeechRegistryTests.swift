@@ -106,6 +106,35 @@ actor FakeStreamSession: SpeechStreamSession {
     }
 }
 
+/// Claims models in its catalog but fails every load — the corrupt-folder case.
+final class BrokenSpeechAdapter: SpeechEngineAdapter, @unchecked Sendable {
+    let engineID: String
+    let capabilities: SpeechEngineCapabilities
+    private let models: [SpeechModelInfo]
+
+    var displayName: String { "Broken (\(engineID))" }
+
+    init(engineID: String, silicon: SpeechEngineSilicon, modelIDs: [String]) {
+        self.engineID = engineID
+        self.capabilities = SpeechEngineCapabilities(
+            supportsFileTranscription: true,
+            supportsStreaming: false,
+            silicon: silicon
+        )
+        self.models = modelIDs.map { SpeechModelInfo(id: $0, engineID: engineID, displayName: $0) }
+    }
+
+    func availableModels() async -> [SpeechModelInfo] { models }
+
+    func transcribeFile(_ request: SpeechFileTranscriptionRequest) async throws -> SpeechTranscriptionResult {
+        throw SpeechEngineError.engineFailure("corrupt model folder")
+    }
+
+    func makeStreamSession(modelID: String, language: String?) async throws -> any SpeechStreamSession {
+        throw SpeechEngineError.streamingUnsupported(engineID: engineID)
+    }
+}
+
 // MARK: - Registry tests
 
 final class SpeechRegistryTests: XCTestCase {
@@ -228,17 +257,33 @@ final class RegistrySpeechBackendTests: XCTestCase {
         XCTAssertEqual(result.segments?.first?.start, 0.0)
     }
 
-    func testBridgeUnknownModelSurfacesError() async throws {
+    func testBridgeUnknownModelMapsTo404WithModelList() async throws {
         let registry = SpeechEngineRegistry()
+        await registry.register(FakeSpeechAdapter(engineID: "whisperkit", silicon: .ane, modelIDs: ["tiny"]))
         let backend = await RegistrySpeechBackend(registry: registry)
 
         do {
             _ = try await backend.transcribe(
                 AudioTranscriptionRequest(model: "ghost", fileName: "t.wav", fileData: Data())
             )
-            XCTFail("expected unknownModel")
-        } catch let error as SpeechEngineError {
-            XCTAssertEqual(error, .unknownModel("ghost"))
+            XCTFail("expected 404")
+        } catch let error as OpenAIHTTPError {
+            XCTAssertEqual(error.status, 404)
+            XCTAssertTrue(error.message.contains("tiny"), "404 body should list available models")
         }
+    }
+
+    func testBridgeFallsThroughToNextCandidateOnLoadFailure() async throws {
+        let registry = SpeechEngineRegistry()
+        await registry.register(
+            BrokenSpeechAdapter(engineID: "corrupt-ane", silicon: .ane, modelIDs: ["shared"])
+        )
+        await registry.register(FakeSpeechAdapter(engineID: "healthy", silicon: .cpu, modelIDs: ["shared"]))
+        let backend = await RegistrySpeechBackend(registry: registry)
+
+        let result = try await backend.transcribe(
+            AudioTranscriptionRequest(model: "shared", fileName: "t.wav", fileData: Data([0x00]))
+        )
+        XCTAssertEqual(result.text, "fake transcript via healthy/shared")
     }
 }

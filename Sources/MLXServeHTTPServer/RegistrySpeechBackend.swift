@@ -4,36 +4,98 @@ import MLXServeSpeech
 
 /// Serves `/v1/audio/transcriptions` from the speech engine registry — the
 /// route stops 501ing the moment any adapter is registered.
-struct RegistrySpeechBackend: AudioTranscriptionBackend {
-    let registry: SpeechEngineRegistry
-    let models: [OpenAIModelInfo]
+final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendable {
+    private let registry: SpeechEngineRegistry
+    private let modelsLock = NSLock()
+    private var cachedModels: [OpenAIModelInfo]
 
     init(registry: SpeechEngineRegistry) async {
         self.registry = registry
-        self.models = await registry.allModels().map { model in
-            OpenAIModelInfo(id: model.id, maxModelLength: nil)
-        }
+        self.cachedModels = await Self.snapshotModels(registry)
     }
 
-    var transcriptionModels: [OpenAIModelInfo] { models }
+    /// The route gate and /v1/models read this synchronously; it is a cache,
+    /// refreshed after every transcribe so adapter catalog changes (new model
+    /// folders appearing) converge without a restart.
+    var transcriptionModels: [OpenAIModelInfo] {
+        modelsLock.lock()
+        defer { modelsLock.unlock() }
+        return cachedModels
+    }
 
     func transcribe(_ request: AudioTranscriptionRequest) async throws -> AudioTranscriptionResult {
-        let (adapter, modelID) = try await registry.resolve(model: request.model)
-        let result = try await adapter.transcribeFile(
-            SpeechFileTranscriptionRequest(
-                model: modelID,
-                fileName: request.fileName,
-                fileData: request.fileData,
-                language: request.language,
-                temperature: request.temperature
+        defer { Task { await self.refreshModels() } }
+
+        let candidates: [any SpeechEngineAdapter]
+        let modelID: String
+        do {
+            (candidates, modelID) = try await registry.resolveCandidates(model: request.model)
+        } catch let error as SpeechEngineError {
+            throw Self.httpError(from: error, model: request.model, models: transcriptionModels)
+        }
+
+        // A claimed model can still fail to load (corrupt folder) — fall through
+        // to the next candidate; only surface the last failure.
+        var lastError: Error = SpeechEngineError.unknownModel(request.model)
+        for adapter in candidates {
+            do {
+                let result = try await adapter.transcribeFile(
+                    SpeechFileTranscriptionRequest(
+                        model: modelID,
+                        fileName: request.fileName,
+                        fileData: request.fileData,
+                        language: request.language,
+                        temperature: request.temperature
+                    )
+                )
+                return AudioTranscriptionResult(
+                    text: result.text,
+                    language: result.language,
+                    duration: result.duration,
+                    segments: segments(from: result)
+                )
+            } catch {
+                lastError = error
+            }
+        }
+        if let speechError = lastError as? SpeechEngineError {
+            throw Self.httpError(from: speechError, model: request.model, models: transcriptionModels)
+        }
+        throw lastError
+    }
+
+    private func refreshModels() async {
+        let fresh = await Self.snapshotModels(registry)
+        storeModels(fresh)
+    }
+
+    private func storeModels(_ fresh: [OpenAIModelInfo]) {
+        modelsLock.lock()
+        cachedModels = fresh
+        modelsLock.unlock()
+    }
+
+    private static func snapshotModels(_ registry: SpeechEngineRegistry) async -> [OpenAIModelInfo] {
+        await registry.allModels().map { OpenAIModelInfo(id: $0.id, maxModelLength: nil) }
+    }
+
+    private static func httpError(
+        from error: SpeechEngineError,
+        model: String,
+        models: [OpenAIModelInfo]
+    ) -> OpenAIHTTPError {
+        switch error {
+        case .unknownModel:
+            let known = models.map(\.id).sorted().joined(separator: ", ")
+            return OpenAIHTTPError(
+                status: 404,
+                message: "model '\(model)' not found. Available transcription models: \(known)"
             )
-        )
-        return AudioTranscriptionResult(
-            text: result.text,
-            language: result.language,
-            duration: result.duration,
-            segments: segments(from: result)
-        )
+        case .fileTranscriptionUnsupported, .streamingUnsupported:
+            return OpenAIHTTPError(status: 400, message: String(describing: error))
+        case .modelNotLoaded, .engineFailure:
+            return OpenAIHTTPError(status: 500, message: String(describing: error))
+        }
     }
 
     private func segments(from result: SpeechTranscriptionResult) -> [AudioTranscriptionSegment]? {

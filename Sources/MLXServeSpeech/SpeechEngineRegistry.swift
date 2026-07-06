@@ -50,6 +50,17 @@ public actor SpeechEngineRegistry {
         model: String,
         preferences: SpeechSessionPreferences = SpeechSessionPreferences()
     ) async throws -> (adapter: any SpeechEngineAdapter, modelID: String) {
+        let (candidates, modelID) = try await resolveCandidates(model: model, preferences: preferences)
+        return (candidates[0], modelID)
+    }
+
+    /// All adapters that claim the model, best-first (silicon preference, then
+    /// registration order). Callers that LOAD should try candidates in order —
+    /// a claimed model can still fail to load (corrupt folder, missing files).
+    public func resolveCandidates(
+        model: String,
+        preferences: SpeechSessionPreferences = SpeechSessionPreferences()
+    ) async throws -> (adapters: [any SpeechEngineAdapter], modelID: String) {
         let (explicitEngine, modelID) = Self.splitModelReference(model)
 
         var candidates: [any SpeechEngineAdapter] = []
@@ -65,12 +76,18 @@ public actor SpeechEngineRegistry {
         guard !candidates.isEmpty else {
             throw SpeechEngineError.unknownModel(model)
         }
-        if let preferred = preferences.preferredSilicon,
-            let match = candidates.first(where: { $0.capabilities.silicon == preferred })
-        {
-            return (match, modelID)
+        if let preferred = preferences.preferredSilicon {
+            // Swift's sort is not stability-guaranteed; sort by (match, original index)
+            // so registration order is preserved within each preference class.
+            candidates = candidates.enumerated()
+                .sorted { lhs, rhs in
+                    let lhsKey = (lhs.element.capabilities.silicon == preferred ? 0 : 1, lhs.offset)
+                    let rhsKey = (rhs.element.capabilities.silicon == preferred ? 0 : 1, rhs.offset)
+                    return lhsKey < rhsKey
+                }
+                .map(\.element)
         }
-        return (candidates[0], modelID)
+        return (candidates, modelID)
     }
 
     static func splitModelReference(_ model: String) -> (engineID: String?, modelID: String) {
