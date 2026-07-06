@@ -35,7 +35,14 @@ def _probe(server, model_id):
             detail = res.body["error"].get("message", "")
         return False, res.status, "", f"HTTP {res.status}: {detail or res.raw[:140]}"
     choices = res.body.get("choices") or []
-    text = (choices[0].get("message", {}).get("content", "") if choices else "") or ""
+    message = choices[0].get("message", {}) if choices else {}
+    text = message.get("content") or ""
+    # Reasoning models (Harmony channels / think tags) may spend the whole
+    # short budget in the reasoning channel, leaving content empty on BOTH
+    # servers. Coherent reasoning output still proves the cell's contract
+    # (model loads + generates), so fall back to it.
+    if not _coherent(text):
+        text = message.get("reasoning_content") or ""
     return _coherent(text), res.status, text, ""
 
 
