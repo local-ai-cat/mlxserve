@@ -215,6 +215,13 @@ CONFORMANCE_MODELS: list[ModelSpec] = [
 ERROR_MODEL = "Qwen3-0.6B-4bit"
 # Benchmark axis uses the fastest dense model.
 BENCH_MODEL = "Qwen3-0.6B-4bit"
+GRAMMAR_MODEL = BENCH_MODEL
+PERF_FLEET_MODELS = [
+    "Qwen3-0.6B-4bit",
+    "Qwen3-1.7B-4bit",
+    "gemma-4-E2B-it-qat-4bit",
+    "Qwen3.5-4B-MLX-4bit",
+]
 
 
 def matrix_models(tier: str) -> list[ModelSpec]:

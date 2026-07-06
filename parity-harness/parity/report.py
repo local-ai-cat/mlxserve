@@ -25,6 +25,9 @@ _AXES = [
     "6. Audio",
     "7. Endpoint smoke",
     "8. Prefix cache",
+    "9. Grammar constraints",
+    "10. Config axis",
+    "11. Perf fleet",
 ]
 
 
@@ -58,6 +61,15 @@ class BenchRow:
 
 
 @dataclass
+class GrammarBenchRow:
+    server: str
+    schema: str
+    plain_tg: float | None
+    grammar_tg: float | None
+    ratio: float | None
+
+
+@dataclass
 class Meta:
     generated_at: str = ""
     native_version: str = "unknown"
@@ -71,6 +83,7 @@ class Report:
     rows: list[Row] = field(default_factory=list)
     matrix: list[MatrixCell] = field(default_factory=list)
     bench: list[BenchRow] = field(default_factory=list)
+    grammar_bench: list[GrammarBenchRow] = field(default_factory=list)
     meta: Meta = field(default_factory=Meta)
 
     def record(self, axis: str, cell: str, verdict: str, note: str = "") -> None:
@@ -81,6 +94,9 @@ class Report:
 
     def record_bench(self, row: BenchRow) -> None:
         self.bench.append(row)
+
+    def record_grammar_bench(self, row: GrammarBenchRow) -> None:
+        self.grammar_bench.append(row)
 
     # --- counts --------------------------------------------------------------
 
@@ -116,6 +132,20 @@ class Report:
             out.append(f"| {axis} | {p} | {g} | {f} |")
         return "\n".join(out) + "\n"
 
+    def _grammar_bench_md(self) -> str:
+        if not self.grammar_bench:
+            return "_grammar overhead not captured in this pass_\n"
+        out = [
+            "| Server | Schema | Plain decode tok/s | Grammar decode tok/s | Ratio |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ]
+        for row in self.grammar_bench:
+            plain = f"{row.plain_tg:.1f}" if row.plain_tg is not None else "n/a"
+            grammar = f"{row.grammar_tg:.1f}" if row.grammar_tg is not None else "n/a"
+            ratio = f"{row.ratio:.2f}x" if row.ratio is not None else "n/a"
+            out.append(f"| {row.server} | {row.schema} | {plain} | {grammar} | {ratio} |")
+        return "\n".join(out) + "\n"
+
     def render_md(self) -> str:
         m = self.meta
         parts = [
@@ -135,6 +165,7 @@ class Report:
         ]
         for axis in _AXES:
             parts += ["", f"## {axis}", "", self._axis_table_md(axis)]
+        parts += ["", "## Grammar overhead", "", self._grammar_bench_md()]
         return "\n".join(parts) + "\n"
 
     def write_report(self, path: Path) -> None:
@@ -246,6 +277,26 @@ def _bench_section_html(rep: Report) -> str:
     )
 
 
+def _grammar_bench_section_html(rep: Report) -> str:
+    if not rep.grammar_bench:
+        return "<p class='muted'>Grammar overhead not captured in this pass.</p>"
+    rows = []
+    for row in rep.grammar_bench:
+        plain = f"{row.plain_tg:,.1f}" if row.plain_tg is not None else "n/a"
+        grammar = f"{row.grammar_tg:,.1f}" if row.grammar_tg is not None else "n/a"
+        ratio = f"{row.ratio:.2f}x" if row.ratio is not None else "n/a"
+        rows.append(
+            f"<tr><td>{_esc(row.server)}</td><td>{_esc(row.schema)}</td>"
+            f"<td>{plain}</td><td>{grammar}</td><td>{ratio}</td></tr>"
+        )
+    return (
+        "<div class='scroll'><table class='bench'>"
+        "<thead><tr><th>Server</th><th>Schema</th><th>Plain decode tok/s</th>"
+        "<th>Grammar decode tok/s</th><th>Ratio</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
 def _gap_list_html(rep: Report) -> str:
     # Native matrix faults grouped by milestone.
     groups: dict[str, list[MatrixCell]] = {}
@@ -328,6 +379,7 @@ def render_html(rep: Report) -> str:
         matrix_section=_matrix_section_html(rep),
         axis_sections=axis_sections,
         bench_section=_bench_section_html(rep),
+        grammar_bench_section=_grammar_bench_section_html(rep),
         gap_list=_gap_list_html(rep),
     )
 
@@ -453,6 +505,9 @@ _HTML_TEMPLATE = """<!doctype html>
 
   <h2>Benchmark <span class="hint">— native vs omlx throughput / latency</span></h2>
   {bench_section}
+
+  <h2>Grammar overhead <span class="hint">— grammar-on vs grammar-off decode throughput</span></h2>
+  {grammar_bench_section}
 
   <h2>Gap list <span class="hint">— every red, grouped by the milestone that closes it</span></h2>
   {gap_list}
