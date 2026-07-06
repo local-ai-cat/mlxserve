@@ -106,8 +106,6 @@ ALL_MODELS: list[ModelSpec] = [
         "sliding-window",
         "sliding-window (Gemma3)",
         "smoke",
-        milestone=FAMILY_MILESTONE["sliding-window"],
-        expect_native_gap=True,
     ),
     # --- FULL ---
     ModelSpec(
@@ -116,8 +114,6 @@ ALL_MODELS: list[ModelSpec] = [
         "sliding-window + MoE + harmony (gpt-oss)",
         "full",
         reasoning=True,
-        milestone=FAMILY_MILESTONE["sliding-window"],
-        expect_native_gap=True,
     ),
     ModelSpec(
         "Qwen3-Coder-30B-A3B-Instruct-4bit",
@@ -130,8 +126,6 @@ ALL_MODELS: list[ModelSpec] = [
         "mamba-hybrid",
         "Mamba-hybrid flagship (Qwen3.6-27B)",
         "full",
-        milestone=FAMILY_MILESTONE["mamba-hybrid"],
-        expect_native_gap=True,
     ),
     ModelSpec(
         "Qwen2-VL-2B-Instruct-4bit",
@@ -139,8 +133,67 @@ ALL_MODELS: list[ModelSpec] = [
         "VLM (Qwen2-VL-2B)",
         "full",
         vlm=True,
-        milestone=FAMILY_MILESTONE["vlm"],
-        expect_native_gap=True,
+    ),
+    # --- M-SWEEP additions (2026-07-05): every local-store model omlx can serve.
+    # Parity definition: "any model omlx serves, we serve identically."
+    ModelSpec(
+        "Qwen3-1.7B-4bit",
+        "dense",
+        "dense full-attn (Qwen3-1.7B)",
+        "full",
+        reasoning=True,
+    ),
+    ModelSpec(
+        "Llama-3.2-3B-Instruct-4bit",
+        "dense",
+        "dense full-attn (Llama-3B)",
+        "full",
+    ),
+    ModelSpec(
+        "DeepSeek-R1-Distill-Qwen-7B-4bit",
+        "dense",
+        "dense full-attn, reasoning (DeepSeek-7B)",
+        "full",
+        reasoning=True,
+    ),
+    ModelSpec(
+        "Qwen2.5-Coder-7B-Instruct-4bit",
+        "dense",
+        "dense full-attn (Qwen2.5-Coder-7B)",
+        "full",
+    ),
+    ModelSpec(
+        "Qwen3.5-4B-MLX-4bit",
+        "mamba-hybrid",
+        "Mamba-hybrid (Qwen3.5-4B)",
+        "full",
+    ),
+    ModelSpec(
+        "Ornith-1.0-9B-6bit",
+        "mamba-hybrid",
+        "Mamba-hybrid (Ornith-9B, qwen3_5)",
+        "full",
+    ),
+    ModelSpec(
+        # Same k_proj QAT-loader expectation as the E2B qat variant (M2b).
+        "gemma-4-E4B-it-qat-4bit",
+        "sliding-window",
+        "sliding-window, QAT (Gemma4-E4B)",
+        "full",
+    ),
+    ModelSpec(
+        # Second publisher/quant of the hybrid flagship (mlx-community build).
+        "Qwen3.6-27B-4bit",
+        "mamba-hybrid",
+        "Mamba-hybrid flagship, alt quant (Qwen3.6-27B community)",
+        "full",
+    ),
+    ModelSpec(
+        # NEW family combination never diffed: hybrid (Mamba) + MoE in one arch.
+        "Qwen3.6-35B-A3B-4bit",
+        "hybrid-moe",
+        "Mamba-hybrid + MoE (Qwen3.6-35B-A3B)",
+        "full",
     ),
 ]
 
