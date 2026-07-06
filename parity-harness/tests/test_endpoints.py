@@ -18,6 +18,18 @@ from parity.report import GAP, PASS, REPORT
 
 AXIS = "7. Endpoint smoke"
 MODEL = ERROR_MODEL
+EXPECTED_RESPONSES_REASONING_EVENTS = {
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+    "response.reasoning_summary_part.done",
+}
+LEGACY_RESPONSES_REASONING_EVENTS = {
+    "response.reasoning_text.delta",
+    "response.reasoning_text.done",
+    "response.reasoning_part.added",
+    "response.reasoning_part.done",
+}
 
 
 @pytest.fixture
@@ -121,3 +133,70 @@ def test_embeddings_shape(native, omlx_server):
         "(both refuse an LLM used as an embedding model; native has no embedding "
         "model loaded so it returns 'backend unavailable')",
     )
+
+
+def test_messages_count_tokens_exact_shape(native, omlx_server):
+    """POST /v1/messages/count_tokens: both should return the Anthropic
+    reference shape and agree on exact chat-template token count."""
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Count this short request."}],
+    }
+    nat = client.post_json(native, "/v1/messages/count_tokens", payload, timeout=180)
+    oml = client.post_json(omlx_server, "/v1/messages/count_tokens", payload, timeout=180)
+
+    def count_shape_ok(res) -> bool:
+        body = res.body or {}
+        return (
+            res.status == 200
+            and set(body.keys()) == {"input_tokens"}
+            and isinstance(body.get("input_tokens"), int)
+            and body["input_tokens"] > 0
+        )
+
+    shape_ok = count_shape_ok(nat) and count_shape_ok(oml)
+    value_ok = shape_ok and nat.body["input_tokens"] == oml.body["input_tokens"]
+    REPORT.record(
+        AXIS,
+        "/v1/messages/count_tokens exact shape/value",
+        PASS if value_ok else GAP,
+        f"native HTTP {nat.status} body={nat.body}; omlx HTTP {oml.status} body={oml.body}",
+    )
+    assert value_ok
+
+
+def test_responses_reasoning_event_names(native, omlx_server):
+    """POST /v1/responses stream: reasoning SSE event names should byte-match
+    omlx's current summary event names, not legacy reasoning_text names."""
+    prompt = "Think briefly about why 2+2 equals 4, then answer with one sentence."
+    stop_after = {"response.reasoning_summary_part.done"}
+    nat = client.stream_responses(
+        native, MODEL, prompt, max_output_tokens=96, stop_after_events=stop_after
+    )
+    oml = client.stream_responses(
+        omlx_server, MODEL, prompt, max_output_tokens=96, stop_after_events=stop_after
+    )
+
+    nat_names = nat.names()
+    oml_names = oml.names()
+    nat_reasoning = {name for name in nat_names if "reasoning" in name}
+    oml_reasoning = {name for name in oml_names if "reasoning" in name}
+    legacy = (nat_reasoning | oml_reasoning) & LEGACY_RESPONSES_REASONING_EVENTS
+    ok = (
+        nat.status == 200
+        and oml.status == 200
+        and not nat.read_error
+        and not oml.read_error
+        and not legacy
+        and EXPECTED_RESPONSES_REASONING_EVENTS <= nat_reasoning
+        and EXPECTED_RESPONSES_REASONING_EVENTS <= oml_reasoning
+    )
+    REPORT.record(
+        AXIS,
+        "/v1/responses reasoning SSE event names",
+        PASS if ok else GAP,
+        f"native reasoning={sorted(nat_reasoning)}; omlx reasoning={sorted(oml_reasoning)}; "
+        f"legacy={sorted(legacy)}; status native/omlx={nat.status}/{oml.status}; "
+        f"errors={nat.read_error or '-'} / {oml.read_error or '-'}",
+    )
+    assert ok

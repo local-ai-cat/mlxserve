@@ -74,6 +74,13 @@ def raw_post(
     return ChatResult(status=resp.status_code, body=body, raw=resp.text)
 
 
+def post_json(
+    server: ServerHandle, path: str, payload: dict, *, timeout: float = 30.0
+) -> ChatResult:
+    """POST JSON to an arbitrary endpoint."""
+    return raw_post(server, path, json.dumps(payload), timeout=timeout)
+
+
 def audio_transcription(
     server: ServerHandle,
     model_id: str,
@@ -148,6 +155,16 @@ class StreamResult:
         if not usage:
             return None
         return usage.get("output_tokens", usage.get("completion_tokens"))
+
+
+@dataclass
+class NamedStreamResult:
+    status: int
+    events: list[tuple[str, dict]] = field(default_factory=list)
+    read_error: str = ""
+
+    def names(self) -> list[str]:
+        return [name for name, _ in self.events]
 
 
 def _ingest_event(result: StreamResult, data: str) -> None:
@@ -256,6 +273,65 @@ def stream_chat(
     except requests.exceptions.RequestException as exc:
         # Mid-stream fault (server hung/closed before [DONE]) — e.g. native
         # rotating-cache fault after 200 headers.
+        result.read_error = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def stream_responses(
+    server: ServerHandle,
+    model_id: str,
+    prompt: str,
+    *,
+    max_output_tokens: int = 64,
+    read_timeout: float = 60.0,
+    stop_after_events: set[str] | None = None,
+) -> NamedStreamResult:
+    """Streaming POST /v1/responses; collect named SSE events."""
+    payload = {
+        "model": model_id,
+        "input": prompt,
+        "max_output_tokens": max_output_tokens,
+        "temperature": 0,
+        "stream": True,
+    }
+    result = NamedStreamResult(status=0)
+    try:
+        with requests.post(
+            f"{server.base_url}/v1/responses",
+            headers=server.headers(),
+            data=json.dumps(payload),
+            stream=True,
+            timeout=(10, read_timeout),
+        ) as resp:
+            result.status = resp.status_code
+            if resp.status_code != 200:
+                return result
+            event_name = "message"
+            data_lines: list[str] = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if line is None:
+                    continue
+                line = line.rstrip("\r")
+                if not line:
+                    if data_lines:
+                        data = "\n".join(data_lines)
+                        if data != "[DONE]":
+                            try:
+                                result.events.append((event_name, json.loads(data)))
+                            except ValueError:
+                                pass
+                            if stop_after_events and event_name in stop_after_events:
+                                return result
+                            if event_name == "response.completed":
+                                return result
+                        event_name = "message"
+                        data_lines = []
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].strip())
+    except requests.exceptions.RequestException as exc:
         result.read_error = f"{type(exc).__name__}: {exc}"
     return result
 
