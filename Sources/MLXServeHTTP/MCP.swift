@@ -411,7 +411,11 @@ public func responsesRequestByReplacingTools(
 
 private actor MCPStdioClient {
     private let config: MCPServerConfig
+    // The stdio transport spawns a child process — macOS-only. iOS builds keep
+    // the HTTP transports (sse-endpoint, streamable-http) and refuse stdio.
+    #if os(macOS)
     private var process: Process?
+    #endif
     private var input: FileHandle?
     private var output: FileHandle?
     private var sseEndpointURL: URL?
@@ -449,7 +453,9 @@ private actor MCPStdioClient {
 
     func shutdown() {
         closeProcess()
+        #if os(macOS)
         process = nil
+        #endif
         sseEndpointURL = nil
         state = "disconnected"
     }
@@ -492,6 +498,7 @@ private actor MCPStdioClient {
         state = "connected"
     }
 
+    #if os(macOS)
     private func connectStdio() throws {
         guard process == nil else { return }
         let process = Process()
@@ -522,6 +529,11 @@ private actor MCPStdioClient {
             Task { await self?.receiveOutputData(data) }
         }
     }
+    #else
+    private func connectStdio() throws {
+        throw MCPStdioError.stdioUnavailableOnPlatform
+    }
+    #endif
 
     func callTool(fullName: String, localName: String, arguments: OpenAIJSONValue) async -> MCPToolExecutionResult {
         do {
@@ -887,7 +899,9 @@ private actor MCPStdioClient {
 
     private func resetAfterTimeout(_ message: String) {
         closeProcess()
+        #if os(macOS)
         process = nil
+        #endif
         readBuffer = Data()
         streamError = nil
         state = "error"
@@ -898,9 +912,11 @@ private actor MCPStdioClient {
         output?.readabilityHandler = nil
         input?.closeFile()
         output?.closeFile()
+        #if os(macOS)
         if let process, process.isRunning {
             process.terminate()
         }
+        #endif
         input = nil
         output = nil
         failAllPendingRequests(MCPStdioError.closed)
@@ -971,6 +987,7 @@ private enum MCPStdioError: Error, CustomStringConvertible {
     case invalidURL(String)
     case httpStatus(Int)
     case unsupportedTransport(String)
+    case stdioUnavailableOnPlatform
 
     var description: String {
         switch self {
@@ -990,6 +1007,8 @@ private enum MCPStdioError: Error, CustomStringConvertible {
             return "MCP HTTP transport returned status \(status)"
         case .unsupportedTransport(let transport):
             return "unsupported MCP transport: \(transport)"
+        case .stdioUnavailableOnPlatform:
+            return "MCP stdio transport is unavailable on this platform (no subprocesses); use streamable-http"
         }
     }
 }
