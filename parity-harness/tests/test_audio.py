@@ -19,6 +19,7 @@ import requests
 
 from parity import client, config
 from parity.report import FAIL, GAP, PASS, REPORT
+from parity.servers import start_omlx
 
 AXIS = "6. Audio"
 FIXTURE = Path(__file__).parent / "fixtures" / "test_speech.wav"
@@ -44,6 +45,52 @@ def native_audio(native_pool):
     return handle
 
 
+@pytest.fixture(scope="session")
+def omlx_audio_server(tmp_path_factory):
+    """Launch omlx against an audio-only shim root.
+
+    omlx discovers local models only after `estimate_model_size` sees a
+    safetensors/bin weight file. The already-downloaded mlx-audio Whisper tiny
+    checkpoint uses `weights.npz`, so the normal shared root skips it before the
+    STT engine can load it. The shim symlinks the real files and adds a tiny
+    discovery marker; the downloaded checkpoint itself is left untouched.
+    """
+    src = Path(config.MODEL_STORE).expanduser() / "mlx-community" / "whisper-tiny"
+    if not src.exists():
+        pytest.skip(f"missing local omlx Whisper model: {src}")
+
+    root = tmp_path_factory.mktemp("omlx-audio-models")
+    dst = root / "whisper-tiny"
+    dst.mkdir()
+    for item in src.iterdir():
+        target = dst / item.name
+        if not target.exists():
+            target.symlink_to(item, target_is_directory=item.is_dir())
+    metadata = Path.home() / "Documents/huggingface/models/openai/whisper-tiny"
+    for name in (
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ):
+        source = metadata / name
+        target = dst / name
+        if source.exists() and not target.exists():
+            target.symlink_to(source)
+    marker_dir = dst / ".discovery"
+    marker_dir.mkdir()
+    marker = marker_dir / "model.safetensors"
+    if not marker.exists():
+        marker.write_bytes(b"0")
+
+    log_dir = tmp_path_factory.mktemp("omlx-audio-logs")
+    handle = start_omlx(Path(log_dir), model_store=str(root))
+    try:
+        yield handle
+    finally:
+        handle.stop()
+
+
 def _words(text: str) -> list[str]:
     lowered = text.lower().translate(str.maketrans("", "", string.punctuation))
     return re.findall(r"[a-z0-9]+", lowered)
@@ -63,13 +110,19 @@ def _transcript_ok(text: str) -> bool:
 def _word_agreement(left: str, right: str) -> float:
     left_counts = Counter(_words(left))
     right_counts = Counter(_words(right))
-    denominator = max(sum(left_counts.values()), sum(right_counts.values()), 1)
+    denominator = max(min(sum(left_counts.values()), sum(right_counts.values())), 1)
     overlap = sum((left_counts & right_counts).values())
     return overlap / denominator
 
 
 def _transcribe(server, model_id: str, timeout: float = 180.0):
-    return client.audio_transcription(server, model_id, str(FIXTURE), timeout=timeout)
+    return client.audio_transcription(
+        server,
+        model_id,
+        str(FIXTURE),
+        extra_fields={"max_tokens": "16"},
+        timeout=timeout,
+    )
 
 
 def _error_message(body) -> str:
@@ -224,7 +277,7 @@ def _omlx_transcription_or_skip(omlx_server):
     pytest.skip(note)
 
 
-def test_differential_transcription_vs_omlx(native_audio, omlx_server):
+def test_differential_transcription_vs_omlx(native_audio, omlx_audio_server):
     native_res = _transcribe(native_audio, config.NATIVE_AUDIO_MODEL)
     native_text = (native_res.body or {}).get("text") if isinstance(native_res.body, dict) else ""
     assert native_res.status == 200 and isinstance(native_text, str), (
@@ -232,13 +285,15 @@ def test_differential_transcription_vs_omlx(native_audio, omlx_server):
         f"HTTP {native_res.status} {native_res.raw[:160]!r}"
     )
 
-    oml_model, oml_res = _omlx_transcription_or_skip(omlx_server)
+    oml_model, oml_res = _omlx_transcription_or_skip(omlx_audio_server)
     oml_text = (oml_res.body or {}).get("text") if isinstance(oml_res.body, dict) else ""
     agreement = _word_agreement(native_text, oml_text if isinstance(oml_text, str) else "")
     ok = (
         native_res.status == 200
         and oml_res.status == 200
         and isinstance(oml_text, str)
+        and _transcript_ok(native_text)
+        and _transcript_ok(oml_text)
         and agreement >= MIN_OMLX_AGREEMENT
     )
     _record_and_assert(

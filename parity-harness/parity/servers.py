@@ -98,7 +98,9 @@ class ServerHandle:
                 pass
 
 
-def start_native(log_dir: Path, extra_args: list[str] | None = None) -> ServerHandle:
+def start_native(
+    log_dir: Path, extra_args: list[str] | None = None, model_store: str | None = None
+) -> ServerHandle:
     """Launch native MLXServe ONCE against the whole model store (multi-model,
     post-M3). No --model-id override — native discovers every subdir and serves
     on demand, validating the request `model`. GOTCHA: mlx.metallib must sit
@@ -110,7 +112,7 @@ def start_native(log_dir: Path, extra_args: list[str] | None = None) -> ServerHa
     args = [
         config.NATIVE_BIN,
         "--model-dir",
-        config.MODEL_STORE,
+        model_store or config.MODEL_STORE,
         "--host",
         "127.0.0.1",
         "--port",
@@ -132,7 +134,9 @@ def start_native(log_dir: Path, extra_args: list[str] | None = None) -> ServerHa
     return handle
 
 
-def start_omlx(log_dir: Path, extra_args: list[str] | None = None) -> ServerHandle:
+def start_omlx(
+    log_dir: Path, extra_args: list[str] | None = None, model_store: str | None = None
+) -> ServerHandle:
     """Launch omlx once against the SAME real store as native, so the ids it
     discovers (bare leaf dir names) match native's and one `model` string selects
     the same model on both."""
@@ -142,7 +146,7 @@ def start_omlx(log_dir: Path, extra_args: list[str] | None = None) -> ServerHand
         config.OMLX_BIN,
         "serve",
         "--model-dir",
-        config.MODEL_STORE,
+        model_store or config.MODEL_STORE,
         "--host",
         "127.0.0.1",
         "--port",

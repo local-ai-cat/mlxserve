@@ -86,17 +86,21 @@ def audio_transcription(
     model_id: str,
     wav_path: str,
     *,
+    extra_fields: dict[str, str] | None = None,
     timeout: float = 180.0,
 ) -> ChatResult:
     """Multipart POST /v1/audio/transcriptions."""
     headers: dict[str, str] = {}
     if server.auth:
         headers["Authorization"] = f"Bearer {server.auth}"
+    fields = {"model": model_id}
+    if extra_fields:
+        fields.update(extra_fields)
     with open(wav_path, "rb") as audio:
         resp = requests.post(
             f"{server.base_url}/v1/audio/transcriptions",
             headers=headers,
-            data={"model": model_id},
+            data=fields,
             files={"file": ("test_speech.wav", audio, "audio/wav")},
             timeout=timeout,
         )
