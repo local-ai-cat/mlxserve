@@ -39,18 +39,45 @@ struct AnthropicMessagesHandler {
     }
 
     func handleCountTokens(_ request: HTTPRequest, connection: NWConnection) async throws {
+        let response = try await countTokensResponse(for: request)
+        try await sendJSON(response.body, status: response.status, connection: connection)
+    }
+
+    func countTokensResponseForTesting(_ request: HTTPRequest) async -> HTTPJSONResponse {
+        do {
+            return try await countTokensResponse(for: request)
+        } catch {
+            let httpError = (error as? OpenAIHTTPError)
+                ?? OpenAIHTTPError(status: 500, message: String(describing: error))
+            return HTTPJSONResponse(
+                status: httpError.status,
+                body: openAIErrorBody(message: httpError.message, status: httpError.status)
+            )
+        }
+    }
+
+    private func countTokensResponse(for request: HTTPRequest) async throws -> HTTPJSONResponse {
         let countTokensRequest: AnthropicCountTokensRequest
         do {
             countTokensRequest = try AnthropicCountTokensRequest.parse(request.body)
         } catch {
             let status = (error as? OpenAIServerError)?.httpStatus ?? 422
-            try await sendJSON(openAIErrorBody(message: String(describing: error), status: status), status: status, connection: connection)
-            return
+            return HTTPJSONResponse(
+                status: status,
+                body: openAIErrorBody(message: String(describing: error), status: status)
+            )
         }
 
-        // Exact prompt tokens are exposed by the backend only when generation starts.
-        // Keep count_tokens side-effect-free with one deterministic estimate.
-        try await sendJSON(buildAnthropicCountTokensResponse(request: countTokensRequest), status: 200, connection: connection)
+        let result: AnthropicCountTokensResult
+        if let countingBackend = backend as? any AnthropicTokenCountingBackend {
+            result = try await countingBackend.countTokens(countTokensRequest)
+        } else {
+            result = AnthropicCountTokensResult(
+                inputTokens: countTokensRequest.estimatedInputTokens(),
+                estimated: true
+            )
+        }
+        return HTTPJSONResponse(status: 200, body: buildAnthropicCountTokensResponse(result: result))
     }
 
     private func sendStreaming(

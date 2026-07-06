@@ -73,6 +73,11 @@ final class NativeModelEngine: @unchecked Sendable {
         return makeStream(from: mlxRequest, promptTokens: tokenIDs.count)
     }
 
+    func countPromptTokens(for request: OpenAIChatRequest) async throws -> Int {
+        let input = try await context.processor.prepare(input: try userInput(from: request))
+        return try countPromptTokens(input)
+    }
+
     private func makeStream(from mlxRequest: Request, promptTokens: Int) -> OpenAIChatStream {
         let responseStream = engine.stream(mlxRequest)
         let chunks = AsyncThrowingStream<OpenAIChatChunk, Error> { continuation in

@@ -2,7 +2,7 @@ import Foundation
 import MLXServe
 import MLXServeHTTP
 
-final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, AudioTranscriptionBackend, OpenAIHealthProviding, @unchecked Sendable
+final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, AudioTranscriptionBackend, AnthropicTokenCountingBackend, OpenAIHealthProviding, @unchecked Sendable
 where Loader.Engine == NativeModelEngine {
     let models: [OpenAIModelInfo]
     var embeddingModels: [OpenAIModelInfo] { embeddingsBackend?.embeddingModels ?? [] }
@@ -102,6 +102,28 @@ where Loader.Engine == NativeModelEngine {
             throw OpenAIHTTPError(status: 501, message: "transcription backend not configured")
         }
         return try await speechBackend.transcribe(request)
+    }
+
+    func countTokens(_ request: AnthropicCountTokensRequest) async throws -> AnthropicCountTokensResult {
+        do {
+            let lease = try await pool.acquire(request.model)
+            do {
+                let count = try await lease.engine.countPromptTokens(for: request.openAIRequest())
+                await pool.release(lease)
+                return AnthropicCountTokensResult(inputTokens: count)
+            } catch {
+                await pool.release(lease)
+                throw error
+            }
+        } catch let poolError as EnginePoolError {
+            if case .modelNotFound = poolError {
+                return AnthropicCountTokensResult(
+                    inputTokens: request.estimatedInputTokens(),
+                    estimated: true
+                )
+            }
+            throw openAIError(from: poolError)
+        }
     }
 
     func modelPoolStatus() async throws -> OpenAIModelPoolStatus {

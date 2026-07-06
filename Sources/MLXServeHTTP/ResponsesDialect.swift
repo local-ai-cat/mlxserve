@@ -194,7 +194,7 @@ public struct ResponsesStreamFormatter {
             }
         }
         if reasoningStarted && !reasoningDone {
-            events.append(reasoningDoneEvent())
+            events.append(contentsOf: reasoningDoneEvents())
         }
         if !messageStarted {
             events.append(contentsOf: startMessageEvents())
@@ -254,7 +254,7 @@ public struct ResponsesStreamFormatter {
         guard !text.isEmpty else { return [] }
         var events: [ResponseSSEEvent] = []
         if reasoningStarted && !reasoningDone {
-            events.append(reasoningDoneEvent())
+            events.append(contentsOf: reasoningDoneEvents())
         }
         if !messageStarted {
             events.append(contentsOf: startMessageEvents())
@@ -289,16 +289,28 @@ public struct ResponsesStreamFormatter {
                     ]
                 )
             )
+            events.append(
+                event(
+                    "response.reasoning_summary_part.added",
+                    [
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": reasoningItemID,
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "part": ["type": "summary_text", "text": ""],
+                    ]
+                )
+            )
         }
         reasoningText += text
         events.append(
             event(
-                "response.reasoning_text.delta",
+                "response.reasoning_summary_text.delta",
                 [
-                    "type": "response.reasoning_text.delta",
+                    "type": "response.reasoning_summary_text.delta",
                     "item_id": reasoningItemID,
                     "output_index": 0,
-                    "content_index": 0,
+                    "summary_index": 0,
                     "delta": text,
                 ]
             )
@@ -306,16 +318,38 @@ public struct ResponsesStreamFormatter {
         return events
     }
 
-    private mutating func reasoningDoneEvent() -> ResponseSSEEvent {
+    private mutating func reasoningDoneEvents() -> [ResponseSSEEvent] {
         reasoningDone = true
-        return event(
-            "response.output_item.done",
-            [
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": reasoningItem(status: "completed", text: reasoningText),
-            ]
-        )
+        return [
+            event(
+                "response.reasoning_summary_text.done",
+                [
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoningItemID,
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": reasoningText,
+                ]
+            ),
+            event(
+                "response.reasoning_summary_part.done",
+                [
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": reasoningItemID,
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "part": ["type": "summary_text", "text": reasoningText],
+                ]
+            ),
+            event(
+                "response.output_item.done",
+                [
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoningItem(status: "completed", text: reasoningText),
+                ]
+            ),
+        ]
     }
 
     private mutating func startMessageEvents() -> [ResponseSSEEvent] {
@@ -491,8 +525,7 @@ public struct ResponsesStreamFormatter {
             "type": "reasoning",
             "id": reasoningItemID,
             "status": status,
-            "summary": [],
-            "content": text.isEmpty ? [] : [["type": "reasoning_text", "text": text]],
+            "summary": text.isEmpty ? [] : [["type": "summary_text", "text": text]],
         ]
     }
 

@@ -38,6 +38,58 @@ final class AnthropicDialectTests: XCTestCase {
         XCTAssertEqual(response["input_tokens"], 2)
     }
 
+    func testCountTokensRequestCarriesToolsIntoOpenAIRequest() throws {
+        let request = try AnthropicCountTokensRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "tools": [{"name": "lookup", "description": "search"}],
+                  "tool_choice": {"type": "tool", "name": "lookup"}
+                }
+                """.utf8
+            )
+        )
+        let openAIRequest = request.openAIRequest()
+
+        XCTAssertEqual(openAIRequest.tools?.count, 1)
+        XCTAssertEqual(openAIRequest.toolChoice, .function("lookup"))
+        XCTAssertEqual(openAIRequest.chatTemplateKwargs?["tools"], .array([.object(["name": .string("lookup"), "description": .string("search")])]))
+    }
+
+    func testCountTokensHandlerUsesExactBackendWhenAvailable() async {
+        let handler = AnthropicMessagesHandler(backend: ExactCountBackend(inputTokens: 42))
+        let response = await handler.countTokensResponseForTesting(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/messages/count_tokens",
+                headers: [:],
+                body: Self.countTokensBody
+            )
+        )
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.body["input_tokens"] as? Int, 42)
+        XCTAssertNil(response.body["estimated"])
+    }
+
+    func testCountTokensHandlerMarksFallbackEstimate() async {
+        let handler = AnthropicMessagesHandler(backend: EstimateOnlyBackend())
+        let response = await handler.countTokensResponseForTesting(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/messages/count_tokens",
+                headers: [:],
+                body: Self.countTokensBody
+            )
+        )
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.body["input_tokens"] as? Int, 2)
+        XCTAssertEqual(response.body["estimated"] as? Bool, true)
+    }
+
     func testMessagesRequestParsesSystemStringAndTranslationFields() throws {
         let request = try AnthropicMessagesRequest.parse(
             Data(
@@ -349,5 +401,39 @@ final class AnthropicDialectTests: XCTestCase {
                 """.utf8
             )
         )
+    }
+
+    private static let countTokensBody = Data(
+        """
+        {
+          "model": "test-model",
+          "messages": [{"role": "user", "content": "hi"}]
+        }
+        """.utf8
+    )
+}
+
+private final class ExactCountBackend: OpenAIChatBackend, AnthropicTokenCountingBackend, @unchecked Sendable {
+    let models = [OpenAIModelInfo(id: "test-model")]
+    private let inputTokens: Int
+
+    init(inputTokens: Int) {
+        self.inputTokens = inputTokens
+    }
+
+    func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
+        OpenAIChatStream(promptTokens: 0, chunks: AsyncThrowingStream { $0.finish() })
+    }
+
+    func countTokens(_ request: AnthropicCountTokensRequest) async throws -> AnthropicCountTokensResult {
+        AnthropicCountTokensResult(inputTokens: inputTokens)
+    }
+}
+
+private final class EstimateOnlyBackend: OpenAIChatBackend, @unchecked Sendable {
+    let models = [OpenAIModelInfo(id: "test-model")]
+
+    func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
+        OpenAIChatStream(promptTokens: 0, chunks: AsyncThrowingStream { $0.finish() })
     }
 }

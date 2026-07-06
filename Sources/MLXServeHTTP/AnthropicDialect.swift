@@ -79,13 +79,28 @@ public struct AnthropicCountTokensRequest {
     public let model: String
     public let messages: [OpenAIChatMessage]
     public let chatTemplateKwargs: [String: OpenAIJSONValue]?
+    public let tools: [OpenAIJSONValue]?
+    public let toolChoice: OpenAIToolChoice?
 
     public static func parse(_ body: Data) throws -> AnthropicCountTokensRequest {
         let parsed = try anthropicParsedBase(body)
         return AnthropicCountTokensRequest(
             model: parsed.model,
             messages: parsed.messages,
-            chatTemplateKwargs: try anthropicChatTemplateKwargs(from: parsed.object)
+            chatTemplateKwargs: try anthropicChatTemplateKwargs(from: parsed.object),
+            tools: try anthropicOpenAITools(from: parsed.object["tools"]),
+            toolChoice: try anthropicToolChoice(from: parsed.object["tool_choice"])
+        )
+    }
+
+    public func openAIRequest() -> OpenAIChatRequest {
+        OpenAIChatRequest(
+            model: model,
+            messages: messages,
+            maxTokens: 1,
+            chatTemplateKwargs: chatTemplateKwargs,
+            tools: tools,
+            toolChoice: toolChoice
         )
     }
 
@@ -95,8 +110,30 @@ public struct AnthropicCountTokensRequest {
     }
 }
 
+public struct AnthropicCountTokensResult: Sendable, Equatable {
+    public let inputTokens: Int
+    public let estimated: Bool
+
+    public init(inputTokens: Int, estimated: Bool = false) {
+        self.inputTokens = inputTokens
+        self.estimated = estimated
+    }
+}
+
+public protocol AnthropicTokenCountingBackend: Sendable {
+    func countTokens(_ request: AnthropicCountTokensRequest) async throws -> AnthropicCountTokensResult
+}
+
 public func buildAnthropicCountTokensResponse(request: AnthropicCountTokensRequest) -> [String: Int] {
     ["input_tokens": request.estimatedInputTokens()]
+}
+
+public func buildAnthropicCountTokensResponse(result: AnthropicCountTokensResult) -> [String: Any] {
+    var response: [String: Any] = ["input_tokens": result.inputTokens]
+    if result.estimated {
+        response["estimated"] = true
+    }
+    return response
 }
 
 public struct AnthropicBufferedCompletion {
