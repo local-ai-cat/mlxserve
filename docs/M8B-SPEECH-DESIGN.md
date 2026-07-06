@@ -60,6 +60,25 @@ rows so aggregate status memory does not double count the shared working set.
   tests. `/v1/audio/transcriptions` stops 501ing when an adapter is registered.
 - **M8b-2:** pool citizenship (`audio_stt`), Parakeet adapter (wraps the app's
   FluidAudio engine at cat-integration), `models/status` integration.
+- **M8b-3 — scheduling & "batching" (ruling 2026-07-06):** audio batching is
+  SCHEDULING, not token batching — Whisper-class/ANE engines can't merge audios
+  into one forward pass (fixed-shape CoreML), so short-while-long comes from
+  the scheduler. Three mechanisms, layered:
+  1. **Window-quantum scheduler** — the pipeline turn gate becomes a priority
+     queue whose quantum is ONE decode window (~30s audio, ~1-2s ANE wall),
+     not one request. Long jobs yield between windows (the sliding-window
+     `trimmedSeconds` machinery already knows how to resume); interactive jobs
+     jump the queue. Interactive latency = current window, not whole file.
+  2. **Priority classes** — every request carries QoS (`interactive` |
+     `background`); surface bindings map to it naturally; HTTP gains a
+     `priority` param on `/v1/audio/transcriptions`.
+  3. **Busy-aware resolution** — adapters expose queue-depth/busy to
+     `resolveCandidates`; interactive jobs route to an idle engine on other
+     silicon (Parakeet/SpeechAnalyzer) instead of waiting. Same signal M8c
+     consensus needs.
+  Per-adapter contract additions: `maxConcurrentSessions` (multi-instance
+  within the pool memory budget), `preemptionQuantum`, `supportsTrueBatch`
+  (MLX-ASR on GPU later — the only lane where real batch inference exists).
 - **M8c:** consensus dispatcher — fan one input to N adapters (ANE+GPU+CPU run
   truly parallel), fuse: confidence pick → ROVER voting → LLM fusion via the
   server's constrained-JSON decode. Post-hoc (raw-first recordings) before live.
