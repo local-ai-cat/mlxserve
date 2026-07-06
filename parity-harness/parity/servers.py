@@ -98,7 +98,7 @@ class ServerHandle:
                 pass
 
 
-def start_native(log_dir: Path) -> ServerHandle:
+def start_native(log_dir: Path, extra_args: list[str] | None = None) -> ServerHandle:
     """Launch native MLXServe ONCE against the whole model store (multi-model,
     post-M3). No --model-id override — native discovers every subdir and serves
     on demand, validating the request `model`. GOTCHA: mlx.metallib must sit
@@ -119,6 +119,8 @@ def start_native(log_dir: Path) -> ServerHandle:
     whisperkit_models = Path(config.WHISPERKIT_MODELS).expanduser()
     if whisperkit_models.exists():
         args.extend(["--whisperkit-models-dir", str(whisperkit_models)])
+    if extra_args:
+        args.extend(extra_args)
     proc = subprocess.Popen(
         args,
         stdout=log,
@@ -130,25 +132,28 @@ def start_native(log_dir: Path) -> ServerHandle:
     return handle
 
 
-def start_omlx(log_dir: Path) -> ServerHandle:
+def start_omlx(log_dir: Path, extra_args: list[str] | None = None) -> ServerHandle:
     """Launch omlx once against the SAME real store as native, so the ids it
     discovers (bare leaf dir names) match native's and one `model` string selects
     the same model on both."""
     port = free_port()
     log = open(log_dir / f"omlx-{port}.log", "w")  # noqa: SIM115
+    args = [
+        config.OMLX_BIN,
+        "serve",
+        "--model-dir",
+        config.MODEL_STORE,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--api-key",
+        config.OMLX_API_KEY,
+    ]
+    if extra_args:
+        args.extend(extra_args)
     proc = subprocess.Popen(
-        [
-            config.OMLX_BIN,
-            "serve",
-            "--model-dir",
-            config.MODEL_STORE,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--api-key",
-            config.OMLX_API_KEY,
-        ],
+        args,
         stdout=log,
         stderr=subprocess.STDOUT,
         env={**os.environ},
