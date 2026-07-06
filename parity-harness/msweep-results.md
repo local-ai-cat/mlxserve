@@ -82,3 +82,26 @@ Verdicts: PASS = both serve, cells green · GAP = one side faulted (see detail) 
 | Qwen3.6-35B-A3B-4bit | 32.3 GB | SKIP | preflight: free 69GB < needed 90GB | 0s | 2026-07-06 08:13 |
 | gpt-oss-20b-MXFP4-Q8 | 11.3 GB | PASS | .                                                                        [100%] | 20s | 2026-07-06 08:16 |
 | Qwen3.6-35B-A3B-4bit | 32.3 GB | PASS | direct pytest cell (preflight bypassed with operator present; Chrome+Docker closed, ~73GB free) | 1 run | 2026-07-06 08:4x |
+| Qwen3-0.6B-4bit | 0.3 GB | PASS | .                                                                        [100%] | 11s | 2026-07-06 08:26 |
+| Qwen3-0.6B-4bit | 0.3 GB | PASS | .                                                                        [100%] | 6s | 2026-07-06 08:27 |
+| Llama-3.2-1B-Instruct-4bit | 0.7 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[Llama-3.2-1B-Instruct-4bit] | 9s | 2026-07-06 08:27 |
+| Qwen3-1.7B-4bit | 0.9 GB | PASS | .                                                                        [100%] | 4s | 2026-07-06 08:27 |
+| DeepSeek-R1-Distill-Qwen-1.5B-4bit | 0.9 GB | PASS | .                                                                        [100%] | 4s | 2026-07-06 08:27 |
+| Qwen2-VL-2B-Instruct-4bit | 1.2 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[Qwen2-VL-2B-Instruct-4bit] | 6s | 2026-07-06 08:27 |
+| Llama-3.2-3B-Instruct-4bit | 1.7 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[Llama-3.2-3B-Instruct-4bit] | 6s | 2026-07-06 08:28 |
+| Qwen3.5-4B-MLX-4bit | 2.9 GB | PASS | .                                                                        [100%] | 14s | 2026-07-06 08:28 |
+| Qwen2.5-Coder-7B-Instruct-4bit | 4.0 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[Qwen2.5-Coder-7B-Instruct-4bit] | 14s | 2026-07-06 08:28 |
+| DeepSeek-R1-Distill-Qwen-7B-4bit | 4.0 GB | PASS | .                                                                        [100%] | 14s | 2026-07-06 08:29 |
+| gemma-4-E2B-it-qat-4bit | 4.1 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[gemma-4-E2B-it-qat-4bit] | 12s | 2026-07-06 08:29 |
+| gemma-4-E4B-it-qat-4bit | 6.4 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[gemma-4-E4B-it-qat-4bit] | 12s | 2026-07-06 08:29 |
+| Ornith-1.0-9B-6bit | 7.7 GB | PASS | .                                                                        [100%] | 18s | 2026-07-06 08:30 |
+| gpt-oss-20b-MXFP4-Q8 | 11.3 GB | PASS | .                                                                        [100%] | 18s | 2026-07-06 08:30 |
+| Qwen3.6-27B-4bit | 15.0 GB | PASS | .                                                                        [100%] | 20s | 2026-07-06 08:30 |
+| Qwen3.6-27B-MLX-4bit | 15.0 GB | PASS | .                                                                        [100%] | 23s | 2026-07-06 08:31 |
+| Qwen3-Coder-30B-A3B-Instruct-4bit | 16.0 GB | FAIL | FAILED tests/test_matrix.py::test_architecture_cell[Qwen3-Coder-30B-A3B-Instruct-4bit] | 18s | 2026-07-06 08:31 |
+| Qwen3.6-35B-A3B-4bit | 32.3 GB | SKIP | preflight: free 74GB < needed 90GB | 0s | 2026-07-06 08:31 |
+| Qwen2.5-Coder-7B-Instruct-4bit | 4.0 GB | PASS | .                                                                        [100%] | 19s | 2026-07-06 08:37 |
+| gemma-4-E2B-it-qat-4bit | 4.1 GB | PASS | .                                                                        [100%] | 21s | 2026-07-06 08:37 |
+| gemma-4-E4B-it-qat-4bit | 6.4 GB | PASS | .                                                                        [100%] | 18s | 2026-07-06 08:38 |
+| Qwen3-Coder-30B-A3B-Instruct-4bit | 16.0 GB | PASS | .                                                                        [100%] | 27s | 2026-07-06 08:38 |
+| Qwen3.6-35B-A3B-4bit | 32.3 GB | SKIP | preflight: free 73GB < needed 90GB | 0s | 2026-07-06 08:38 |

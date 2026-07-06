@@ -10,6 +10,8 @@ to hard-error the run.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from parity import client
 from parity.config import spec_for
 from parity.report import FAIL, GAP, PASS, REPORT, MatrixCell
@@ -23,10 +25,10 @@ def _coherent(text: str) -> bool:
     return len(stripped) >= 3 and any(ch.isalpha() for ch in stripped)
 
 
-def _probe(server, model_id):
+def _probe(server, model_id, messages=None):
     """Return (ok, status, text, note)."""
     try:
-        res = client.chat(server, model_id, PROMPT, max_tokens=32, timeout=180)
+        res = client.chat(server, model_id, messages or PROMPT, max_tokens=32, timeout=180)
     except Exception as exc:  # noqa: BLE001
         return False, 0, "", f"request raised: {exc}"
     if res.status != 200 or res.body is None:
@@ -104,3 +106,36 @@ def test_architecture_cell(native_pool, omlx_server, model_id):
     assert oml_ok, f"omlx (reference) failed on {model_id}: {oml_note}"
     if not spec.expect_native_gap:
         assert nat_ok, f"native unexpectedly faulted on {model_id}: {nat_note}"
+
+    # --- concurrency probe (native only — parallel batching is the product) ---
+    # 4 in-flight requests: every one must come back coherent, and the request
+    # repeating the solo prompt must reproduce the solo greedy output exactly —
+    # continuous batching must not corrupt determinism.
+    if nat_ok and native is not None:
+        _assert_concurrent_consistent(native, model_id, nat_text)
+
+
+CONCURRENT_PROMPTS = [
+    PROMPT,  # index 0 repeats the solo prompt — must match the solo output
+    [{"role": "user", "content": "Name three primary colors."}],
+    # Keep every prompt wordy: terse models answer "What is 2+2?" with a bare
+    # "4", which the coherence heuristic (>=3 chars + a letter) rejects.
+    [{"role": "user", "content": "Count from one to five in words."}],
+    [{"role": "user", "content": "Say hello in French."}],
+]
+
+
+def _assert_concurrent_consistent(native, model_id, solo_text):
+    with ThreadPoolExecutor(max_workers=len(CONCURRENT_PROMPTS)) as pool:
+        results = list(
+            pool.map(lambda msgs: _probe(native, model_id, msgs), CONCURRENT_PROMPTS)
+        )
+    for i, (ok, status, _text, note) in enumerate(results):
+        assert ok, (
+            f"native concurrent request {i} failed on {model_id}: "
+            f"status {status} {note}"
+        )
+    assert results[0][2] == solo_text, (
+        f"native batched greedy output diverged from solo on {model_id}: "
+        f"solo[:60]={solo_text[:60]!r} batched[:60]={results[0][2][:60]!r}"
+    )
