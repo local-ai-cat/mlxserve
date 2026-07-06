@@ -321,6 +321,9 @@ public final class OpenAIServer: @unchecked Sendable {
     private let listener: NWListener
     private let responsesStore: ResponsesStore
     private let mcpManager: MCPManager?
+    private let connectionsLock = NSLock()
+    private var openConnections: [ObjectIdentifier: NWConnection] = [:]
+    private var isStopped = false
 
     public init(
         host: String = "127.0.0.1",
@@ -334,9 +337,22 @@ public final class OpenAIServer: @unchecked Sendable {
         self.host = NWEndpoint.Host(host)
         self.port = nwPort
         self.backend = backend
-        self.listener = try NWListener(using: .tcp, on: nwPort)
+        // Loopback hosts must actually bind loopback-only: the `host` parameter
+        // used to be stored but never applied, so the listener accepted
+        // connections on every interface regardless of it.
+        let parameters: NWParameters = .tcp
+        if ["127.0.0.1", "localhost", "::1"].contains(host) {
+            parameters.requiredInterfaceType = .loopback
+        }
+        self.listener = try NWListener(using: parameters, on: nwPort)
         self.responsesStore = ResponsesStore()
         self.mcpManager = mcpManager
+    }
+
+    /// The port the listener is actually bound to — differs from the requested
+    /// port when constructed with port 0 (ephemeral). Nil until `start()` returns.
+    public var boundPort: UInt16? {
+        listener.port?.rawValue
     }
 
     public func start() async throws {
@@ -355,17 +371,50 @@ public final class OpenAIServer: @unchecked Sendable {
                 }
             }
             listener.newConnectionHandler = { [weak self] connection in
-                guard let self else {
+                guard let self, self.track(connection) else {
                     connection.cancel()
                     return
                 }
                 connection.start(queue: .global(qos: .userInitiated))
                 Task {
                     await self.handle(connection)
+                    self.untrack(connection)
                 }
             }
             listener.start(queue: .global(qos: .userInitiated))
         }
+    }
+
+    /// Stops accepting new connections and cancels the in-flight ones, releasing
+    /// the port. Idempotent. Embedded hosts (in-app serving) use this; the CLI
+    /// never stops. The instance cannot be restarted — create a new server.
+    public func stop() {
+        connectionsLock.lock()
+        let alreadyStopped = isStopped
+        isStopped = true
+        let connections = Array(openConnections.values)
+        openConnections.removeAll()
+        connectionsLock.unlock()
+
+        guard !alreadyStopped else { return }
+        listener.cancel()
+        for connection in connections {
+            connection.cancel()
+        }
+    }
+
+    private func track(_ connection: NWConnection) -> Bool {
+        connectionsLock.lock()
+        defer { connectionsLock.unlock() }
+        guard !isStopped else { return false }
+        openConnections[ObjectIdentifier(connection)] = connection
+        return true
+    }
+
+    private func untrack(_ connection: NWConnection) {
+        connectionsLock.lock()
+        openConnections.removeValue(forKey: ObjectIdentifier(connection))
+        connectionsLock.unlock()
     }
 
     public func waitForever() {

@@ -609,6 +609,37 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertFalse(final.stopped)
         XCTAssertEqual(final.text, " ST")
     }
+
+    func testStartServesHealthOverLoopbackThenStopReleasesPort() async throws {
+        let backend = FakePoolLifecycleBackend()
+        let server = try OpenAIServer(port: 0, backend: backend)
+        try await server.start()
+        let port = try XCTUnwrap(server.boundPort)
+        XCTAssertNotEqual(port, 0)
+
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/health"))
+        let (_, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+
+        server.stop()
+        server.stop()  // idempotent
+
+        // The port must actually be released: rebinding it succeeds (with a
+        // brief retry window for kernel teardown).
+        var rebound: OpenAIServer?
+        for _ in 0..<50 {
+            let candidate = try OpenAIServer(port: port, backend: backend)
+            do {
+                try await candidate.start()
+                rebound = candidate
+                break
+            } catch {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        XCTAssertNotNil(rebound, "port \(port) was not released after stop()")
+        rebound?.stop()
+    }
 }
 
 private struct RouteFakeEngine: Sendable {
