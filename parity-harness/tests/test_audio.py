@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import string
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,7 @@ import requests
 
 from parity import client, config
 from parity.report import FAIL, GAP, PASS, REPORT
-from parity.servers import start_omlx
+from parity.servers import start_native, start_omlx
 
 AXIS = "6. Audio"
 FIXTURE = Path(__file__).parent / "fixtures" / "test_speech.wav"
@@ -27,18 +28,28 @@ EXPECTED_WORDS = ["the", "quick", "brown", "fox", "jumps", "over", "the", "lazy"
 MIN_EXPECTED_WORDS = 7
 MIN_OMLX_AGREEMENT = 0.80
 OMLX_TRANSCRIPTION_ATTEMPTS = 3
+MIN_FREE_MEMORY_PERCENT = 40
 
 
-@pytest.fixture(scope="session")
-def native_audio(native_pool):
+@pytest.fixture
+def native_audio(tmp_path):
+    handle = _start_native_audio(tmp_path)
+    try:
+        yield handle
+    finally:
+        handle.stop()
+
+
+def _start_native_audio(log_dir: Path):
     if not Path(config.NATIVE_BIN).exists():
         pytest.skip(f"missing native binary: {config.NATIVE_BIN}")
     models_dir = Path(config.WHISPERKIT_MODELS).expanduser()
     model_dir = models_dir / config.NATIVE_AUDIO_MODEL
     if not model_dir.exists():
         pytest.skip(f"missing WhisperKit model dir: {model_dir}")
-    handle = native_pool.get(config.NATIVE_AUDIO_MODEL)
+    handle = start_native(log_dir)
     if config.NATIVE_AUDIO_MODEL not in handle.discovered_ids(refresh=True):
+        handle.stop()
         pytest.fail(
             f"native did not list speech model {config.NATIVE_AUDIO_MODEL!r}; "
             f"check --whisperkit-models-dir {models_dir}"
@@ -46,8 +57,16 @@ def native_audio(native_pool):
     return handle
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def omlx_audio_server(tmp_path_factory):
+    handle = _start_omlx_audio_server(tmp_path_factory)
+    try:
+        yield handle
+    finally:
+        handle.stop()
+
+
+def _start_omlx_audio_server(tmp_path_factory):
     """Launch omlx against an audio-only shim root.
 
     omlx discovers local models only after `estimate_model_size` sees a
@@ -85,11 +104,34 @@ def omlx_audio_server(tmp_path_factory):
         marker.write_bytes(b"0")
 
     log_dir = tmp_path_factory.mktemp("omlx-audio-logs")
-    handle = start_omlx(Path(log_dir), model_store=str(root))
+    return start_omlx(Path(log_dir), model_store=str(root))
+
+
+def _free_memory_percent() -> int | None:
     try:
-        yield handle
-    finally:
-        handle.stop()
+        output = subprocess.check_output(
+            ["memory_pressure", "-Q"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"System-wide memory free percentage:\s*(\d+)%", output)
+    return int(match.group(1)) if match else None
+
+
+def _require_dual_server_memory(cell: str) -> None:
+    free_percent = _free_memory_percent()
+    if free_percent is not None and free_percent > MIN_FREE_MEMORY_PERCENT:
+        return
+    note = (
+        "SKIP: dual-server audio differential requires "
+        f"memory_pressure -Q free > {MIN_FREE_MEMORY_PERCENT}%; "
+        f"observed {free_percent if free_percent is not None else 'unknown'}%"
+    )
+    REPORT.record(AXIS, cell, GAP, note)
+    pytest.skip(note)
 
 
 def _words(text: str) -> list[str]:
@@ -300,15 +342,27 @@ def _omlx_transcription_or_skip(omlx_server, native_text: str):
     pytest.skip(note)
 
 
-def test_differential_transcription_vs_omlx(native_audio, omlx_audio_server):
-    native_res = _transcribe(native_audio, config.NATIVE_AUDIO_MODEL)
+def test_differential_transcription_vs_omlx(tmp_path_factory):
+    _require_dual_server_memory("native vs omlx transcription")
+
+    native = _start_native_audio(tmp_path_factory.mktemp("native-audio-diff-logs"))
+    try:
+        native_res = _transcribe(native, config.NATIVE_AUDIO_MODEL)
+    finally:
+        native.stop()
+
     native_text = (native_res.body or {}).get("text") if isinstance(native_res.body, dict) else ""
     assert native_res.status == 200 and isinstance(native_text, str), (
         f"native transcription failed before differential: "
         f"HTTP {native_res.status} {native_res.raw[:160]!r}"
     )
 
-    oml_model, oml_res = _omlx_transcription_or_skip(omlx_audio_server, native_text)
+    omlx = _start_omlx_audio_server(tmp_path_factory)
+    try:
+        oml_model, oml_res = _omlx_transcription_or_skip(omlx, native_text)
+    finally:
+        omlx.stop()
+
     oml_text = (oml_res.body or {}).get("text") if isinstance(oml_res.body, dict) else ""
     agreement = _word_agreement(native_text, oml_text if isinstance(oml_text, str) else "")
     ok = (
