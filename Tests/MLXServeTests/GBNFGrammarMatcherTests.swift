@@ -93,6 +93,21 @@ final class GBNFGrammarMatcherTests: XCTestCase {
             message: "left-recursive GBNF rule 'root' is unsupported"
         )
         assertUnsupportedGrammar(
+            """
+            root ::= a
+            a ::= root "x"
+            """,
+            message: "left-recursive GBNF rule 'root' is unsupported"
+        )
+        assertUnsupportedGrammar(
+            """
+            root ::= prefix a
+            prefix ::= "" | "p"
+            a ::= root "x"
+            """,
+            message: "left-recursive GBNF rule 'root' is unsupported"
+        )
+        assertUnsupportedGrammar(
             "root ::= \"abc",
             message: "unclosed GBNF string literal"
         )

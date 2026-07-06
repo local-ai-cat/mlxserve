@@ -236,9 +236,11 @@ private enum GBNFValidator {
             for reference in references(in: expression) where rules[reference] == nil {
                 throw GBNFGrammarError.unsupported("GBNF rule '\(name)' references unknown rule '\(reference)'")
             }
-            if nullableFirstReferences(in: expression).contains(name) {
-                throw GBNFGrammarError.unsupported("left-recursive GBNF rule '\(name)' is unsupported")
-            }
+        }
+        let nullableRules = computeNullableRules(rules)
+        let graph = rules.mapValues { nullableFirstReferences(in: $0, nullableRules: nullableRules) }
+        if let cycle = leftRecursiveRule(in: graph) {
+            throw GBNFGrammarError.unsupported("left-recursive GBNF rule '\(cycle)' is unsupported")
         }
     }
 
@@ -255,39 +257,87 @@ private enum GBNFValidator {
         }
     }
 
-    private static func nullableFirstReferences(in expression: GBNFExpr) -> Set<String> {
+    private static func computeNullableRules(_ rules: [String: GBNFExpr]) -> Set<String> {
+        var nullableRules: Set<String> = []
+        var changed = true
+        while changed {
+            changed = false
+            for (name, expression) in rules where !nullableRules.contains(name) {
+                if isNullable(expression, nullableRules: nullableRules) {
+                    nullableRules.insert(name)
+                    changed = true
+                }
+            }
+        }
+        return nullableRules
+    }
+
+    private static func nullableFirstReferences(
+        in expression: GBNFExpr,
+        nullableRules: Set<String>
+    ) -> Set<String> {
         switch expression {
         case .rule(let name):
             return [name]
         case .sequence(let parts):
             var result: Set<String> = []
             for part in parts {
-                result.formUnion(nullableFirstReferences(in: part))
-                if !isNullable(part) { break }
+                result.formUnion(nullableFirstReferences(in: part, nullableRules: nullableRules))
+                if !isNullable(part, nullableRules: nullableRules) { break }
             }
             return result
         case .alternate(let branches):
-            return branches.reduce(into: Set<String>()) { $0.formUnion(nullableFirstReferences(in: $1)) }
-        case .repeatNode(let atom, _, _):
-            return nullableFirstReferences(in: atom)
+            return branches.reduce(into: Set<String>()) {
+                $0.formUnion(nullableFirstReferences(in: $1, nullableRules: nullableRules))
+            }
+        case .repeatNode(let atom, _, let max):
+            guard max != 0 else { return [] }
+            return nullableFirstReferences(in: atom, nullableRules: nullableRules)
         case .empty, .literal, .any, .characterClass:
             return []
         }
     }
 
-    private static func isNullable(_ expression: GBNFExpr) -> Bool {
+    private static func isNullable(_ expression: GBNFExpr, nullableRules: Set<String>) -> Bool {
         switch expression {
         case .empty:
             return true
         case .alternate(let branches):
-            return branches.contains(where: isNullable)
+            return branches.contains { isNullable($0, nullableRules: nullableRules) }
         case .sequence(let parts):
-            return parts.allSatisfy(isNullable)
-        case .repeatNode(_, let min, _):
-            return min == 0
-        case .rule, .literal, .any, .characterClass:
+            return parts.allSatisfy { isNullable($0, nullableRules: nullableRules) }
+        case .repeatNode(let atom, let min, _):
+            return min == 0 || isNullable(atom, nullableRules: nullableRules)
+        case .rule(let name):
+            return nullableRules.contains(name)
+        case .literal, .any, .characterClass:
             return false
         }
+    }
+
+    private static func leftRecursiveRule(in graph: [String: Set<String>]) -> String? {
+        let cyclicRules = graph.keys.sorted().filter { reaches($0, from: $0, graph: graph) }
+        if cyclicRules.contains("root") {
+            return "root"
+        }
+        return cyclicRules.first
+    }
+
+    private static func reaches(
+        _ target: String,
+        from start: String,
+        graph: [String: Set<String>]
+    ) -> Bool {
+        var visited: Set<String> = []
+        var stack = Array(graph[start] ?? [])
+        while let node = stack.popLast() {
+            if node == target {
+                return true
+            }
+            guard visited.insert(node).inserted else { continue }
+            stack.append(contentsOf: graph[node] ?? [])
+        }
+        return false
     }
 }
 
