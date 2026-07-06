@@ -241,6 +241,70 @@ final class StructuredOutputTests: XCTestCase {
         XCTAssertEqual(request.structuredOutput, .regex(pattern: "[A-Z]{2}"))
     }
 
+    func testStructuredOutputsParsesOMLXRegexAlias() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "structured_outputs": {"regex": "[A-Z]{2}"}
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(request.structuredOutput, .regex(pattern: "[A-Z]{2}"))
+    }
+
+    func testStructuredOutputsParsesOMLXGrammarAlias() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "structured_outputs": {"grammar": "root ::= \\"OK\\""}
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(request.structuredOutput, .grammar("root ::= \"OK\""))
+    }
+
+    func testStructuredOutputsParsesOMLXJsonAlias() throws {
+        let request = try OpenAIChatRequest.parse(
+            Data(
+                """
+                {
+                  "model": "test-model",
+                  "messages": [{"role": "user", "content": "hello"}],
+                  "structured_outputs": {
+                    "json": {
+                      "type": "object",
+                      "properties": {"answer": {"type": "string"}},
+                      "required": ["answer"]
+                    }
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(
+            request.structuredOutput,
+            .jsonSchema(
+                name: nil,
+                schema: [
+                    "type": .string("object"),
+                    "properties": .object(["answer": .object(["type": .string("string")])]),
+                    "required": .array([.string("answer")]),
+                ]
+            )
+        )
+    }
+
     func testCompletionRequestParsesStructuredOutputsChoice() throws {
         let request = try OpenAICompletionRequest.parse(
             Data(

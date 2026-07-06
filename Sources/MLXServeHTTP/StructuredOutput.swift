@@ -65,7 +65,7 @@ enum StructuredOutputParser {
         guard let object = value as? [String: Any],
             let type = object["type"] as? String
         else {
-            throw OpenAIServerError.invalidJSON
+            return try parseStructuredOutputAliases(value)
         }
 
         switch type {
@@ -96,6 +96,36 @@ enum StructuredOutputParser {
         default:
             throw OpenAIServerError.invalidJSON
         }
+    }
+
+    private static func parseStructuredOutputAliases(_ value: Any) throws -> StructuredOutputSpec {
+        guard let object = value as? [String: Any] else {
+            throw OpenAIServerError.invalidJSON
+        }
+
+        if let rawJSON = object["json"] ?? object["json_schema"] {
+            guard let schema = rawJSON as? [String: Any] else {
+                throw OpenAIServerError.invalidJSON
+            }
+            return .jsonSchema(name: nil, schema: try convertJSONObject(schema))
+        }
+
+        if let choices = object["choice"] as? [String] ?? object["choices"] as? [String] {
+            guard !choices.isEmpty else {
+                throw OpenAIServerError.invalidStructuredOutput("structured_outputs.choice requires at least one choice")
+            }
+            return .choice(choices)
+        }
+
+        if let pattern = object["regex"] as? String, !pattern.isEmpty {
+            return .regex(pattern: pattern)
+        }
+
+        if let grammar = object["grammar"] as? String ?? object["gbnf"] as? String, !grammar.isEmpty {
+            return .grammar(grammar)
+        }
+
+        throw OpenAIServerError.invalidJSON
     }
 
     private static func convertJSONObject(_ object: [String: Any]) throws -> [String: OpenAIJSONValue] {
