@@ -83,8 +83,11 @@ public actor Scheduler {
         for response in rawResponses {
             guard var runningRequest = running[response.uid] else { continue }
             runningRequest.generatedTokenCount += 1
-            if runningRequest.generatedTokenCount == 1,
-                runningRequest.promptCacheSnapshot == nil
+            if prefixCacheEnabled,
+                prefixStore != nil,
+                runningRequest.generatedTokenCount == 1,
+                runningRequest.promptCacheSnapshot == nil,
+                !runningRequest.promptTokens.isEmpty
             {
                 runningRequest.promptCacheSnapshot = promptCacheSnapshot(uid: response.uid)
             }
