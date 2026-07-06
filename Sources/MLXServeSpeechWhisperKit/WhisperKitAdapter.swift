@@ -136,8 +136,12 @@ public actor WhisperKitSpeechAdapter: SpeechEngineAdapter {
 
 /// Owns one non-Sendable `WhisperKit` instance and serializes every transcribe
 /// call through it — the unit both the file lane and stream sessions share.
+/// Actors are REENTRANT across `await`, so isolation alone does not serialize;
+/// a job chain does: each call awaits the previous job before starting.
 actor WhisperKitPipeline {
     private let whisperKit: WhisperKit
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
 
     init(modelFolder: String) async throws {
         self.whisperKit = try await WhisperKit(WhisperKitConfig(modelFolder: modelFolder, load: true))
@@ -152,9 +156,11 @@ actor WhisperKitPipeline {
         language: String?,
         temperature: Float
     ) async throws -> [TranscriptionResult] {
-        try await whisperKit.transcribe(
+        await acquireTurn()
+        defer { releaseTurn() }
+        return try await whisperKit.transcribe(
             audioPath: audioPath,
-            decodeOptions: options(language: language, temperature: temperature)
+            decodeOptions: Self.options(language: language, temperature: temperature)
         )
     }
 
@@ -162,13 +168,33 @@ actor WhisperKitPipeline {
         audioArray: [Float],
         language: String?
     ) async throws -> [TranscriptionResult] {
-        try await whisperKit.transcribe(
+        await acquireTurn()
+        defer { releaseTurn() }
+        return try await whisperKit.transcribe(
             audioArray: audioArray,
-            decodeOptions: options(language: language, temperature: 0)
+            decodeOptions: Self.options(language: language, temperature: 0)
         )
     }
 
-    private func options(language: String?, temperature: Float) -> DecodingOptions {
+    /// FIFO turn gate: actor isolation alone does NOT serialize across `await`
+    /// (actors are reentrant), so callers explicitly take turns.
+    private func acquireTurn() async {
+        if !busy {
+            busy = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func releaseTurn() {
+        if waiters.isEmpty {
+            busy = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+
+    private static func options(language: String?, temperature: Float) -> DecodingOptions {
         DecodingOptions(
             task: .transcribe,
             language: language,
@@ -189,17 +215,28 @@ actor WhisperKitStreamSession: SpeechStreamSession {
     private let pipeline: WhisperKitPipeline
     private let language: String?
     private let partialInterval: Double
+    /// Window cap: beyond this, the oldest audio is trimmed (its transcript was
+    /// already emitted in earlier partials) and emitted times stay engine-relative
+    /// via `trimmedSeconds`. Bounds memory AND per-partial re-transcription cost.
+    private let maxWindowSeconds: Double
 
     private var samples: [Float] = []
     private var sampleRate: Double = 16_000
+    private var trimmedSeconds: Double = 0
     private var secondsSinceLastPartial: Double = 0
     private var latencySamples: [Double] = []
     private var finished = false
 
-    init(pipeline: WhisperKitPipeline, language: String?, partialInterval: Double = 2.0) {
+    init(
+        pipeline: WhisperKitPipeline,
+        language: String?,
+        partialInterval: Double = 2.0,
+        maxWindowSeconds: Double = 120
+    ) {
         self.pipeline = pipeline
         self.language = language
         self.partialInterval = partialInterval
+        self.maxWindowSeconds = maxWindowSeconds
         var continuation: AsyncThrowingStream<SpeechStreamSegment, Error>.Continuation!
         self.segments = AsyncThrowingStream { continuation = $0 }
         self.continuation = continuation
@@ -209,6 +246,7 @@ actor WhisperKitStreamSession: SpeechStreamSession {
         guard !finished else { return }
         sampleRate = buffer.sampleRate
         samples.append(contentsOf: buffer.samples)
+        trimWindowIfNeeded()
         secondsSinceLastPartial += buffer.duration
         if secondsSinceLastPartial >= partialInterval {
             secondsSinceLastPartial = 0
@@ -218,8 +256,8 @@ actor WhisperKitStreamSession: SpeechStreamSession {
 
     func finish() async throws {
         guard !finished else { return }
-        finished = true
         try await emit(kind: .final)
+        finished = true
         continuation.finish()
     }
 
@@ -233,32 +271,60 @@ actor WhisperKitStreamSession: SpeechStreamSession {
         let sorted = latencySamples.sorted()
         return SpeechSessionLatencyStats(
             sampleCount: sorted.count,
-            p50Seconds: sorted[sorted.count / 2],
-            p95Seconds: sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))]
+            p50Seconds: nearestRank(sorted, 0.5),
+            p95Seconds: nearestRank(sorted, 0.95)
         )
+    }
+
+    private func nearestRank(_ sorted: [Double], _ percentile: Double) -> Double {
+        let rank = Int((percentile * Double(sorted.count)).rounded(.up)) - 1
+        return sorted[max(0, min(sorted.count - 1, rank))]
+    }
+
+    private func trimWindowIfNeeded() {
+        let maxSamples = Int(maxWindowSeconds * sampleRate)
+        guard samples.count > maxSamples else { return }
+        let excess = samples.count - maxSamples
+        samples.removeFirst(excess)
+        trimmedSeconds += Double(excess) / sampleRate
     }
 
     private func emit(kind: SpeechSegmentKind) async throws {
         guard !samples.isEmpty else {
             if kind == .final {
-                continuation.yield(SpeechStreamSegment(id: 0, kind: .final, text: "", start: 0, end: 0))
+                continuation.yield(
+                    SpeechStreamSegment(id: 0, kind: .final, text: "", start: trimmedSeconds, end: trimmedSeconds)
+                )
             }
             return
         }
-        let fedSeconds = Double(samples.count) / sampleRate
+        let windowStart = trimmedSeconds
+        let windowEnd = trimmedSeconds + Double(samples.count) / sampleRate
         let started = DispatchTime.now()
         let results = try await pipeline.transcribe(audioArray: samples, language: language)
+        // cancel() may have closed the stream while transcription was in flight.
+        guard !finished else { return }
         let merged = WhisperKitSpeechAdapter.merge(results)
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000_000
         latencySamples.append(elapsed)
+        let offsetWords = merged.words.map { words in
+            words.map {
+                SpeechWord(
+                    text: $0.text,
+                    start: $0.start + windowStart,
+                    end: $0.end + windowStart,
+                    confidence: $0.confidence
+                )
+            }
+        }
         continuation.yield(
             SpeechStreamSegment(
                 id: 0,
                 kind: kind,
                 text: merged.text,
-                start: 0,
-                end: fedSeconds,
-                words: merged.words
+                start: windowStart,
+                end: windowEnd,
+                words: offsetWords
             )
         )
     }

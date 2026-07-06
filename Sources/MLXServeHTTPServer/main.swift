@@ -275,6 +275,7 @@ private struct ServerConfig {
               --port PORT                       Bind port. Default: 18181
               --model-dir PATH                  MLX model directory. Required unless MLXSERVE_MODEL_DIR is set.
               --embedding-model-dir PATH        Optional MLX embedding model directory. Also supports MLXSERVE_EMBEDDING_MODEL_DIR.
+              --whisperkit-models-dir PATH      Optional WhisperKit models root for /v1/audio/transcriptions. Also supports MLXSERVE_WHISPERKIT_MODEL_DIR.
               --model-id ID                     Single-model compatibility override.
               --max-concurrent-requests N       Scheduler concurrency cap. Default: 8
               --memory-guard-tier TIER          safe, balanced, or aggressive. Default: off.
