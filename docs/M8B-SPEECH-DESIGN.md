@@ -42,9 +42,13 @@ bridge file→PCM-push; file-only engines buffer), never by consumers.
 ## Lifecycle (pool citizenship — phase 2)
 
 Adapters expose `loadModel`/`unloadModel`/`loadedFootprint` so speech models can
-join the engine pool as an `audio_stt` model type (omlx's taxonomy) — status, LRU,
-memory-guard uniform with LLMs. Phase 1 keeps lifecycle internal to the adapter;
-the protocol carries the hooks from day one so pool wiring is additive.
+appear beside LLMs as `audio_stt` model types (omlx's taxonomy) in `/v1/models`
+and `/v1/models/status`. Load/unload routes delegate to the owning speech adapter,
+but speech models are deliberately not enrolled in the LLM `EnginePool` LRU or
+memory-ceiling eviction yet; that needs a dedicated cross-engine admission policy.
+`loadedFootprint` is reported as `actual_size`. For CoreML/ANE-backed adapters this
+is an approximate adapter working-set signal, not a precise per-model MLX tensor
+allocation.
 
 ## Phasing
 

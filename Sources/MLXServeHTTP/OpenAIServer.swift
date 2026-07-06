@@ -4,10 +4,12 @@ import Network
 public struct OpenAIModelInfo: Sendable {
     public let id: String
     public let maxModelLength: Int?
+    public let modelType: String
 
-    public init(id: String, maxModelLength: Int? = nil) {
+    public init(id: String, maxModelLength: Int? = nil, modelType: String = "llm") {
         self.id = id
         self.maxModelLength = maxModelLength
+        self.modelType = modelType
     }
 }
 
@@ -421,6 +423,10 @@ public final class OpenAIServer: @unchecked Sendable {
         } catch {
             return errorResponse(for: error)
         }
+    }
+
+    func modelsResponseForTesting() -> [String: Any] {
+        modelsResponse()
     }
 
     private func responseID(from path: String) -> String? {
@@ -945,6 +951,9 @@ public final class OpenAIServer: @unchecked Sendable {
         if let rerankBackend = backend as? any OpenAIRerankBackend {
             models.append(contentsOf: rerankBackend.rerankModels)
         }
+        if let audioBackend = backend as? any AudioTranscriptionBackend {
+            models.append(contentsOf: audioBackend.transcriptionModels)
+        }
 
         return [
             "object": "list",
@@ -954,6 +963,7 @@ public final class OpenAIServer: @unchecked Sendable {
                     "object": "model",
                     "created": Int(Date().timeIntervalSince1970),
                     "owned_by": "mlxserve-native",
+                    "model_type": model.modelType,
                 ]
                 if let maxModelLength = model.maxModelLength {
                     payload["max_model_len"] = maxModelLength
@@ -1139,6 +1149,7 @@ private func modelStatusBody(_ status: OpenAIModelPoolStatus) -> [String: Any] {
         "models": status.models.map { model in
             [
                 "id": model.id,
+                "model_type": model.modelType,
                 "model_path": model.modelPath,
                 "loaded": model.loaded,
                 "is_loading": model.isLoading,

@@ -1,4 +1,5 @@
 import Foundation
+@testable import MLXServe
 @testable import MLXServeHTTP
 @testable import MLXServeHTTPServer
 @testable import MLXServeSpeech
@@ -12,6 +13,8 @@ final class FakeSpeechAdapter: SpeechEngineAdapter, @unchecked Sendable {
     let engineID: String
     let capabilities: SpeechEngineCapabilities
     private let models: [SpeechModelInfo]
+    private let footprintBytes: Int64
+    private let state = FakeSpeechAdapterState()
 
     var displayName: String { "Fake (\(engineID))" }
 
@@ -19,9 +22,11 @@ final class FakeSpeechAdapter: SpeechEngineAdapter, @unchecked Sendable {
         engineID: String,
         silicon: SpeechEngineSilicon,
         streaming: Bool = true,
-        modelIDs: [String]
+        modelIDs: [String],
+        footprintBytes: Int64 = 0
     ) {
         self.engineID = engineID
+        self.footprintBytes = footprintBytes
         self.capabilities = SpeechEngineCapabilities(
             supportsFileTranscription: true,
             supportsStreaming: streaming,
@@ -34,6 +39,33 @@ final class FakeSpeechAdapter: SpeechEngineAdapter, @unchecked Sendable {
     }
 
     func availableModels() async -> [SpeechModelInfo] { models }
+
+    func loadModel(_ modelID: String) async throws {
+        guard models.contains(where: { $0.id == modelID }) else {
+            throw SpeechEngineError.unknownModel(modelID)
+        }
+        await state.markLoaded(modelID)
+    }
+
+    func unloadModel(_ modelID: String) async {
+        await state.markUnloaded(modelID)
+    }
+
+    func loadedFootprint() async -> Int64 {
+        await state.hasLoadedModels ? footprintBytes : 0
+    }
+
+    func isLoadedForTest(_ modelID: String) async -> Bool {
+        await state.isLoaded(modelID)
+    }
+
+    func loadCallsForTest(_ modelID: String) async -> Int {
+        await state.loadCalls(modelID)
+    }
+
+    func unloadCallsForTest(_ modelID: String) async -> Int {
+        await state.unloadCalls(modelID)
+    }
 
     func transcribeFile(_ request: SpeechFileTranscriptionRequest) async throws -> SpeechTranscriptionResult {
         SpeechTranscriptionResult(
@@ -52,6 +84,38 @@ final class FakeSpeechAdapter: SpeechEngineAdapter, @unchecked Sendable {
             throw SpeechEngineError.streamingUnsupported(engineID: engineID)
         }
         return FakeStreamSession()
+    }
+}
+
+private actor FakeSpeechAdapterState {
+    private var loadedModelIDs: Set<String> = []
+    private var loadCallCounts: [String: Int] = [:]
+    private var unloadCallCounts: [String: Int] = [:]
+
+    var hasLoadedModels: Bool {
+        !loadedModelIDs.isEmpty
+    }
+
+    func markLoaded(_ modelID: String) {
+        loadedModelIDs.insert(modelID)
+        loadCallCounts[modelID, default: 0] += 1
+    }
+
+    func markUnloaded(_ modelID: String) {
+        loadedModelIDs.remove(modelID)
+        unloadCallCounts[modelID, default: 0] += 1
+    }
+
+    func isLoaded(_ modelID: String) -> Bool {
+        loadedModelIDs.contains(modelID)
+    }
+
+    func loadCalls(_ modelID: String) -> Int {
+        loadCallCounts[modelID] ?? 0
+    }
+
+    func unloadCalls(_ modelID: String) -> Int {
+        unloadCallCounts[modelID] ?? 0
     }
 }
 
@@ -286,4 +350,98 @@ final class RegistrySpeechBackendTests: XCTestCase {
         )
         XCTAssertEqual(result.text, "fake transcript via healthy/shared")
     }
+
+    func testModelsRouteListsSpeechModelsAsAudioSTT() async throws {
+        let adapter = FakeSpeechAdapter(
+            engineID: "whisperkit",
+            silicon: .ane,
+            modelIDs: ["tiny"]
+        )
+        let server = try await makeServer(speechAdapter: adapter)
+
+        let body = server.modelsResponseForTesting()
+        let data = try XCTUnwrap(body["data"] as? [[String: Any]])
+        let tiny = try XCTUnwrap(data.first { $0["id"] as? String == "tiny" })
+        let alpha = try XCTUnwrap(data.first { $0["id"] as? String == "alpha" })
+
+        XCTAssertEqual(tiny["model_type"] as? String, "audio_stt")
+        XCTAssertEqual(alpha["model_type"] as? String, "llm")
+    }
+
+    func testSpeechLifecycleRoutesLoadUnloadAdapterAndStatusIncludesFootprint() async throws {
+        let adapter = FakeSpeechAdapter(
+            engineID: "whisperkit",
+            silicon: .ane,
+            modelIDs: ["tiny"],
+            footprintBytes: 123_456
+        )
+        let server = try await makeServer(speechAdapter: adapter)
+
+        let load = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/tiny/load", headers: [:], body: Data())
+        )
+        XCTAssertEqual(load.status, 200)
+        XCTAssertEqual(load.body["model_id"] as? String, "tiny")
+        let loadCalls = await adapter.loadCallsForTest("tiny")
+        let loadedAfterLoad = await adapter.isLoadedForTest("tiny")
+        XCTAssertEqual(loadCalls, 1)
+        XCTAssertTrue(loadedAfterLoad)
+
+        let status = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "GET", path: "/v1/models/status", headers: [:], body: Data())
+        )
+        XCTAssertEqual(status.status, 200)
+        XCTAssertEqual(status.body["model_count"] as? Int, 2)
+        XCTAssertEqual(status.body["loaded_count"] as? Int, 1)
+        XCTAssertEqual(status.body["current_model_memory"] as? Int64, 123_456)
+        let models = try XCTUnwrap(status.body["models"] as? [[String: Any]])
+        let tiny = try XCTUnwrap(models.first { $0["id"] as? String == "tiny" })
+        XCTAssertEqual(tiny["model_type"] as? String, "audio_stt")
+        XCTAssertEqual(tiny["loaded"] as? Bool, true)
+        XCTAssertEqual(tiny["actual_size"] as? Int64, 123_456)
+
+        let unload = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/tiny/unload", headers: [:], body: Data())
+        )
+        XCTAssertEqual(unload.status, 200)
+        let unloadCalls = await adapter.unloadCallsForTest("tiny")
+        let loadedAfterUnload = await adapter.isLoadedForTest("tiny")
+        XCTAssertEqual(unloadCalls, 1)
+        XCTAssertFalse(loadedAfterUnload)
+    }
+
+    func testUnknownSpeechLifecycleModelMapsTo404() async throws {
+        let adapter = FakeSpeechAdapter(engineID: "whisperkit", silicon: .ane, modelIDs: ["tiny"])
+        let server = try await makeServer(speechAdapter: adapter)
+
+        let response = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/ghost/load", headers: [:], body: Data())
+        )
+        XCTAssertEqual(response.status, 404)
+        let error = try XCTUnwrap(response.body["error"] as? [String: Any])
+        XCTAssertEqual(error["type"] as? String, "not_found_error")
+    }
+}
+
+private func makeServer(speechAdapter: FakeSpeechAdapter) async throws -> OpenAIServer {
+    let registry = SpeechEngineRegistry()
+    await registry.register(speechAdapter)
+    let speechBackend = await RegistrySpeechBackend(registry: registry)
+    let pool = EnginePool(
+        models: [
+            "alpha": DiscoveredModel(
+                id: "alpha",
+                modelURL: URL(fileURLWithPath: "/models/alpha", isDirectory: true),
+                estimatedSize: 100
+            )
+        ],
+        loader: NativeModelLoader(maxConcurrentRequests: 1),
+        finalCeiling: 1_000
+    )
+    let backend = PoolBackedChatBackend(
+        pool: pool,
+        modelIDs: ["alpha"],
+        speechBackend: speechBackend
+    )
+    return try OpenAIServer(port: 0, backend: backend)
 }

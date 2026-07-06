@@ -2,6 +2,7 @@ import Foundation
 
 public struct OpenAIModelRuntimeStatus: Sendable, Equatable {
     public let id: String
+    public let modelType: String
     public let modelPath: String
     public let loaded: Bool
     public let isLoading: Bool
@@ -13,6 +14,7 @@ public struct OpenAIModelRuntimeStatus: Sendable, Equatable {
 
     public init(
         id: String,
+        modelType: String = "llm",
         modelPath: String,
         loaded: Bool,
         isLoading: Bool,
@@ -23,6 +25,7 @@ public struct OpenAIModelRuntimeStatus: Sendable, Equatable {
         inUse: Int
     ) {
         self.id = id
+        self.modelType = modelType
         self.modelPath = modelPath
         self.loaded = loaded
         self.isLoading = isLoading

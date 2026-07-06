@@ -71,7 +71,18 @@ final class OpenAIServerTests: XCTestCase {
         let first = try XCTUnwrap(models.first)
         XCTAssertEqual(
             Set(first.keys),
-            ["id", "model_path", "loaded", "is_loading", "estimated_size", "actual_size", "pinned", "last_access", "in_use"]
+            [
+                "id",
+                "model_type",
+                "model_path",
+                "loaded",
+                "is_loading",
+                "estimated_size",
+                "actual_size",
+                "pinned",
+                "last_access",
+                "in_use",
+            ]
         )
     }
 

@@ -105,10 +105,19 @@ where Loader.Engine == NativeModelEngine {
     }
 
     func modelPoolStatus() async throws -> OpenAIModelPoolStatus {
-        OpenAIModelPoolStatus(await pool.status())
+        var status = OpenAIModelPoolStatus(await pool.status())
+        if let speechBackend = speechBackend as? RegistrySpeechBackend {
+            let speechModels = await speechBackend.speechModelStatuses()
+            let speechMemory = speechModels.compactMap(\.actualSize).reduce(Int64(0), +)
+            status = status.appendingSpeechModels(speechModels, speechMemory: speechMemory)
+        }
+        return status
     }
 
     func loadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        if !isLLMModel(id), let speechBackend = speechBackend as? RegistrySpeechBackend {
+            return try await speechBackend.loadModel(id)
+        }
         do {
             let result = try await pool.load(id)
             let message = result.alreadyLoaded ? "Already loaded: \(id)" : "Loaded: \(id)"
@@ -119,12 +128,19 @@ where Loader.Engine == NativeModelEngine {
     }
 
     func unloadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        if !isLLMModel(id), let speechBackend = speechBackend as? RegistrySpeechBackend {
+            return try await speechBackend.unloadModel(id)
+        }
         do {
             try await pool.unload(id)
             return OpenAIModelLifecycleResult(modelID: id)
         } catch {
             throw openAIError(from: error)
         }
+    }
+
+    private func isLLMModel(_ id: String) -> Bool {
+        models.contains { $0.id == id }
     }
 
     private func leasedStream(
@@ -207,6 +223,22 @@ private extension OpenAIModelPoolStatus {
             modelCount: status.modelCount,
             loadedCount: status.loadedCount,
             models: status.models.map(OpenAIModelRuntimeStatus.init)
+        )
+    }
+
+    func appendingSpeechModels(
+        _ speechModels: [OpenAIModelRuntimeStatus],
+        speechMemory: Int64
+    ) -> OpenAIModelPoolStatus {
+        OpenAIModelPoolStatus(
+            finalCeiling: finalCeiling,
+            currentModelMemory: currentModelMemory + speechMemory,
+            modelCount: modelCount + speechModels.count,
+            loadedCount: loadedCount + speechModels.filter(\.loaded).count,
+            models: (models + speechModels).sorted { lhs, rhs in
+                if lhs.id == rhs.id { return lhs.modelType < rhs.modelType }
+                return lhs.id < rhs.id
+            }
         )
     }
 }

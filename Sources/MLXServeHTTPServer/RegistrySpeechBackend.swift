@@ -8,6 +8,7 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
     private let registry: SpeechEngineRegistry
     private let modelsLock = NSLock()
     private var cachedModels: [OpenAIModelInfo]
+    private var loadedModelIDs: Set<String> = []
 
     init(registry: SpeechEngineRegistry) async {
         self.registry = registry
@@ -76,7 +77,98 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
     }
 
     private static func snapshotModels(_ registry: SpeechEngineRegistry) async -> [OpenAIModelInfo] {
-        await registry.allModels().map { OpenAIModelInfo(id: $0.id, maxModelLength: nil) }
+        await registry.allModels().map { OpenAIModelInfo(id: $0.id, maxModelLength: nil, modelType: "audio_stt") }
+    }
+
+    func speechModelStatuses() async -> [OpenAIModelRuntimeStatus] {
+        let adapters = await registry.allAdapters()
+        var statuses: [OpenAIModelRuntimeStatus] = []
+        for adapter in adapters {
+            let footprint = await adapter.loadedFootprint()
+            for model in await adapter.availableModels() {
+                let loaded = isLoaded(model.id)
+                statuses.append(
+                    OpenAIModelRuntimeStatus(
+                        id: model.id,
+                        modelType: "audio_stt",
+                        modelPath: "speech://\(model.engineID)/\(model.id)",
+                        loaded: loaded,
+                        isLoading: false,
+                        estimatedSize: model.footprint ?? 0,
+                        // CoreML/ANE adapters can only expose an approximate process
+                        // working set; report the adapter value without feeding it into
+                        // the LLM EnginePool eviction policy.
+                        actualSize: loaded ? footprint : nil,
+                        pinned: false,
+                        lastAccess: nil,
+                        inUse: 0
+                    )
+                )
+            }
+        }
+        return statuses.sorted { lhs, rhs in
+            if lhs.id == rhs.id { return lhs.modelPath < rhs.modelPath }
+            return lhs.id < rhs.id
+        }
+    }
+
+    func loadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        let candidates: [any SpeechEngineAdapter]
+        let modelID: String
+        do {
+            (candidates, modelID) = try await registry.resolveCandidates(model: id)
+        } catch let error as SpeechEngineError {
+            throw Self.httpError(from: error, model: id, models: transcriptionModels)
+        }
+
+        var lastError: Error = SpeechEngineError.unknownModel(id)
+        for adapter in candidates {
+            do {
+                try await adapter.loadModel(modelID)
+                markLoaded(modelID)
+                return OpenAIModelLifecycleResult(modelID: id, message: "Loaded: \(id)")
+            } catch {
+                lastError = error
+            }
+        }
+        if let speechError = lastError as? SpeechEngineError {
+            throw Self.httpError(from: speechError, model: id, models: transcriptionModels)
+        }
+        throw lastError
+    }
+
+    func unloadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        let candidates: [any SpeechEngineAdapter]
+        let modelID: String
+        do {
+            (candidates, modelID) = try await registry.resolveCandidates(model: id)
+        } catch let error as SpeechEngineError {
+            throw Self.httpError(from: error, model: id, models: transcriptionModels)
+        }
+
+        for adapter in candidates {
+            await adapter.unloadModel(modelID)
+        }
+        markUnloaded(modelID)
+        return OpenAIModelLifecycleResult(modelID: id)
+    }
+
+    private func isLoaded(_ modelID: String) -> Bool {
+        modelsLock.lock()
+        defer { modelsLock.unlock() }
+        return loadedModelIDs.contains(modelID)
+    }
+
+    private func markLoaded(_ modelID: String) {
+        modelsLock.lock()
+        loadedModelIDs.insert(modelID)
+        modelsLock.unlock()
+    }
+
+    private func markUnloaded(_ modelID: String) {
+        modelsLock.lock()
+        loadedModelIDs.remove(modelID)
+        modelsLock.unlock()
     }
 
     private static func httpError(
