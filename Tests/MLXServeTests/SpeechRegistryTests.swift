@@ -440,6 +440,53 @@ final class RegistrySpeechBackendTests: XCTestCase {
         XCTAssertEqual(secondLoadCalls, 1)
     }
 
+    func testNamespacedSpeechLifecycleRemainsReachableWhenBareIDCollidesWithLLM() async throws {
+        let adapter = FakeSpeechAdapter(
+            engineID: "whisperkit",
+            silicon: .ane,
+            modelIDs: ["tiny"]
+        )
+        let server = try await makeServer(speechAdapter: adapter, llmModelIDs: ["tiny"])
+
+        let response = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/whisperkit:tiny/load", headers: [:], body: Data())
+        )
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.body["model_id"] as? String, "whisperkit:tiny")
+        let loadCalls = await adapter.loadCallsForTest("tiny")
+        let loaded = await adapter.isLoadedForTest("tiny")
+        XCTAssertEqual(loadCalls, 1)
+        XCTAssertTrue(loaded)
+    }
+
+    func testSpeechStatusReportsAdapterFootprintOnlyOnceForMultipleLoadedModels() async throws {
+        let adapter = FakeSpeechAdapter(
+            engineID: "whisperkit",
+            silicon: .ane,
+            modelIDs: ["base", "tiny"],
+            footprintBytes: 123_456
+        )
+        let server = try await makeServer(speechAdapter: adapter)
+
+        _ = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/base/load", headers: [:], body: Data())
+        )
+        _ = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "POST", path: "/v1/models/tiny/load", headers: [:], body: Data())
+        )
+
+        let status = await server.lifecycleRouteResponseForTesting(
+            HTTPRequest(method: "GET", path: "/v1/models/status", headers: [:], body: Data())
+        )
+        XCTAssertEqual(status.status, 200)
+        XCTAssertEqual(status.body["current_model_memory"] as? Int64, 123_456)
+        let models = try XCTUnwrap(status.body["models"] as? [[String: Any]])
+        let speechRows = models.filter { $0["model_type"] as? String == "audio_stt" }
+        XCTAssertEqual(speechRows.filter { $0["loaded"] as? Bool == true }.count, 2)
+        XCTAssertEqual(speechRows.compactMap { $0["actual_size"] as? Int64 }, [123_456])
+    }
+
     func testUnknownSpeechLifecycleModelMapsTo404() async throws {
         let adapter = FakeSpeechAdapter(engineID: "whisperkit", silicon: .ane, modelIDs: ["tiny"])
         let server = try await makeServer(speechAdapter: adapter)
@@ -453,24 +500,32 @@ final class RegistrySpeechBackendTests: XCTestCase {
     }
 }
 
-private func makeServer(speechAdapter: FakeSpeechAdapter) async throws -> OpenAIServer {
+private func makeServer(
+    speechAdapter: FakeSpeechAdapter,
+    llmModelIDs: [String] = ["alpha"]
+) async throws -> OpenAIServer {
     let registry = SpeechEngineRegistry()
     await registry.register(speechAdapter)
     let speechBackend = await RegistrySpeechBackend(registry: registry)
     let pool = EnginePool(
-        models: [
-            "alpha": DiscoveredModel(
-                id: "alpha",
-                modelURL: URL(fileURLWithPath: "/models/alpha", isDirectory: true),
-                estimatedSize: 100
-            )
-        ],
+        models: Dictionary(
+            uniqueKeysWithValues: llmModelIDs.map {
+                (
+                    $0,
+                    DiscoveredModel(
+                        id: $0,
+                        modelURL: URL(fileURLWithPath: "/models/\($0)", isDirectory: true),
+                        estimatedSize: 100
+                    )
+                )
+            }
+        ),
         loader: NativeModelLoader(maxConcurrentRequests: 1),
         finalCeiling: 1_000
     )
     let backend = PoolBackedChatBackend(
         pool: pool,
-        modelIDs: ["alpha"],
+        modelIDs: llmModelIDs,
         speechBackend: speechBackend
     )
     return try OpenAIServer(port: 0, backend: backend)

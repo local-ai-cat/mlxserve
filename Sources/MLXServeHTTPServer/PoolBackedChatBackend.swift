@@ -137,8 +137,10 @@ where Loader.Engine == NativeModelEngine {
     }
 
     func loadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
-        if !isLLMModel(id), let speechBackend = speechBackend as? RegistrySpeechBackend {
-            return try await speechBackend.loadModel(id)
+        if let registrySpeechBackend = speechBackend as? RegistrySpeechBackend,
+            await shouldRouteSpeechLifecycle(id, speechBackend: registrySpeechBackend)
+        {
+            return try await registrySpeechBackend.loadModel(id)
         }
         do {
             let result = try await pool.load(id)
@@ -150,8 +152,10 @@ where Loader.Engine == NativeModelEngine {
     }
 
     func unloadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
-        if !isLLMModel(id), let speechBackend = speechBackend as? RegistrySpeechBackend {
-            return try await speechBackend.unloadModel(id)
+        if let registrySpeechBackend = speechBackend as? RegistrySpeechBackend,
+            await shouldRouteSpeechLifecycle(id, speechBackend: registrySpeechBackend)
+        {
+            return try await registrySpeechBackend.unloadModel(id)
         }
         do {
             try await pool.unload(id)
@@ -163,6 +167,16 @@ where Loader.Engine == NativeModelEngine {
 
     private func isLLMModel(_ id: String) -> Bool {
         models.contains { $0.id == id }
+    }
+
+    private func shouldRouteSpeechLifecycle(_ id: String, speechBackend: RegistrySpeechBackend) async -> Bool {
+        if !isLLMModel(id) {
+            return true
+        }
+        guard speechBackend.isNamespacedSpeechModelReference(id) else {
+            return false
+        }
+        return await speechBackend.canResolveModelReference(id)
     }
 
     private func leasedStream(

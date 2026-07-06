@@ -85,8 +85,19 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
         var statuses: [OpenAIModelRuntimeStatus] = []
         for adapter in adapters {
             let footprint = await adapter.loadedFootprint()
-            for model in await adapter.availableModels() {
+            var reportedAdapterFootprint = false
+            for model in await adapter.availableModels().sorted(by: { $0.id < $1.id }) {
                 let loaded = isLoaded(engineID: model.engineID, modelID: model.id)
+                let actualSize: Int64?
+                if loaded && !reportedAdapterFootprint {
+                    // Adapter APIs expose one process/ANE/CoreML working-set estimate,
+                    // not separable per-model allocations. Attribute it to the first
+                    // loaded model for the adapter so status totals do not double count.
+                    actualSize = footprint
+                    reportedAdapterFootprint = true
+                } else {
+                    actualSize = nil
+                }
                 statuses.append(
                     OpenAIModelRuntimeStatus(
                         id: model.id,
@@ -95,10 +106,7 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
                         loaded: loaded,
                         isLoading: false,
                         estimatedSize: model.footprint ?? 0,
-                        // CoreML/ANE adapters can only expose an approximate process
-                        // working set; report the adapter value without feeding it into
-                        // the LLM EnginePool eviction policy.
-                        actualSize: loaded ? footprint : nil,
+                        actualSize: actualSize,
                         pinned: false,
                         lastAccess: nil,
                         inUse: 0
@@ -109,6 +117,23 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
         return statuses.sorted { lhs, rhs in
             if lhs.id == rhs.id { return lhs.modelPath < rhs.modelPath }
             return lhs.id < rhs.id
+        }
+    }
+
+    func isNamespacedSpeechModelReference(_ id: String) -> Bool {
+        let parts = id.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    func canResolveModelReference(_ id: String) async -> Bool {
+        do {
+            _ = try await registry.resolveCandidates(model: id)
+            return true
+        } catch {
+            return false
         }
     }
 

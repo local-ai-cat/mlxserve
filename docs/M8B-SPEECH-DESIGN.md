@@ -48,7 +48,9 @@ but speech models are deliberately not enrolled in the LLM `EnginePool` LRU or
 memory-ceiling eviction yet; that needs a dedicated cross-engine admission policy.
 `loadedFootprint` is reported as `actual_size`. For CoreML/ANE-backed adapters this
 is an approximate adapter working-set signal, not a precise per-model MLX tensor
-allocation.
+allocation. When multiple models are loaded inside one adapter, the adapter
+footprint is attributed once to the first loaded model in that adapter's status
+rows so aggregate status memory does not double count the shared working set.
 
 ## Phasing
 
