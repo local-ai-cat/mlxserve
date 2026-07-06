@@ -2,16 +2,31 @@ import Foundation
 
 public struct MCPServerConfig: Sendable, Equatable {
     public let name: String
+    public let transport: String
     public let command: String
     public let args: [String]
     public let env: [String: String]
+    public let url: String?
+    public let headers: [String: String]
     public let timeoutMs: Int
 
-    public init(name: String, command: String, args: [String] = [], env: [String: String] = [:], timeoutMs: Int = 30_000) {
+    public init(
+        name: String,
+        transport: String = "stdio",
+        command: String = "",
+        args: [String] = [],
+        env: [String: String] = [:],
+        url: String? = nil,
+        headers: [String: String] = [:],
+        timeoutMs: Int = 30_000
+    ) {
         self.name = name
+        self.transport = transport
         self.command = command
         self.args = args
         self.env = env
+        self.url = url
+        self.headers = headers
         self.timeoutMs = timeoutMs
     }
 }
@@ -45,17 +60,52 @@ public struct MCPConfig: Sendable, Equatable {
             let enabled = serverObject["enabled"] as? Bool ?? true
             guard enabled else { continue }
             let transport = serverObject["transport"] as? String ?? "stdio"
-            guard transport == "stdio" else { continue }
-            guard let command = serverObject["command"] as? String, !command.isEmpty else {
-                throw OpenAIServerError.invalidJSON
-            }
+            let normalizedTransport = transport == "streamable_http" ? "streamable-http" : transport
             let args = serverObject["args"] as? [String] ?? []
             let env = serverObject["env"] as? [String: String] ?? [:]
-            let timeoutMs = serverObject["timeoutMs"] as? Int ?? 30_000
+            let url = serverObject["url"] as? String
+            let headers = serverObject["headers"] as? [String: String] ?? [:]
+            let timeoutSeconds = (serverObject["timeout"] as? Double)
+                ?? (serverObject["timeout"] as? Int).map(Double.init)
+            let timeoutMs = serverObject["timeoutMs"] as? Int
+                ?? timeoutSeconds.map { Int($0 * 1000) }
+                ?? 30_000
             guard timeoutMs > 0 else {
                 throw OpenAIServerError.invalidJSON
             }
-            servers.append(MCPServerConfig(name: name, command: command, args: args, env: env, timeoutMs: timeoutMs))
+            switch normalizedTransport {
+            case "stdio":
+                guard let command = serverObject["command"] as? String, !command.isEmpty else {
+                    throw OpenAIServerError.invalidJSON
+                }
+                servers.append(
+                    MCPServerConfig(
+                        name: name,
+                        transport: normalizedTransport,
+                        command: command,
+                        args: args,
+                        env: env,
+                        headers: headers,
+                        timeoutMs: timeoutMs
+                    )
+                )
+            case "sse", "streamable-http":
+                guard let url, !url.isEmpty else {
+                    throw OpenAIServerError.invalidJSON
+                }
+                servers.append(
+                    MCPServerConfig(
+                        name: name,
+                        transport: normalizedTransport,
+                        env: env,
+                        url: url,
+                        headers: headers,
+                        timeoutMs: timeoutMs
+                    )
+                )
+            default:
+                throw OpenAIServerError.invalidJSON
+            }
         }
         return MCPConfig(servers: servers)
     }
@@ -353,6 +403,7 @@ private actor MCPStdioClient {
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
+    private var sseEndpointURL: URL?
     private var nextID = 1
     private var state = "disconnected"
     private var error: String?
@@ -373,7 +424,7 @@ private actor MCPStdioClient {
         MCPServerStatus(
             name: config.name,
             state: state,
-            transport: "stdio",
+            transport: config.transport,
             toolsCount: discoveredTools.count,
             error: error
         )
@@ -388,6 +439,7 @@ private actor MCPStdioClient {
     func shutdown() {
         closeProcess()
         process = nil
+        sseEndpointURL = nil
         state = "disconnected"
     }
 
@@ -396,12 +448,41 @@ private actor MCPStdioClient {
     }
 
     func connect() async throws {
-        guard process == nil else { return }
+        guard state != "connected" else { return }
         state = "connecting"
         error = nil
         streamError = nil
         readBuffer = Data()
 
+        switch config.transport {
+        case "stdio":
+            try connectStdio()
+        case "sse":
+            sseEndpointURL = try await discoverSSEEndpoint()
+        case "streamable-http":
+            guard config.url.flatMap(URL.init(string:)) != nil else {
+                throw MCPStdioError.invalidURL(config.url ?? "")
+            }
+        default:
+            throw MCPStdioError.unsupportedTransport(config.transport)
+        }
+
+        _ = try await sendRequest(
+            method: "initialize",
+            params: [
+                "protocolVersion": "2024-11-05",
+                "capabilities": [:],
+                "clientInfo": ["name": "MLXServe", "version": "0"],
+            ]
+        )
+        try await sendNotification(method: "notifications/initialized", params: [:])
+        let toolsResult = try await sendRequest(method: "tools/list", params: [:])
+        discoveredTools = parseTools(from: toolsResult)
+        state = "connected"
+    }
+
+    private func connectStdio() throws {
+        guard process == nil else { return }
         let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -429,24 +510,11 @@ private actor MCPStdioClient {
             let data = handle.availableData
             Task { await self?.receiveOutputData(data) }
         }
-
-        _ = try await sendRequest(
-            method: "initialize",
-            params: [
-                "protocolVersion": "2024-11-05",
-                "capabilities": [:],
-                "clientInfo": ["name": "MLXServe", "version": "0"],
-            ]
-        )
-        try sendNotification(method: "notifications/initialized", params: [:])
-        let toolsResult = try await sendRequest(method: "tools/list", params: [:])
-        discoveredTools = parseTools(from: toolsResult)
-        state = "connected"
     }
 
     func callTool(fullName: String, localName: String, arguments: OpenAIJSONValue) async -> MCPToolExecutionResult {
         do {
-            if process == nil {
+            if state != "connected" {
                 try await connect()
             }
             let result = try await sendRequest(
@@ -479,6 +547,13 @@ private actor MCPStdioClient {
     private func sendRequest(method: String, params: [String: Any]) async throws -> Any {
         let id = nextID
         nextID += 1
+        guard config.transport == "stdio" else {
+            return try await sendHTTPRequest(id: id, method: method, params: params)
+        }
+        return try await sendStdioRequest(id: id, method: method, params: params)
+    }
+
+    private func sendStdioRequest(id: Int, method: String, params: [String: Any]) async throws -> Any {
         try writeMessage(
             [
                 "jsonrpc": "2.0",
@@ -525,6 +600,196 @@ private actor MCPStdioClient {
         }
     }
 
+    private func sendHTTPRequest(id: Int?, method: String, params: [String: Any]) async throws -> Any {
+        let message: [String: Any]
+        if let id {
+            message = [
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            ]
+        } else {
+            message = [
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            ]
+        }
+
+        if id == nil {
+            _ = try await postHTTPRequest(message: message)
+            return [:]
+        }
+
+        var lastError: Error?
+        for attempt in 0 ..< 2 {
+            do {
+                let data = try await postHTTPRequest(message: message)
+                let response = try parseHTTPResponseData(data)
+                if let error = response["error"] as? [String: Any] {
+                    throw MCPStdioError.rpcError(error["message"] as? String ?? String(describing: error))
+                }
+                return response["result"] ?? [:]
+            } catch {
+                lastError = error
+                guard attempt == 0, !isTimeout(error) else { break }
+                if config.transport == "sse" {
+                    sseEndpointURL = nil
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    sseEndpointURL = try await discoverSSEEndpoint()
+                } else {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+        }
+        throw lastError ?? MCPStdioError.invalidMessage
+    }
+
+    private func postHTTPRequest(message: [String: Any]) async throws -> Data {
+        let url = try await requestURL()
+        let timeoutMs = config.timeoutMs
+        let headers = config.headers
+        let body = try JSONSerialization.data(withJSONObject: message, options: [])
+        return try await withTimeout(milliseconds: timeoutMs) {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = TimeInterval(timeoutMs) / 1000.0
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+            request.httpBody = body
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, 200 ..< 300 ~= http.statusCode else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                throw MCPStdioError.httpStatus(status)
+            }
+            return data
+        }
+    }
+
+    private func requestURL() async throws -> URL {
+        switch config.transport {
+        case "sse":
+            if let sseEndpointURL {
+                return sseEndpointURL
+            }
+            let endpoint = try await discoverSSEEndpoint()
+            sseEndpointURL = endpoint
+            return endpoint
+        case "streamable-http":
+            guard let urlString = config.url, let url = URL(string: urlString) else {
+                throw MCPStdioError.invalidURL(config.url ?? "")
+            }
+            return url
+        default:
+            throw MCPStdioError.unsupportedTransport(config.transport)
+        }
+    }
+
+    private func discoverSSEEndpoint() async throws -> URL {
+        guard let urlString = config.url, let url = URL(string: urlString) else {
+            throw MCPStdioError.invalidURL(config.url ?? "")
+        }
+        let timeoutMs = config.timeoutMs
+        let headers = config.headers
+        return try await withTimeout(milliseconds: timeoutMs) {
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = TimeInterval(timeoutMs) / 1000.0
+            request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            guard let http = response as? HTTPURLResponse, 200 ..< 300 ~= http.statusCode else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                throw MCPStdioError.httpStatus(status)
+            }
+            var buffer = Data()
+            for try await byte in bytes {
+                buffer.append(byte)
+                if buffer.containsSSEEventTerminator,
+                    let endpoint = try Self.endpointURL(fromSSEData: buffer, baseURL: url)
+                {
+                    return endpoint
+                }
+            }
+            if let endpoint = try Self.endpointURL(fromSSEData: buffer, baseURL: url) {
+                return endpoint
+            }
+            throw MCPStdioError.invalidMessage
+        }
+    }
+
+    private func parseHTTPResponseData(_ data: Data) throws -> [String: Any] {
+        if let direct = try? parseMessageLine(data) {
+            return direct
+        }
+        guard let payload = Self.firstSSEData(in: data) else {
+            throw MCPStdioError.invalidMessage
+        }
+        return try parseMessageLine(payload)
+    }
+
+    private nonisolated static func firstSSEData(in data: Data) -> Data? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        for event in text.components(separatedBy: "\n\n") {
+            let dataLines = event
+                .split(separator: "\n")
+                .map(String.init)
+                .filter { $0.hasPrefix("data:") }
+                .map { String($0.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces) }
+            guard !dataLines.isEmpty else { continue }
+            let payload = dataLines.joined(separator: "\n")
+            if payload == "[DONE]" { continue }
+            return Data(payload.utf8)
+        }
+        return nil
+    }
+
+    private nonisolated static func endpointURL(fromSSEData data: Data, baseURL: URL) throws -> URL? {
+        guard let payload = firstSSEData(in: data),
+            let endpoint = String(data: payload, encoding: .utf8),
+            !endpoint.isEmpty
+        else {
+            return nil
+        }
+        guard let url = URL(string: endpoint, relativeTo: baseURL)?.absoluteURL else {
+            throw MCPStdioError.invalidURL(endpoint)
+        }
+        return url
+    }
+
+    private func withTimeout<T: Sendable>(
+        milliseconds: Int,
+        operation: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                throw MCPStdioError.timeout(milliseconds)
+            }
+            guard let result = try await group.next() else {
+                throw MCPStdioError.timeout(milliseconds)
+            }
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private func isTimeout(_ error: Error) -> Bool {
+        if case MCPStdioError.timeout = error {
+            return true
+        }
+        return false
+    }
+
     private func timeoutRequest(id: Int, timeoutMs: Int) {
         guard pendingRequests[id] != nil else { return }
         let error = MCPStdioError.timeout(timeoutMs)
@@ -533,7 +798,11 @@ private actor MCPStdioClient {
         resetAfterTimeout(error.description)
     }
 
-    private func sendNotification(method: String, params: [String: Any]) throws {
+    private func sendNotification(method: String, params: [String: Any]) async throws {
+        guard config.transport == "stdio" else {
+            _ = try await sendHTTPRequest(id: nil, method: method, params: params)
+            return
+        }
         try writeMessage(
             [
                 "jsonrpc": "2.0",
@@ -688,6 +957,9 @@ private enum MCPStdioError: Error, CustomStringConvertible {
     case invalidMessage
     case rpcError(String)
     case timeout(Int)
+    case invalidURL(String)
+    case httpStatus(Int)
+    case unsupportedTransport(String)
 
     var description: String {
         switch self {
@@ -701,7 +973,19 @@ private enum MCPStdioError: Error, CustomStringConvertible {
             return "MCP JSON-RPC error: \(message)"
         case .timeout(let timeoutMs):
             return "tool failed: timeout after \(timeoutMs)ms"
+        case .invalidURL(let url):
+            return "invalid MCP URL: \(url)"
+        case .httpStatus(let status):
+            return "MCP HTTP transport returned status \(status)"
+        case .unsupportedTransport(let transport):
+            return "unsupported MCP transport: \(transport)"
         }
+    }
+}
+
+private extension Data {
+    var containsSSEEventTerminator: Bool {
+        contains(Data("\n\n".utf8)) || contains(Data("\r\n\r\n".utf8))
     }
 }
 

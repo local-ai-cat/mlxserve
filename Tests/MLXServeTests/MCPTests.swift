@@ -1,4 +1,5 @@
 import Foundation
+import Network
 @testable import MLXServeHTTP
 import XCTest
 
@@ -19,6 +20,12 @@ final class MCPTests: XCTestCase {
                     "sse": [
                         "transport": "sse",
                         "url": "http://127.0.0.1:1",
+                        "headers": ["Authorization": "Bearer test"],
+                    ],
+                    "stream": [
+                        "transport": "streamable-http",
+                        "url": "http://127.0.0.1:2/mcp",
+                        "timeout": 3,
                     ],
                 ]
             ]
@@ -26,7 +33,16 @@ final class MCPTests: XCTestCase {
 
         XCTAssertEqual(
             config.servers,
-            [MCPServerConfig(name: "fake", command: "python3", args: ["server.py"], env: ["TOKEN": "abc"])]
+            [
+                MCPServerConfig(name: "fake", command: "python3", args: ["server.py"], env: ["TOKEN": "abc"]),
+                MCPServerConfig(
+                    name: "sse",
+                    transport: "sse",
+                    url: "http://127.0.0.1:1",
+                    headers: ["Authorization": "Bearer test"]
+                ),
+                MCPServerConfig(name: "stream", transport: "streamable-http", url: "http://127.0.0.1:2/mcp", timeoutMs: 3_000),
+            ]
         )
     }
 
@@ -68,7 +84,7 @@ final class MCPTests: XCTestCase {
         await manager.connectAll()
 
         let statuses = await manager.serverStatuses()
-        XCTAssertEqual(statuses.first?.state, "connected")
+        XCTAssertEqual(statuses.first?.state, "connected", statuses.first?.error ?? "")
         XCTAssertEqual(statuses.first?.toolsCount, 1)
 
         let tools = await manager.allTools()
@@ -89,6 +105,73 @@ final class MCPTests: XCTestCase {
             return
         }
         XCTAssertEqual(text, "hello")
+        await manager.shutdown()
+    }
+
+    func testMCPStreamableHTTPDiscoversAndExecutesWithHeaders() async throws {
+        let server = try MockMCPHTTPServer(requiredAuthorization: "Bearer stream-token")
+        defer { server.stop() }
+        let manager = MCPManager(
+            config: MCPConfig(
+                servers: [
+                    MCPServerConfig(
+                        name: "remote",
+                        transport: "streamable-http",
+                        url: "\(server.baseURL)/mcp",
+                        headers: ["Authorization": "Bearer stream-token"],
+                        timeoutMs: 1_000
+                    )
+                ]
+            )
+        )
+        await manager.connectAll()
+
+        let statuses = await manager.serverStatuses()
+        XCTAssertEqual(statuses.first?.state, "connected", statuses.first?.error ?? "")
+        XCTAssertEqual(statuses.first?.transport, "streamable-http")
+        XCTAssertEqual(statuses.first?.toolsCount, 1)
+
+        let result = await manager.execute(
+            toolName: "remote__echo",
+            arguments: .object(["message": .string("over-http")])
+        )
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(Self.textContent(result), "over-http")
+        XCTAssertTrue(server.sawAuthorizedRequest)
+        await manager.shutdown()
+    }
+
+    func testMCPSSEDiscoversEndpointAndExecutesWithHeaders() async throws {
+        let server = try MockMCPHTTPServer(requiredAuthorization: "Bearer sse-token")
+        defer { server.stop() }
+        let manager = MCPManager(
+            config: MCPConfig(
+                servers: [
+                    MCPServerConfig(
+                        name: "remote",
+                        transport: "sse",
+                        url: "\(server.baseURL)/sse",
+                        headers: ["Authorization": "Bearer sse-token"],
+                        timeoutMs: 1_000
+                    )
+                ]
+            )
+        )
+        await manager.connectAll()
+
+        let statuses = await manager.serverStatuses()
+        XCTAssertEqual(statuses.first?.state, "connected")
+        XCTAssertEqual(statuses.first?.transport, "sse")
+        XCTAssertEqual(statuses.first?.toolsCount, 1)
+
+        let result = await manager.execute(
+            toolName: "remote__echo",
+            arguments: .object(["message": .string("over-sse")])
+        )
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(Self.textContent(result), "over-sse")
+        XCTAssertEqual(server.sseConnectCount, 1)
+        XCTAssertTrue(server.sawAuthorizedRequest)
         await manager.shutdown()
     }
 
@@ -345,6 +428,181 @@ final class MCPTests: XCTestCase {
         let scriptURL = directory.appendingPathComponent("fake_mcp_server.py")
         try fakeMCPServerScript.write(to: scriptURL, atomically: true, encoding: .utf8)
         return scriptURL
+    }
+
+    private final class MockMCPHTTPServer: @unchecked Sendable {
+        private let listener: NWListener
+        private let requiredAuthorization: String
+        private let queue = DispatchQueue(label: "MockMCPHTTPServer.state")
+        private var _sseConnectCount = 0
+        private var _sawAuthorizedRequest = false
+
+        private(set) var baseURL: String = ""
+
+        var sseConnectCount: Int {
+            queue.sync { _sseConnectCount }
+        }
+
+        var sawAuthorizedRequest: Bool {
+            queue.sync { _sawAuthorizedRequest }
+        }
+
+        init(requiredAuthorization: String) throws {
+            self.requiredAuthorization = requiredAuthorization
+            listener = try NWListener(using: .tcp, on: .any)
+            listener.newConnectionHandler = { [weak self] connection in
+                connection.start(queue: .global())
+                Task {
+                    await self?.handle(connection)
+                }
+            }
+            let ready = DispatchSemaphore(value: 0)
+            listener.stateUpdateHandler = { state in
+                if case .ready = state {
+                    ready.signal()
+                }
+            }
+            listener.start(queue: .global())
+            guard ready.wait(timeout: .now() + 2) == .success else {
+                throw NSError(domain: "MockMCPHTTPServer", code: 2)
+            }
+            guard let port = listener.port else {
+                throw NSError(domain: "MockMCPHTTPServer", code: 1)
+            }
+            baseURL = "http://127.0.0.1:\(port.rawValue)"
+        }
+
+        func stop() {
+            listener.cancel()
+        }
+
+        private func handle(_ connection: NWConnection) async {
+            do {
+                let request = try await HTTPRequest.read(from: connection)
+                let authorized = request.headers["authorization"] == requiredAuthorization
+                    || request.headers["Authorization"] == requiredAuthorization
+                if authorized {
+                    queue.sync {
+                        _sawAuthorizedRequest = true
+                    }
+                } else {
+                    try await send(
+                        status: 401,
+                        contentType: "application/json",
+                        body: #"{"error":"unauthorized"}"#,
+                        connection: connection
+                    )
+                    return
+                }
+
+                if request.method == "GET", request.path == "/sse" {
+                    queue.sync {
+                        _sseConnectCount += 1
+                    }
+                    try await send(
+                        status: 200,
+                        contentType: "text/event-stream",
+                        body: "event: endpoint\ndata: /message\n\n",
+                        connection: connection
+                    )
+                    return
+                }
+
+                if request.method == "POST", request.path == "/mcp" || request.path == "/message" {
+                    let body = try responseBody(for: request.body)
+                    try await send(
+                        status: 200,
+                        contentType: "application/json",
+                        body: body,
+                        connection: connection
+                    )
+                    return
+                }
+
+                try await send(
+                    status: 404,
+                    contentType: "application/json",
+                    body: #"{"error":"not found"}"#,
+                    connection: connection
+                )
+            } catch {
+                connection.cancel()
+            }
+        }
+
+        private func responseBody(for body: Data) throws -> String {
+            guard let request = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+                return #"{"jsonrpc":"2.0","error":{"code":-32700,"message":"invalid json"}}"#
+            }
+            guard let id = request["id"] else {
+                return "{}"
+            }
+            let method = request["method"] as? String
+            let result: [String: Any]
+            switch method {
+            case "initialize":
+                result = [
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": [:],
+                    "serverInfo": ["name": "mock", "version": "1"],
+                ]
+            case "tools/list":
+                result = [
+                    "tools": [
+                        [
+                            "name": "echo",
+                            "description": "Echo input",
+                            "inputSchema": [
+                                "type": "object",
+                                "properties": ["message": ["type": "string"]],
+                            ],
+                        ]
+                    ]
+                ]
+            case "tools/call":
+                let params = request["params"] as? [String: Any] ?? [:]
+                let arguments = params["arguments"] as? [String: Any] ?? [:]
+                result = [
+                    "content": [
+                        [
+                            "type": "text",
+                            "text": arguments["message"] as? String ?? "",
+                        ]
+                    ],
+                    "isError": false,
+                ]
+            default:
+                let response: [String: Any] = [
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": ["code": -32601, "message": "method not found"],
+                ]
+                return String(data: try JSONSerialization.data(withJSONObject: response), encoding: .utf8) ?? "{}"
+            }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            ]
+            return String(data: try JSONSerialization.data(withJSONObject: response), encoding: .utf8) ?? "{}"
+        }
+
+        private func send(
+            status: Int,
+            contentType: String,
+            body: String,
+            connection: NWConnection
+        ) async throws {
+            let reason = status == 200 ? "OK" : status == 401 ? "Unauthorized" : "Not Found"
+            let data = Data(body.utf8)
+            let header = "HTTP/1.1 \(status) \(reason)\r\n"
+                + "Content-Type: \(contentType)\r\n"
+                + "Content-Length: \(data.count)\r\n"
+                + "Connection: close\r\n"
+                + "\r\n"
+            try await connection.sendFinal(data: Data(header.utf8) + data)
+            connection.cancel()
+        }
     }
 
     private var fakeMCPServerScript: String {
