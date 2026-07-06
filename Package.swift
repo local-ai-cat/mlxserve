@@ -40,7 +40,10 @@ let package = Package(
             revision: "098cf970a96c26dca1fb5b036abbf198c0b74ad4"
         ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        // Same fork+revision as the Local AI Chat app pins — one URL per package
+        // identity across the combined graph (SwiftPM escalates the mismatch to
+        // an error in future versions).
+        .package(url: "https://github.com/atlas-open-sources/swift-transformers", revision: "089cb3f02a1718b2943c7e7c4553876cd51a75d1"),
         // Pinned to main by revision: tagged releases (≤0.17) pin swift-transformers
         // <1.2 which conflicts with mlx-swift-lm's ≥1.3; main dropped the dep.
         .package(
