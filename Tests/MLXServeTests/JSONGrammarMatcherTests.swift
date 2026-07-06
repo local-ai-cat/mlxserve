@@ -119,6 +119,38 @@ final class JSONGrammarMatcherTests: XCTestCase {
         XCTAssertEqual(sampled.item(Int.self), 1)
     }
 
+    func testThinkingBudgetForcedTokenDefersToJSONGrammarMask() throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        let matcher = JSONGrammarConfiguration(tokens: Self.tokens, schema: .jsonObject)
+            .makeMatcher()
+        var state: ThinkingBudgetState? = ThinkingBudgetState(
+            configuration: ThinkingBudgetConfiguration(
+                budget: 0,
+                closeTokenIDs: [Self.id("}")],
+                startsInThinking: true
+            )
+        )
+        var logits = [Float](repeating: -10, count: 24)
+        logits[Self.id("[")] = 99
+        logits[Self.id("{")] = 5
+
+        let sampled = TokenSampler.sample(
+            logits: MLXArray(logits),
+            parameters: SamplingParameters(temperature: 0),
+            jsonGrammarMatcher: matcher,
+            thinkingBudgetState: &state
+        )
+        let tokenID = sampled.item(Int.self)
+
+        XCTAssertEqual(tokenID, Self.id("{"))
+        XCTAssertTrue(matcher.accepts(tokenID: tokenID))
+        matcher.advance(tokenID: tokenID)
+        state?.advance(tokenID: tokenID)
+        XCTAssertFalse(matcher.accepts(tokenID: Self.id("{")))
+        XCTAssertTrue(matcher.accepts(tokenID: Self.id("}")))
+    }
+
     func testJSONObjectAllowsOnlyObjectPrefixesAndGatesEOS() {
         let matcher = JSONGrammarConfiguration(
             tokens: Self.tokens,

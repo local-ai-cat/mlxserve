@@ -293,10 +293,15 @@ public final class ContinuousBatchGenerator {
 
         let tokenIds = nextTokens.asArray(Int.self)
         for row in generatedTokenHistory.indices {
-            generatedTokenHistory[row].append(tokenIds[row])
-            jsonGrammarMatchers[row]?.advance(tokenID: tokenIds[row])
-            regexGrammarMatchers[row]?.advance(tokenID: tokenIds[row])
-            thinkingBudgetStates[row]?.advance(tokenID: tokenIds[row])
+            let tokenID = tokenIds[row]
+            generatedTokenHistory[row].append(tokenID)
+            if jsonGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
+                jsonGrammarMatchers[row]?.advance(tokenID: tokenID)
+            }
+            if regexGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
+                regexGrammarMatchers[row]?.advance(tokenID: tokenID)
+            }
+            thinkingBudgetStates[row]?.advance(tokenID: tokenID)
         }
         return rowUIDs.enumerated().map { row, uid in
             Response(uid: uid, token: tokenIds[row])
@@ -337,8 +342,14 @@ public final class ContinuousBatchGenerator {
             regexGrammarMatcher: regexMatcher,
             thinkingBudgetState: &thinkingBudgetState
         )
-        regexMatcher?.advance(tokenID: token.item(Int.self))
-        thinkingBudgetState?.advance(tokenID: token.item(Int.self))
+        let tokenID = token.item(Int.self)
+        if matcher?.accepts(tokenID: tokenID) == true {
+            matcher?.advance(tokenID: tokenID)
+        }
+        if regexMatcher?.accepts(tokenID: tokenID) == true {
+            regexMatcher?.advance(tokenID: tokenID)
+        }
+        thinkingBudgetState?.advance(tokenID: tokenID)
         return PreparedSampledToken(token: token, thinkingBudgetState: thinkingBudgetState)
     }
 }

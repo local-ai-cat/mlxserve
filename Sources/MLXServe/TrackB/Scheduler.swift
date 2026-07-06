@@ -430,11 +430,17 @@ public actor Scheduler {
             regexGrammarMatcher: regexMatcher,
             thinkingBudgetState: &thinkingBudgetState
         )
-        regexMatcher?.advance(tokenID: token.item(Int.self))
-        thinkingBudgetState?.advance(tokenID: token.item(Int.self))
+        let tokenID = token.item(Int.self)
+        if matcher?.accepts(tokenID: tokenID) == true {
+            matcher?.advance(tokenID: tokenID)
+        }
+        if regexMatcher?.accepts(tokenID: tokenID) == true {
+            regexMatcher?.advance(tokenID: tokenID)
+        }
+        thinkingBudgetState?.advance(tokenID: tokenID)
         return PreparedGeneratedToken(
             token: token,
-            tokenID: token.item(Int.self),
+            tokenID: tokenID,
             thinkingBudgetState: thinkingBudgetState
         )
     }

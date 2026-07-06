@@ -36,6 +36,7 @@ public struct ThinkingBudgetState: Sendable, Equatable {
     private var forcing = false
     private var forceIndex = 0
     private var done = false
+    private var skippedForcedToken = false
     private var recentCloseTokens: [Int] = []
     private var recentStartTokens: [Int] = []
 
@@ -67,8 +68,13 @@ public struct ThinkingBudgetState: Sendable, Equatable {
         return sequence[forceIndex]
     }
 
+    public mutating func deferForcedToken() {
+        guard forcing else { return }
+        skippedForcedToken = true
+    }
+
     public mutating func advance(tokenID: Int) {
-        if forcing {
+        if forcing && !skippedForcedToken {
             forceIndex += 1
             if forceIndex >= configuration.forceSequence.count {
                 forcing = false
@@ -78,6 +84,7 @@ public struct ThinkingBudgetState: Sendable, Equatable {
             }
             return
         }
+        skippedForcedToken = false
 
         if done {
             detectThinkingStart(tokenID: tokenID)
@@ -218,7 +225,16 @@ public enum TokenSampler {
     ) -> MLXArray {
         var logits = logits
         if let forcedTokenID = thinkingBudgetState?.nextForcedTokenID() {
-            return MLXArray([Int32(forcedTokenID)])
+            if acceptsForcedToken(
+                forcedTokenID,
+                parameters: parameters,
+                generatedTokens: generatedTokens,
+                jsonGrammarMatcher: jsonGrammarMatcher,
+                regexGrammarMatcher: regexGrammarMatcher
+            ) {
+                return MLXArray([Int32(forcedTokenID)])
+            }
+            thinkingBudgetState?.deferForcedToken()
         }
         if let allowedSequences = parameters.allowedSequences,
             let allowedTokenIDs = allowedNextTokenIDs(
@@ -264,6 +280,31 @@ public enum TokenSampler {
             parameters: parameters,
             generatedTokens: generatedTokens
         )
+    }
+
+    private static func acceptsForcedToken(
+        _ tokenID: Int,
+        parameters: SamplingParameters,
+        generatedTokens: [Int],
+        jsonGrammarMatcher: JSONGrammarMatcher?,
+        regexGrammarMatcher: RegexGrammarMatcher?
+    ) -> Bool {
+        if let allowedSequences = parameters.allowedSequences,
+            let allowedTokenIDs = allowedNextTokenIDs(
+                allowedSequences: allowedSequences,
+                generatedTokens: generatedTokens
+            ),
+            !allowedTokenIDs.contains(tokenID)
+        {
+            return false
+        }
+        if let jsonGrammarMatcher, !jsonGrammarMatcher.accepts(tokenID: tokenID) {
+            return false
+        }
+        if let regexGrammarMatcher, !regexGrammarMatcher.accepts(tokenID: tokenID) {
+            return false
+        }
+        return true
     }
 
     private static func sampleUnconstrained(
