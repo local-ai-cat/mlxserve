@@ -90,6 +90,38 @@ rows so aggregate status memory does not double count the shared working set.
   truly parallel), fuse: confidence pick → ROVER voting → LLM fusion via the
   server's constrained-JSON decode. Post-hoc (raw-first recordings) before live.
 
+## Dispatch control plane + default configuration (ALIGNED 2026-07-06)
+
+Policy/mechanism split — this is the implementation contract for M8b-3:
+
+- **`SpeechDispatchPolicy` — pure function** `decide(request, fleetSnapshot,
+  config) -> Decision` where Decision ∈ {useInstance, spawnInstance(model,
+  computeUnit), routeToEngine, enqueue, windowYield}. No side effects/state/
+  clock — the policy is a reviewable table and every row gets a unit test with
+  fake snapshots. No routing heuristics may live anywhere else (adapters are
+  dumb executors).
+- **`SpeechDispatchController` — actor** beside the registry: builds
+  snapshots, executes decisions, accounts every instance in the shared pool
+  (LRU/footprint from M8b-2 — this also enforces the `release()` discipline
+  centrally; see the FluidAudio jetsam-OOM scar). Emits one structured trace
+  per decision (decision + reason) and counters (spawns/fallbacks/yields).
+  Config read/write over `/v1/audio/dispatch` (GET/PATCH) — app settings and
+  the later UI drive the same object.
+- **Busy = estimated wait** (windows remaining × s/window), never queue depth.
+
+Default config (user-aligned 2026-07-06):
+
+| key | default | rationale |
+|---|---|---|
+| `global.audioPoolShare` | 0.20 | audio burst can't evict the chat LLM |
+| `global.maxTotalInstances` | 4 | 2 engines × 2 compute units |
+| `global.scaleOut` | on | |
+| `engine.*.maxInstancesPerModel` | 2 | ANE+GPU placement; a 3rd contends |
+| `defaults.interactive` | parakeet → appleSpeech (iOS) / whisperkit (macOS) → wait | **Parakeet is the overall interactive default** (user ruling: ~600MB CoreML, streaming partials → live-reveal UI, powers translate). **Download-aware**: skip engines whose model isn't on disk (never auto-download on resolve); auto-promote to Parakeet once its model is present |
+| `defaults.file` | whisperkit → parakeet | word-level timestamps (studio/editor + API contract) + long-file accuracy |
+| `background.mayScaleOut` | false | background takes leftover capacity; only interactive spawns |
+| `surfaces.translate.*` | pinned parakeet | motivating surface |
+
 ## Surface bindings (ruling 2026-07-06)
 
 Engine selection is **per app surface**, layered ABOVE the registry:
