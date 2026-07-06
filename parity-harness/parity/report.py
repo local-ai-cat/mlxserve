@@ -24,6 +24,7 @@ _AXES = [
     "5. Streaming framing",
     "6. Audio",
     "7. Endpoint smoke",
+    "8. Prefix cache",
 ]
 
 

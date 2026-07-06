@@ -181,6 +181,7 @@ def stream_chat(
     max_tokens: int = 32,
     temperature: float = 0.0,
     include_usage: bool = True,
+    extra: dict | None = None,
     read_timeout: float = 30.0,
 ) -> StreamResult:
     """Streaming POST; parse SSE, stopping at `data: [DONE]`.
@@ -201,6 +202,8 @@ def stream_chat(
     }
     if include_usage:
         payload["stream_options"] = {"include_usage": True}
+    if extra:
+        payload.update(extra)
 
     result = StreamResult(status=0)
     try:
