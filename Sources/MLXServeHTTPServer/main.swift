@@ -5,6 +5,8 @@ import MLXHuggingFace
 import MLXLMCommon
 import MLXServe
 import MLXServeHTTP
+import MLXServeSpeech
+import MLXServeSpeechWhisperKit
 import Tokenizers
 
 struct MLXServeHTTPServerMain {
@@ -56,11 +58,26 @@ struct MLXServeHTTPServerMain {
             try await pool.setPinned(true, for: pinnedModelID)
         }
 
+        // M8b speech: registry-backed transcription (WhisperKit adapter first).
+        let speechBackend: RegistrySpeechBackend?
+        if let whisperKitModelsPath = config.whisperKitModelsPath {
+            let registry = SpeechEngineRegistry()
+            await registry.register(
+                WhisperKitSpeechAdapter(
+                    modelsRoot: URL(fileURLWithPath: whisperKitModelsPath, isDirectory: true)
+                )
+            )
+            speechBackend = await RegistrySpeechBackend(registry: registry)
+        } else {
+            speechBackend = nil
+        }
+
         let backend = PoolBackedChatBackend(
             pool: pool,
             modelIDs: Array(discovered.keys),
             embeddingsBackend: embeddingBackend,
-            rerankBackend: rerankBackend
+            rerankBackend: rerankBackend,
+            speechBackend: speechBackend
         )
         let mcpManager: MCPManager?
         if let mcpConfigPath = config.mcpConfigPath {
@@ -132,6 +149,7 @@ private struct ServerConfig {
     let port: UInt16
     let modelPath: String
     let embeddingModelPath: String?
+    let whisperKitModelsPath: String?
     let modelID: String?
     let maxConcurrentRequests: Int
     let memoryGuardTier: MemoryGuardTier?
@@ -146,6 +164,7 @@ private struct ServerConfig {
         var modelPath = ProcessInfo.processInfo.environment["MLXSERVE_MODEL_DIR"]
             ?? ProcessInfo.processInfo.environment["MLXSERVE_TEST_MODEL"]
         var embeddingModelPath = ProcessInfo.processInfo.environment["MLXSERVE_EMBEDDING_MODEL_DIR"]
+        var whisperKitModelsPath = ProcessInfo.processInfo.environment["MLXSERVE_WHISPERKIT_MODEL_DIR"]
         var modelID: String?
         var maxConcurrentRequests = 8
         var memoryGuardTier: MemoryGuardTier?
@@ -173,6 +192,9 @@ private struct ServerConfig {
             case "--embedding-model-dir":
                 index += 1
                 embeddingModelPath = try value(arguments, at: index, for: argument)
+            case "--whisperkit-models-dir":
+                index += 1
+                whisperKitModelsPath = try value(arguments, at: index, for: argument)
             case "--model-id":
                 index += 1
                 modelID = try value(arguments, at: index, for: argument)
@@ -225,6 +247,7 @@ private struct ServerConfig {
             port: port,
             modelPath: modelPath,
             embeddingModelPath: embeddingModelPath,
+            whisperKitModelsPath: whisperKitModelsPath,
             modelID: modelID,
             maxConcurrentRequests: maxConcurrentRequests,
             memoryGuardTier: memoryGuardTier,

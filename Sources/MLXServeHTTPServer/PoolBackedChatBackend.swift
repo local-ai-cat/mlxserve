@@ -2,11 +2,12 @@ import Foundation
 import MLXServe
 import MLXServeHTTP
 
-final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, OpenAIHealthProviding, @unchecked Sendable
+final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, AudioTranscriptionBackend, OpenAIHealthProviding, @unchecked Sendable
 where Loader.Engine == NativeModelEngine {
     let models: [OpenAIModelInfo]
     var embeddingModels: [OpenAIModelInfo] { embeddingsBackend?.embeddingModels ?? [] }
     var rerankModels: [OpenAIModelInfo] { rerankBackend?.rerankModels ?? [] }
+    var transcriptionModels: [OpenAIModelInfo] { speechBackend?.transcriptionModels ?? [] }
     var healthInfo: OpenAIHealthInfo {
         OpenAIHealthInfo(
             defaultModel: models.first?.id,
@@ -17,16 +18,19 @@ where Loader.Engine == NativeModelEngine {
     private let pool: EnginePool<Loader>
     private let embeddingsBackend: (any OpenAIEmbeddingsBackend)?
     private let rerankBackend: (any OpenAIRerankBackend)?
+    private let speechBackend: (any AudioTranscriptionBackend)?
 
     init(
         pool: EnginePool<Loader>,
         modelIDs: [String],
         embeddingsBackend: (any OpenAIEmbeddingsBackend)? = nil,
-        rerankBackend: (any OpenAIRerankBackend)? = nil
+        rerankBackend: (any OpenAIRerankBackend)? = nil,
+        speechBackend: (any AudioTranscriptionBackend)? = nil
     ) {
         self.pool = pool
         self.embeddingsBackend = embeddingsBackend
         self.rerankBackend = rerankBackend
+        self.speechBackend = speechBackend
         self.models = modelIDs.sorted().map { OpenAIModelInfo(id: $0, maxModelLength: nil) }
     }
 
@@ -91,6 +95,13 @@ where Loader.Engine == NativeModelEngine {
             throw OpenAIHTTPError(status: 404, message: "rerank backend unavailable")
         }
         return try await rerankBackend.rerank(request)
+    }
+
+    func transcribe(_ request: AudioTranscriptionRequest) async throws -> AudioTranscriptionResult {
+        guard let speechBackend else {
+            throw OpenAIHTTPError(status: 501, message: "transcription backend not configured")
+        }
+        return try await speechBackend.transcribe(request)
     }
 
     func modelPoolStatus() async throws -> OpenAIModelPoolStatus {

@@ -16,6 +16,14 @@ let package = Package(
             name: "MLXServeHTTP",
             targets: ["MLXServeHTTP"]
         ),
+        .library(
+            name: "MLXServeSpeech",
+            targets: ["MLXServeSpeech"]
+        ),
+        .library(
+            name: "MLXServeSpeechWhisperKit",
+            targets: ["MLXServeSpeechWhisperKit"]
+        ),
         .executable(
             name: "mlxserve-bench",
             targets: ["MLXServeBench"]
@@ -32,6 +40,12 @@ let package = Package(
         ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        // Pinned to main by revision: tagged releases (≤0.17) pin swift-transformers
+        // <1.2 which conflicts with mlx-swift-lm's ≥1.3; main dropped the dep.
+        .package(
+            url: "https://github.com/argmaxinc/WhisperKit",
+            revision: "dcf3a00f0ae4d5b57bc0aad92063b102b70d5fd1"
+        ),
     ],
     targets: [
         .target(
@@ -57,11 +71,24 @@ let package = Package(
             name: "MLXServeHTTP",
             dependencies: []
         ),
+        .target(
+            name: "MLXServeSpeech",
+            dependencies: []
+        ),
+        .target(
+            name: "MLXServeSpeechWhisperKit",
+            dependencies: [
+                "MLXServeSpeech",
+                .product(name: "WhisperKit", package: "WhisperKit"),
+            ]
+        ),
         .executableTarget(
             name: "MLXServeHTTPServer",
             dependencies: [
                 "MLXServe",
                 "MLXServeHTTP",
+                "MLXServeSpeech",
+                "MLXServeSpeechWhisperKit",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
@@ -77,6 +104,8 @@ let package = Package(
                 "MLXServe",
                 "MLXServeHTTP",
                 "MLXServeHTTPServer",
+                "MLXServeSpeech",
+                "MLXServeSpeechWhisperKit",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
