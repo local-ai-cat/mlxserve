@@ -244,8 +244,11 @@ public actor Scheduler {
     {
         let rowCache = model.newCache(parameters: parameters)
         let prefixCacheEligible = isPrefixCacheEligible(request.input)
+        let canUseRawPrefixTokens = prefixCacheEnabled
+            && prefixCacheEligible
+            && request.input.text.tokens.ndim == 1
         let promptText: LMInput.Text
-        if prefixCacheEnabled, prefixCacheEligible {
+        if canUseRawPrefixTokens {
             promptText = request.input.text
         } else {
             switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
@@ -265,10 +268,23 @@ public actor Scheduler {
 
         let promptTokensArray = promptText.tokens
         let promptTokenCount = promptTokensArray.dim(0)
-        guard promptTokenCount > 1 else {
+        guard promptTokenCount > 0 else {
             throw BatchGeneratorError.promptTooShortForExternalPrefill
         }
         let promptTokens = promptTokensArray.asArray(Int.self)
+
+        if promptTokenCount == 1 {
+            let output = model(promptText[text: .newAxis], cache: rowCache, state: nil)
+            eval(rowCache)
+            let firstToken = sampledToken(from: output.logits, sampling: sampling)
+            return PreparedBatchRow(
+                cache: rowCache,
+                lastToken: firstToken.token,
+                promptTokens: [],
+                prefixHit: nil,
+                initialGeneratedToken: firstToken
+            )
+        }
 
         if prefixCacheEnabled,
             prefixCacheEligible,

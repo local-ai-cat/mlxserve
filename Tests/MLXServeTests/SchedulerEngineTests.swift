@@ -92,7 +92,7 @@ final class SchedulerEngineTests: XCTestCase {
                 parameters: GenerateParameters(maxTokens: 2, temperature: 0),
                 maxConcurrentRequests: 1
             )
-            let badInput = LMInput(tokens: MLXArray([Int32(0)]))
+            let badInput = LMInput(tokens: MLXArray([Int32]()))
             let goodInput = try await context.processor.prepare(
                 input: UserInput(prompt: "The capital of France is")
             )
@@ -126,6 +126,40 @@ final class SchedulerEngineTests: XCTestCase {
             }
             XCTAssertEqual(good.filter { $0.token >= 0 }.count, 2)
             XCTAssertEqual(good.last?.finishReason, .length)
+        }
+    }
+
+    func testSingleTokenAdmissionProducesTokens() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run single-token admission gate.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+
+        try await container.perform { context in
+            let engine = MLXServeEngine(
+                model: context.model,
+                parameters: GenerateParameters(maxTokens: 2, temperature: 0),
+                maxConcurrentRequests: 1
+            )
+            let responses = try await Self.collectResponses(
+                from: engine.stream(
+                    Request(
+                        uid: "single-token",
+                        input: LMInput(tokens: MLXArray([Int32(0)])),
+                        maxTokens: 2,
+                        sampling: SamplingParameters(temperature: 0)
+                    )
+                )
+            )
+
+            XCTAssertEqual(responses.filter { $0.token >= 0 }.count, 2)
+            XCTAssertEqual(responses.last?.finishReason, .length)
         }
     }
 

@@ -144,6 +144,21 @@ public final class ContinuousBatchGenerator {
         let rowCache = model.newCache(parameters: parameters)
         switch try model.prepare(input, cache: rowCache, windowSize: parameters.prefillStepSize) {
         case .tokens(let tokens):
+            if tokens.tokens.dim(0) == 1 {
+                let output = model(tokens[text: .newAxis], cache: rowCache, state: nil)
+                eval(rowCache)
+                let firstToken = sampledToken(from: output.logits, sampling: sampling)
+                let tokenID = firstToken.token.item(Int.self)
+                try insert(
+                    uid: uid,
+                    cache: rowCache,
+                    lastToken: firstToken.token,
+                    sampling: sampling,
+                    generatedTokens: [tokenID],
+                    thinkingBudgetState: firstToken.thinkingBudgetState
+                )
+                return Response(uid: uid, token: tokenID)
+            }
             let lastToken = try prefillWithLastTokenWithheld(tokens, cache: rowCache)
             try insert(uid: uid, cache: rowCache, lastToken: lastToken, sampling: sampling)
             return nil
