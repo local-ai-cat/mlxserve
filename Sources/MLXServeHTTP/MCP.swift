@@ -21,13 +21,24 @@ public struct MCPServerConfig: Sendable, Equatable {
         timeoutMs: Int = 30_000
     ) {
         self.name = name
-        self.transport = transport
+        self.transport = Self.normalizeTransport(transport)
         self.command = command
         self.args = args
         self.env = env
         self.url = url
         self.headers = headers
         self.timeoutMs = timeoutMs
+    }
+
+    public static func normalizeTransport(_ transport: String) -> String {
+        switch transport {
+        case "streamable_http":
+            return "streamable-http"
+        case "sse":
+            return "sse-endpoint"
+        default:
+            return transport
+        }
     }
 }
 
@@ -60,7 +71,7 @@ public struct MCPConfig: Sendable, Equatable {
             let enabled = serverObject["enabled"] as? Bool ?? true
             guard enabled else { continue }
             let transport = serverObject["transport"] as? String ?? "stdio"
-            let normalizedTransport = transport == "streamable_http" ? "streamable-http" : transport
+            let normalizedTransport = MCPServerConfig.normalizeTransport(transport)
             let args = serverObject["args"] as? [String] ?? []
             let env = serverObject["env"] as? [String: String] ?? [:]
             let url = serverObject["url"] as? String
@@ -89,7 +100,7 @@ public struct MCPConfig: Sendable, Equatable {
                         timeoutMs: timeoutMs
                     )
                 )
-            case "sse", "streamable-http":
+            case "sse-endpoint", "streamable-http":
                 guard let url, !url.isEmpty else {
                     throw OpenAIServerError.invalidJSON
                 }
@@ -457,7 +468,7 @@ private actor MCPStdioClient {
         switch config.transport {
         case "stdio":
             try connectStdio()
-        case "sse":
+        case "sse-endpoint":
             sseEndpointURL = try await discoverSSEEndpoint()
         case "streamable-http":
             guard config.url.flatMap(URL.init(string:)) != nil else {
@@ -634,7 +645,7 @@ private actor MCPStdioClient {
             } catch {
                 lastError = error
                 guard attempt == 0, !isTimeout(error) else { break }
-                if config.transport == "sse" {
+                if config.transport == "sse-endpoint" {
                     sseEndpointURL = nil
                     try? await Task.sleep(nanoseconds: 100_000_000)
                     sseEndpointURL = try await discoverSSEEndpoint()
@@ -672,7 +683,7 @@ private actor MCPStdioClient {
 
     private func requestURL() async throws -> URL {
         switch config.transport {
-        case "sse":
+        case "sse-endpoint":
             if let sseEndpointURL {
                 return sseEndpointURL
             }

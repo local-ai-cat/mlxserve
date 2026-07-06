@@ -155,6 +155,9 @@ public final class SessionPrefixKVStore: PrefixKVStore, @unchecked Sendable {
             )
             if let sessionKey, !sessionKey.isEmpty {
                 if let old = sessionSlots[sessionKey] {
+                    guard old.leaseCount == 0 else {
+                        return
+                    }
                     currentBytes -= old.byteCount
                 }
                 sessionSlots[sessionKey] = slot

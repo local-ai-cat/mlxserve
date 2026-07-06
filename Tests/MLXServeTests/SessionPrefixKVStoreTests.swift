@@ -49,11 +49,16 @@ final class SessionPrefixKVStoreTests: XCTestCase {
 
         let first = try XCTUnwrap(store.fetch(tokens: [1, 2, 3, 4], sessionKey: "s"))
         XCTAssertNil(store.fetch(tokens: [1, 2, 9], sessionKey: "s"))
+        try store.store(tokens: [1, 2, 3, 4, 5], sessionKey: "s", cache: Self.layers(tokenCount: 5))
 
         store.release(first)
         let second = try XCTUnwrap(store.fetch(tokens: [1, 2, 9], sessionKey: "s"))
         XCTAssertEqual(second.matchedTokenCount, 2)
         store.release(second)
+
+        let preserved = try XCTUnwrap(store.fetch(tokens: [1, 2, 3, 4, 5], sessionKey: "s"))
+        XCTAssertEqual(preserved.matchedTokenCount, 3)
+        store.release(preserved)
     }
 
     func testClearEntryRollsBackSlot() throws {

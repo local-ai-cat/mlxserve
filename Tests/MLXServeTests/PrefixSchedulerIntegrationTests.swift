@@ -73,6 +73,29 @@ final class PrefixSchedulerIntegrationTests: XCTestCase {
         XCTAssertEqual(stats.clearCount, 0)
     }
 
+    func testSessionPrefixCacheMatchesCacheDisabledForExtendedPrompt() async throws {
+        try MLXMetalRuntime.requireAvailable()
+
+        guard let resolution = TestModelResolver.resolve() else {
+            throw XCTSkip("Set MLXSERVE_TEST_MODEL to run M10a session correctness gate.")
+        }
+        guard resolution.url.lastPathComponent == "Qwen3-0.6B-4bit" else {
+            throw XCTSkip("M10a session correctness gate is pinned to Qwen3-0.6B-4bit.")
+        }
+
+        let container = try await LLMModelFactory.shared.loadContainer(
+            from: resolution.url,
+            using: #huggingFaceTokenizerLoader()
+        )
+        let result = try await container.perform { context in
+            try await Self.evaluateSessionCorrectnessGate(context: context)
+        }
+
+        XCTAssertEqual(result.cachedTokens, result.freshTokens)
+        XCTAssertEqual(result.fetchHits, 1)
+        XCTAssertGreaterThanOrEqual(result.stores, 1)
+    }
+
     private static func evaluateGate(context: ModelContext) async throws -> PrefixSchedulerGateResult {
         let model = context.model
         let blockSize = 256
@@ -205,6 +228,70 @@ final class PrefixSchedulerIntegrationTests: XCTestCase {
             )
         ])
         return prefixStore.stats
+    }
+
+    private static func evaluateSessionCorrectnessGate(
+        context: ModelContext
+    ) async throws -> (cachedTokens: [Int], freshTokens: [Int], fetchHits: Int, stores: Int) {
+        let parameters = GenerateParameters(maxTokens: 8, temperature: 0)
+        let prefixTokens = try await makePrefixTokens(context: context, blockSize: 128)
+        let first = prefixTokens + (try await tokenIDs(
+            for: " Cache warmup request. Continue with a short deterministic answer.",
+            context: context,
+            parameters: parameters
+        ))
+        let second = first + (try await tokenIDs(
+            for: " Extended request suffix. Answer in one sentence about Paris.",
+            context: context,
+            parameters: parameters
+        ))
+
+        let prefixStore = SessionPrefixKVStore()
+        let cachedEngine = MLXServeEngine(
+            model: context.model,
+            parameters: parameters,
+            maxConcurrentRequests: 1,
+            prefixStore: prefixStore
+        )
+        _ = try await cachedEngine.generate([
+            Request(
+                uid: "warm",
+                input: LMInput(text: LMInput.Text(tokens: MLXArray(first.map(Int32.init)))),
+                maxTokens: parameters.maxTokens ?? 8,
+                sampling: SamplingParameters(temperature: 0),
+                cacheSession: "session-correctness"
+            )
+        ])
+        let cached = try await cachedEngine.generate([
+            Request(
+                uid: "cached",
+                input: LMInput(text: LMInput.Text(tokens: MLXArray(second.map(Int32.init)))),
+                maxTokens: parameters.maxTokens ?? 8,
+                sampling: SamplingParameters(temperature: 0),
+                cacheSession: "session-correctness"
+            )
+        ])["cached", default: []]
+
+        let freshEngine = MLXServeEngine(
+            model: context.model,
+            parameters: parameters,
+            maxConcurrentRequests: 1
+        )
+        let fresh = try await freshEngine.generate([
+            Request(
+                uid: "fresh",
+                input: LMInput(text: LMInput.Text(tokens: MLXArray(second.map(Int32.init)))),
+                maxTokens: parameters.maxTokens ?? 8,
+                sampling: SamplingParameters(temperature: 0)
+            )
+        ])["fresh", default: []]
+
+        return (
+            cached,
+            fresh,
+            prefixStore.stats.fetchHitCount,
+            prefixStore.stats.storeCount
+        )
     }
 
     private static func serialTrace(

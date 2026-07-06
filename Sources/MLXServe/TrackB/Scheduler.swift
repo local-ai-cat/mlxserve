@@ -83,6 +83,11 @@ public actor Scheduler {
         for response in rawResponses {
             guard var runningRequest = running[response.uid] else { continue }
             runningRequest.generatedTokenCount += 1
+            if runningRequest.generatedTokenCount == 1,
+                runningRequest.promptCacheSnapshot == nil
+            {
+                runningRequest.promptCacheSnapshot = promptCacheSnapshot(uid: response.uid)
+            }
 
             let finishReason: FinishReason?
             if runningRequest.request.eosTokenIds.contains(response.token) {
@@ -111,10 +116,15 @@ public actor Scheduler {
         if !finishedUIDs.isEmpty {
             Stream.gpu.synchronize()
             for uid in finishedUIDs {
-                storeFinishedPromptCache(uid: uid)
+                let finishedRequest = running[uid]
                 generator.remove(uid: uid)
-                releasePrefixHit(uid: uid)
+                if let hit = finishedRequest?.prefixHit {
+                    prefixStore?.release(hit)
+                }
                 running.removeValue(forKey: uid)
+                if let finishedRequest {
+                    storePromptCache(from: finishedRequest)
+                }
             }
         }
 
@@ -188,7 +198,8 @@ public actor Scheduler {
                         request: request,
                         promptTokens: row.promptTokens,
                         prefixHit: row.prefixHit,
-                        generatedTokenCount: generatedTokenCount
+                        generatedTokenCount: generatedTokenCount,
+                        promptCacheSnapshot: nil
                     )
                 }
 
@@ -227,8 +238,10 @@ public actor Scheduler {
         Stream.gpu.synchronize()
         var responses: [Response] = []
         for uid in pendingCancellation {
-            guard running[uid] != nil else { continue }
-            releasePrefixHit(uid: uid)
+            guard let runningRequest = running[uid] else { continue }
+            if let hit = runningRequest.prefixHit {
+                prefixStore?.release(hit)
+            }
             generator.remove(uid: uid)
             running.removeValue(forKey: uid)
             let response = Response(uid: uid, token: -1, finishReason: .cancelled)
@@ -403,37 +416,36 @@ public actor Scheduler {
         eval(cache)
     }
 
-    private func storeFinishedPromptCache(uid: String) {
-        guard prefixCacheEnabled,
-            let prefixStore,
-            let runningRequest = running[uid],
-            !runningRequest.promptTokens.isEmpty,
-            let cache = generator.extractCache(uid: uid)
-        else {
-            return
+    private func promptCacheSnapshot(uid: String) -> [SerializedKVLayer]? {
+        guard let cache = generator.extractCache(uid: uid) else {
+            return nil
         }
-
-        let serialized = cache.map {
+        return cache.map {
             SerializedKVLayer(
                 state: $0.state,
                 metaState: $0.metaState,
                 className: "KVCacheSimple"
             )
         }
+    }
+
+    private func storePromptCache(from runningRequest: RunningRequest) {
+        guard prefixCacheEnabled,
+            let prefixStore,
+            !runningRequest.promptTokens.isEmpty,
+            let snapshot = runningRequest.promptCacheSnapshot
+        else {
+            return
+        }
         do {
             try prefixStore.store(
                 tokens: runningRequest.promptTokens,
                 sessionKey: runningRequest.request.cacheSession,
-                cache: serialized
+                cache: snapshot
             )
         } catch {
             logCacheFailure("prompt cache store failed", error)
         }
-    }
-
-    private func releasePrefixHit(uid: String) {
-        guard let hit = running[uid]?.prefixHit else { return }
-        prefixStore?.release(hit)
     }
 
     private func logCacheFailure(_ message: String, _ error: Error) {

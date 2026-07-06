@@ -37,7 +37,7 @@ final class MCPTests: XCTestCase {
                 MCPServerConfig(name: "fake", command: "python3", args: ["server.py"], env: ["TOKEN": "abc"]),
                 MCPServerConfig(
                     name: "sse",
-                    transport: "sse",
+                    transport: "sse-endpoint",
                     url: "http://127.0.0.1:1",
                     headers: ["Authorization": "Bearer test"]
                 ),
@@ -141,7 +141,7 @@ final class MCPTests: XCTestCase {
         await manager.shutdown()
     }
 
-    func testMCPSSEDiscoversEndpointAndExecutesWithHeaders() async throws {
+    func testMCPSSEEndpointHandshakeDiscoversEndpointAndExecutesWithHeaders() async throws {
         let server = try MockMCPHTTPServer(requiredAuthorization: "Bearer sse-token")
         defer { server.stop() }
         let manager = MCPManager(
@@ -161,7 +161,7 @@ final class MCPTests: XCTestCase {
 
         let statuses = await manager.serverStatuses()
         XCTAssertEqual(statuses.first?.state, "connected")
-        XCTAssertEqual(statuses.first?.transport, "sse")
+        XCTAssertEqual(statuses.first?.transport, "sse-endpoint")
         XCTAssertEqual(statuses.first?.toolsCount, 1)
 
         let result = await manager.execute(
