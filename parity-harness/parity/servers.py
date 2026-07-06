@@ -107,16 +107,20 @@ def start_native(log_dir: Path) -> ServerHandle:
     store, not the flattened symlink farm."""
     port = free_port()
     log = open(log_dir / f"native-{port}.log", "w")  # noqa: SIM115 (kept open for proc)
+    args = [
+        config.NATIVE_BIN,
+        "--model-dir",
+        config.MODEL_STORE,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
+    whisperkit_models = Path(config.WHISPERKIT_MODELS).expanduser()
+    if whisperkit_models.exists():
+        args.extend(["--whisperkit-models-dir", str(whisperkit_models)])
     proc = subprocess.Popen(
-        [
-            config.NATIVE_BIN,
-            "--model-dir",
-            config.MODEL_STORE,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
+        args,
         stdout=log,
         stderr=subprocess.STDOUT,
         cwd=str(Path(config.NATIVE_BIN).parent),

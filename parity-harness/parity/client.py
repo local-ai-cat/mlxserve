@@ -74,6 +74,58 @@ def raw_post(
     return ChatResult(status=resp.status_code, body=body, raw=resp.text)
 
 
+def audio_transcription(
+    server: ServerHandle,
+    model_id: str,
+    wav_path: str,
+    *,
+    timeout: float = 180.0,
+) -> ChatResult:
+    """Multipart POST /v1/audio/transcriptions."""
+    headers: dict[str, str] = {}
+    if server.auth:
+        headers["Authorization"] = f"Bearer {server.auth}"
+    with open(wav_path, "rb") as audio:
+        resp = requests.post(
+            f"{server.base_url}/v1/audio/transcriptions",
+            headers=headers,
+            data={"model": model_id},
+            files={"file": ("test_speech.wav", audio, "audio/wav")},
+            timeout=timeout,
+        )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    return ChatResult(status=resp.status_code, body=body, raw=resp.text)
+
+
+def audio_transcription_bytes(
+    server: ServerHandle,
+    model_id: str,
+    data: bytes,
+    *,
+    filename: str = "garbage.wav",
+    timeout: float = 60.0,
+) -> ChatResult:
+    """Multipart transcription request from bytes, for malformed-audio probes."""
+    headers: dict[str, str] = {}
+    if server.auth:
+        headers["Authorization"] = f"Bearer {server.auth}"
+    resp = requests.post(
+        f"{server.base_url}/v1/audio/transcriptions",
+        headers=headers,
+        data={"model": model_id},
+        files={"file": (filename, data, "audio/wav")},
+        timeout=timeout,
+    )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    return ChatResult(status=resp.status_code, body=body, raw=resp.text)
+
+
 @dataclass
 class StreamResult:
     status: int

@@ -37,6 +37,13 @@ MODEL_STORE = os.environ.get(
 MODEL_FARM = os.environ.get("PARITY_MODEL_FARM", MODEL_STORE)
 OMLX_API_KEY = os.environ.get("PARITY_OMLX_API_KEY", "devkey")
 
+WHISPERKIT_MODELS = os.environ.get(
+    "PARITY_WHISPERKIT_MODELS",
+    str(Path.home() / "Documents/huggingface/models/argmaxinc/whisperkit-coreml"),
+)
+NATIVE_AUDIO_MODEL = os.environ.get("PARITY_NATIVE_AUDIO_MODEL", "openai_whisper-tiny")
+OMLX_AUDIO_MODEL = os.environ.get("PARITY_OMLX_AUDIO_MODEL", "mlx-community/whisper-tiny")
+
 # Token-count agreement tolerance. Chat-template / BOS differences make the two
 # servers count prompt tokens off-by-a-few; with a length cap both hit exactly
 # max_tokens, so output-token agreement is normally exact.

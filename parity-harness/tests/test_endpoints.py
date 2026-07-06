@@ -1,4 +1,4 @@
-"""Axis 6 — Endpoint smoke.
+"""Axis 7 — Endpoint smoke.
 
 Post-M3 native grew several routes beyond /v1/chat/completions. This axis pokes
 the cheap, shape-comparable ones — /health, /v1/completions, /v1/embeddings —
@@ -16,7 +16,7 @@ from parity import client
 from parity.config import ERROR_MODEL
 from parity.report import GAP, PASS, REPORT
 
-AXIS = "6. Endpoint smoke"
+AXIS = "7. Endpoint smoke"
 MODEL = ERROR_MODEL
 
 

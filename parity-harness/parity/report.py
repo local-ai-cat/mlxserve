@@ -22,7 +22,8 @@ _AXES = [
     "3. Model-architecture matrix",
     "4. Error semantics",
     "5. Streaming framing",
-    "6. Endpoint smoke",
+    "6. Audio",
+    "7. Endpoint smoke",
 ]
 
 
