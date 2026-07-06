@@ -153,6 +153,36 @@ final class RerankTests: XCTestCase {
         XCTAssertTrue(NativeRerankBackend.isRerankModelDirectory(directory))
     }
 
+    func testNativeRerankCacheStateEvictsPreviousModelBeforeDifferentLoad() throws {
+        var state = NativeRerankCacheState()
+
+        XCTAssertNil(try state.prepareLoad(id: "rerank-a", estimatedSize: 100, memoryCeilingBytes: 200))
+        state.finishLoad(id: "rerank-a")
+
+        let evicted = try state.prepareLoad(id: "rerank-b", estimatedSize: 100, memoryCeilingBytes: 200)
+
+        XCTAssertEqual(evicted, "rerank-a")
+        XCTAssertNil(state.loadedModelID)
+        state.finishLoad(id: "rerank-b")
+        XCTAssertEqual(state.loadedModelID, "rerank-b")
+    }
+
+    func testNativeRerankCacheStateRejectsModelAboveMemoryCeilingWith507() {
+        var state = NativeRerankCacheState()
+
+        XCTAssertThrowsError(
+            try state.prepareLoad(id: "rerank-huge", estimatedSize: 300, memoryCeilingBytes: 200)
+        ) { error in
+            XCTAssertEqual(
+                error as? OpenAIHTTPError,
+                OpenAIHTTPError(
+                    status: 507,
+                    message: "Model 'rerank-huge' is too large: 300.00B exceeds memory ceiling 200.00B"
+                )
+            )
+        }
+    }
+
     func testNativeRerankSmokeWhenModelGateIsSet() async throws {
         guard let modelPath = ProcessInfo.processInfo.environment["MLXSERVE_RERANK_TEST_MODEL"] else {
             throw XCTSkip("Set MLXSERVE_RERANK_TEST_MODEL to run the rerank scoring smoke test.")

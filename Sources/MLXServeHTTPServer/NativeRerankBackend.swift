@@ -11,11 +11,15 @@ final class NativeRerankBackend: OpenAIRerankBackend, @unchecked Sendable {
     let rerankModels: [OpenAIModelInfo]
 
     private let modelURLsByID: [String: URL]
-    private let cache = NativeRerankModelCache()
+    private let cache: NativeRerankModelCache
 
-    init(models: [String: DiscoveredModel]) {
+    init(models: [String: DiscoveredModel], memoryCeilingBytes: Int64 = 0) {
         self.modelURLsByID = models.mapValues(\.modelURL)
         self.rerankModels = models.keys.sorted().map { OpenAIModelInfo(id: $0, maxModelLength: nil) }
+        self.cache = NativeRerankModelCache(
+            estimatedSizesByID: models.mapValues(\.estimatedSize),
+            memoryCeilingBytes: memoryCeilingBytes
+        )
     }
 
     func rerank(_ request: OpenAIRerankRequest) async throws -> OpenAIRerankResult {
@@ -46,18 +50,76 @@ final class NativeRerankBackend: OpenAIRerankBackend, @unchecked Sendable {
 }
 
 private actor NativeRerankModelCache {
-    private var containers: [String: ModelContainer] = [:]
+    private let estimatedSizesByID: [String: Int64]
+    private let memoryCeilingBytes: Int64
+    private var state = NativeRerankCacheState()
+    private var cached: (id: String, container: ModelContainer)?
+
+    init(estimatedSizesByID: [String: Int64], memoryCeilingBytes: Int64) {
+        self.estimatedSizesByID = estimatedSizesByID
+        self.memoryCeilingBytes = memoryCeilingBytes
+    }
 
     func container(for id: String, modelURL: URL) async throws -> ModelContainer {
-        if let container = containers[id] {
-            return container
+        if let cached, cached.id == id {
+            return cached.container
         }
-        let container = try await LLMModelFactory.shared.loadContainer(
-            from: modelURL,
-            using: #huggingFaceTokenizerLoader()
+        // Auxiliary model classes do not yet have full audio_stt-style pool citizenship.
+        // Until they do, rerank is capped to one resident model and preflights the same
+        // memory ceiling used by the main model pool.
+        _ = try state.prepareLoad(
+            id: id,
+            estimatedSize: estimatedSizesByID[id] ?? 0,
+            memoryCeilingBytes: memoryCeilingBytes
         )
-        containers[id] = container
-        return container
+        cached = nil
+        do {
+            let container = try await LLMModelFactory.shared.loadContainer(
+                from: modelURL,
+                using: #huggingFaceTokenizerLoader()
+            )
+            cached = (id, container)
+            state.finishLoad(id: id)
+            return container
+        } catch {
+            state.clear()
+            throw error
+        }
+    }
+}
+
+struct NativeRerankCacheState: Equatable {
+    private(set) var loadedModelID: String?
+
+    mutating func prepareLoad(
+        id: String,
+        estimatedSize: Int64,
+        memoryCeilingBytes: Int64
+    ) throws -> String? {
+        if loadedModelID == id {
+            return nil
+        }
+        if memoryCeilingBytes > 0 && estimatedSize > memoryCeilingBytes {
+            throw OpenAIHTTPError(
+                status: 507,
+                message: EnginePoolError.modelTooLarge(
+                    id: id,
+                    size: estimatedSize,
+                    ceiling: memoryCeilingBytes
+                ).description
+            )
+        }
+        let evicted = loadedModelID
+        loadedModelID = nil
+        return evicted
+    }
+
+    mutating func finishLoad(id: String) {
+        loadedModelID = id
+    }
+
+    mutating func clear() {
+        loadedModelID = nil
     }
 }
 

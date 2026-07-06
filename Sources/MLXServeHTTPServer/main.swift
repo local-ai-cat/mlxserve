@@ -22,6 +22,10 @@ struct MLXServeHTTPServerMain {
             NativeRerankBackend.isRerankModelDirectory($0.value.modelURL)
         }
         let discovered = allDiscovered.filter { rerankDiscovered[$0.key] == nil }
+        let effectiveCeiling = finalMemoryCeiling(
+            overrideBytes: config.memoryCeilingBytes,
+            tier: config.memoryGuardTier
+        )
 
         // M5 embeddings: a separate model class, NOT part of the LLM pool.
         let embeddingBackend: NativeEmbeddingsBackend?
@@ -38,11 +42,9 @@ struct MLXServeHTTPServerMain {
         } else {
             embeddingBackend = nil
         }
-        let rerankBackend = rerankDiscovered.isEmpty ? nil : NativeRerankBackend(models: rerankDiscovered)
-
-        let effectiveCeiling = finalMemoryCeiling(
-            overrideBytes: config.memoryCeilingBytes,
-            tier: config.memoryGuardTier
+        let rerankBackend = rerankDiscovered.isEmpty ? nil : NativeRerankBackend(
+            models: rerankDiscovered,
+            memoryCeilingBytes: effectiveCeiling.bytes
         )
         let pool = EnginePool(
             models: discovered,
