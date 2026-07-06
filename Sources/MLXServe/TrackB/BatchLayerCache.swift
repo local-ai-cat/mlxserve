@@ -5,11 +5,12 @@ final class BatchLayerCache {
     var kvCache: any KVCache
 
     private enum Layout: Equatable {
+        case single
         case sequence
         case batchState
     }
 
-    private let layout: Layout
+    private var layout: Layout
     private var rowMetaStates: [[String]]
 
     private init(kvCache: any KVCache, layout: Layout, rowMetaStates: [[String]]) {
@@ -19,7 +20,21 @@ final class BatchLayerCache {
     }
 
     var batchSize: Int {
-        kvCache.state.first?.dim(0) ?? 0
+        if layout == .single {
+            return rowMetaStates.isEmpty ? 0 : 1
+        }
+        return kvCache.state.first?.dim(0) ?? 0
+    }
+
+    static func adoptSingle(_ cache: any KVCache) throws -> BatchLayerCache {
+        guard !cache.state.isEmpty else {
+            throw BatchKVCacheError.emptyState(cacheType: String(describing: type(of: cache)))
+        }
+        return BatchLayerCache(
+            kvCache: cache,
+            layout: .single,
+            rowMetaStates: [cache.metaState]
+        )
     }
 
     static func merge(_ caches: [any KVCache]) throws -> BatchLayerCache {
@@ -49,6 +64,14 @@ final class BatchLayerCache {
 
     func extend(_ other: BatchLayerCache) throws {
         guard layout == other.layout else {
+            if layout == .single {
+                try replaceWithMergedRows(from: [self, other])
+                return
+            }
+            if other.layout == .single {
+                try extend(Self.merge(other.rowCaches()))
+                return
+            }
             throw BatchKVCacheError.incompatibleLayout(
                 expected: String(describing: layout),
                 actual: String(describing: other.layout)
@@ -56,6 +79,8 @@ final class BatchLayerCache {
         }
 
         switch layout {
+        case .single:
+            try replaceWithMergedRows(from: [self, other])
         case .sequence:
             guard let cache = kvCache as? BatchKVCache,
                 let otherCache = other.kvCache as? BatchKVCache
@@ -94,6 +119,12 @@ final class BatchLayerCache {
         }
 
         switch layout {
+        case .single:
+            guard rows == [0] else {
+                kvCache.state = []
+                rowMetaStates.removeAll()
+                return
+            }
         case .sequence:
             (kvCache as? BatchKVCache)?.filter(keeping: rows)
         case .batchState:
@@ -111,6 +142,11 @@ final class BatchLayerCache {
     }
 
     func extract(_ row: Int) -> KVCacheSimple {
+        if layout == .single {
+            guard row == 0, !rowMetaStates.isEmpty else { return KVCacheSimple() }
+            return Self.simpleCache(from: kvCache)
+        }
+
         if layout == .sequence, let cache = kvCache as? BatchKVCache {
             return cache.extract(row)
         }
@@ -127,6 +163,33 @@ final class BatchLayerCache {
             layout: layout,
             rowMetaStates: rowMetaStates
         )
+    }
+
+    private func rowCaches() -> [any KVCache] {
+        guard batchSize > 0 else { return [] }
+        if layout == .single {
+            return [kvCache]
+        }
+        return (0 ..< batchSize).map { extract($0) }
+    }
+
+    private func replaceWithMergedRows(from layers: [BatchLayerCache]) throws {
+        let merged = try Self.merge(layers.flatMap { $0.rowCaches() })
+        kvCache = merged.kvCache
+        layout = merged.layout
+        rowMetaStates = merged.rowMetaStates
+    }
+
+    private static func simpleCache(from cache: any KVCache) -> KVCacheSimple {
+        if let simple = cache.copy() as? KVCacheSimple {
+            return simple
+        }
+        let simple = KVCacheSimple()
+        simple.state = cache.state
+        if !cache.metaState.isEmpty {
+            simple.metaState = cache.metaState
+        }
+        return simple
     }
 
     private static func mergeBatchState(_ caches: [any KVCache]) throws -> BatchLayerCache {

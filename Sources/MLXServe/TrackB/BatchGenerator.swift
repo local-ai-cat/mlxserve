@@ -180,10 +180,7 @@ public final class ContinuousBatchGenerator {
         }
 
         if cache.isEmpty {
-            let merged = try (0 ..< rowCache.count).map { layer in
-                try BatchLayerCache.merge([rowCache[layer]])
-            }
-            cache = merged
+            cache = try rowCache.map { try BatchLayerCache.adoptSingle($0) }
             currentTokens = lastToken.reshaped([1])
         } else {
             guard cache.count == rowCache.count else {

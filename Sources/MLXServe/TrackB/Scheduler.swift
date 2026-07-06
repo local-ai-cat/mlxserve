@@ -243,19 +243,24 @@ public actor Scheduler {
         -> PreparedBatchRow
     {
         let rowCache = model.newCache(parameters: parameters)
+        let prefixCacheEligible = isPrefixCacheEligible(request.input)
         let promptText: LMInput.Text
-        switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
-        case .tokens(let tokens):
-            promptText = tokens
-        case .logits(let output):
-            let firstToken = sampledToken(from: output.logits, sampling: sampling)
-            return PreparedBatchRow(
-                cache: rowCache,
-                lastToken: firstToken.token,
-                promptTokens: [],
-                prefixHit: nil,
-                initialGeneratedToken: firstToken
-            )
+        if prefixCacheEnabled, prefixCacheEligible {
+            promptText = request.input.text
+        } else {
+            switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
+            case .tokens(let tokens):
+                promptText = tokens
+            case .logits(let output):
+                let firstToken = sampledToken(from: output.logits, sampling: sampling)
+                return PreparedBatchRow(
+                    cache: rowCache,
+                    lastToken: firstToken.token,
+                    promptTokens: [],
+                    prefixHit: nil,
+                    initialGeneratedToken: firstToken
+                )
+            }
         }
 
         let promptTokensArray = promptText.tokens
@@ -264,7 +269,6 @@ public actor Scheduler {
             throw BatchGeneratorError.promptTooShortForExternalPrefill
         }
         let promptTokens = promptTokensArray.asArray(Int.self)
-        let prefixCacheEligible = isPrefixCacheEligible(request.input)
 
         if prefixCacheEnabled,
             prefixCacheEligible,
@@ -325,11 +329,11 @@ public actor Scheduler {
 
         let remainingCount = promptTokens.count - matched
         if remainingCount > 1 {
-            let suffixPrefix = LMInput.Text(
-                tokens: promptTokensArray[matched ..< (promptTokens.count - 1)]
+            prefillTokenRange(
+                promptTokensArray,
+                range: matched ..< (promptTokens.count - 1),
+                cache: reconstructedCache
             )
-            _ = model(suffixPrefix[text: .newAxis], cache: reconstructedCache, state: nil)
-            eval(reconstructedCache)
         }
 
         return PreparedBatchRow(
@@ -348,9 +352,11 @@ public actor Scheduler {
         storedPromptTokens: [Int],
         rowCache: [any KVCache]
     ) -> PreparedBatchRow {
-        let prefixInput = LMInput.Text(tokens: promptTokensArray[..<(promptTokens.count - 1)])
-        _ = model(prefixInput[text: .newAxis], cache: rowCache, state: nil)
-        eval(rowCache)
+        prefillTokenRange(
+            promptTokensArray,
+            range: 0 ..< (promptTokens.count - 1),
+            cache: rowCache
+        )
 
         return PreparedBatchRow(
             cache: rowCache,
@@ -359,6 +365,26 @@ public actor Scheduler {
             prefixHit: nil,
             initialGeneratedToken: nil
         )
+    }
+
+    private func prefillTokenRange(
+        _ tokens: MLXArray,
+        range: Range<Int>,
+        cache: [any KVCache]
+    ) {
+        guard !range.isEmpty else { return }
+        let stepSize = max(1, parameters.prefillStepSize)
+        var state: LMOutput.State?
+        var start = range.lowerBound
+        while start < range.upperBound {
+            let end = min(start + stepSize, range.upperBound)
+            let input = LMInput.Text(tokens: tokens[start ..< end])
+            let output = model(input[text: .newAxis], cache: cache, state: state)
+            state = output.state
+            asyncEval(cache)
+            start = end
+        }
+        eval(cache)
     }
 
     private func storeFinishedPromptCache(uid: String) {
