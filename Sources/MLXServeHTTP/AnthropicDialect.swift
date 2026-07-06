@@ -129,11 +129,7 @@ public func buildAnthropicCountTokensResponse(request: AnthropicCountTokensReque
 }
 
 public func buildAnthropicCountTokensResponse(result: AnthropicCountTokensResult) -> [String: Any] {
-    var response: [String: Any] = ["input_tokens": result.inputTokens]
-    if result.estimated {
-        response["estimated"] = true
-    }
-    return response
+    ["input_tokens": result.inputTokens]
 }
 
 public struct AnthropicBufferedCompletion {

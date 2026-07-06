@@ -74,7 +74,7 @@ final class AnthropicDialectTests: XCTestCase {
         XCTAssertNil(response.body["estimated"])
     }
 
-    func testCountTokensHandlerMarksFallbackEstimate() async {
+    func testCountTokensHandlerFallbackMatchesReferenceShape() async {
         let handler = AnthropicMessagesHandler(backend: EstimateOnlyBackend())
         let response = await handler.countTokensResponseForTesting(
             HTTPRequest(
@@ -87,7 +87,8 @@ final class AnthropicDialectTests: XCTestCase {
 
         XCTAssertEqual(response.status, 200)
         XCTAssertEqual(response.body["input_tokens"] as? Int, 2)
-        XCTAssertEqual(response.body["estimated"] as? Bool, true)
+        XCTAssertNil(response.body["estimated"])
+        XCTAssertEqual(Set(response.body.keys), ["input_tokens"])
     }
 
     func testMessagesRequestParsesSystemStringAndTranslationFields() throws {
