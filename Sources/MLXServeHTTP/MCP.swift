@@ -357,10 +357,8 @@ private actor MCPStdioClient {
     private var error: String?
     private var discoveredTools: [MCPTool] = []
     private var readBuffer = Data()
-    private var queuedLines: [Data] = []
-    private var pendingRead: (id: UUID, continuation: CheckedContinuation<Data, Error>)?
     private var streamError: Error?
-    private var activeRequestID: UUID?
+    private var pendingRequests: [Int: PendingRequest] = [:]
 
     init(config: MCPServerConfig) {
         self.config = config
@@ -402,7 +400,6 @@ private actor MCPStdioClient {
         error = nil
         streamError = nil
         readBuffer = Data()
-        queuedLines = []
 
         let process = Process()
         let stdinPipe = Pipe()
@@ -490,26 +487,35 @@ private actor MCPStdioClient {
             ]
         )
 
-        let requestID = UUID()
-        activeRequestID = requestID
         let timeoutMs = config.timeoutMs
-        let timeoutTask = Task {
-            do {
-                try await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
-            } catch {
-                return
-            }
-            self.timeoutActiveRequest(id: requestID, timeoutMs: timeoutMs)
-        }
-        defer {
-            timeoutTask.cancel()
-            if activeRequestID == requestID {
-                activeRequestID = nil
-            }
-        }
 
         do {
-            return try await readMatchingResponse(id: id)
+            let responseLine: Data = try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { continuation in
+                        let timeoutTask = Task {
+                            do {
+                                try await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+                            } catch {
+                                return
+                            }
+                            self.timeoutRequest(id: id, timeoutMs: timeoutMs)
+                        }
+                        pendingRequests[id] = PendingRequest(
+                            continuation: continuation,
+                            timeoutTask: timeoutTask
+                        )
+                    }
+                },
+                onCancel: {
+                    Task { await self.cancelRequest(id: id) }
+                }
+            )
+            let response = try parseMessageLine(responseLine)
+            if let error = response["error"] as? [String: Any] {
+                throw MCPStdioError.rpcError(error["message"] as? String ?? String(describing: error))
+            }
+            return response["result"] ?? [:]
         } catch let error as MCPStdioError {
             if case .timeout = error {
                 resetAfterTimeout(error.description)
@@ -518,24 +524,12 @@ private actor MCPStdioClient {
         }
     }
 
-    private func timeoutActiveRequest(id: UUID, timeoutMs: Int) {
-        guard activeRequestID == id else { return }
+    private func timeoutRequest(id: Int, timeoutMs: Int) {
+        guard pendingRequests[id] != nil else { return }
         let error = MCPStdioError.timeout(timeoutMs)
         streamError = error
-        finishPendingRead(.failure(error))
-    }
-
-    private func readMatchingResponse(id: Int) async throws -> Any {
-        while true {
-            let response = try await readMessage()
-            guard let responseID = response["id"] as? Int, responseID == id else {
-                continue
-            }
-            if let error = response["error"] as? [String: Any] {
-                throw MCPStdioError.rpcError(error["message"] as? String ?? String(describing: error))
-            }
-            return response["result"] ?? [:]
-        }
+        failAllPendingRequests(error)
+        resetAfterTimeout(error.description)
     }
 
     private func sendNotification(method: String, params: [String: Any]) throws {
@@ -556,35 +550,10 @@ private actor MCPStdioClient {
         input.write(body + Data("\n".utf8))
     }
 
-    private func readMessage() async throws -> [String: Any] {
-        guard output != nil else {
-            throw MCPStdioError.notConnected
-        }
-        if !queuedLines.isEmpty {
-            return try parseMessageLine(queuedLines.removeFirst())
-        }
-        if let streamError {
-            throw streamError
-        }
-
-        let readID = UUID()
-        return try await withTaskCancellationHandler(
-            operation: {
-                let line = try await withCheckedThrowingContinuation { continuation in
-                    pendingRead = (readID, continuation)
-                }
-                return try parseMessageLine(line)
-            },
-            onCancel: {
-                Task { await self.cancelPendingRead(id: readID) }
-            }
-        )
-    }
-
     private func receiveOutputData(_ data: Data) {
         guard !data.isEmpty else {
             streamError = MCPStdioError.closed
-            finishPendingRead(.failure(MCPStdioError.closed))
+            failAllPendingRequests(MCPStdioError.closed)
             return
         }
 
@@ -600,41 +569,45 @@ private actor MCPStdioClient {
             guard !line.isEmpty else {
                 continue
             }
-            enqueueLine(line)
+            routeMessageLine(line)
         }
     }
 
-    private func enqueueLine(_ line: Data) {
-        if let pendingRead {
-            self.pendingRead = nil
-            pendingRead.continuation.resume(returning: line)
-        } else {
-            queuedLines.append(line)
+    private func routeMessageLine(_ line: Data) {
+        do {
+            let response = try parseMessageLine(line)
+            guard let responseID = response["id"] as? Int else {
+                return
+            }
+            guard let pending = pendingRequests.removeValue(forKey: responseID) else {
+                return
+            }
+            pending.timeoutTask.cancel()
+            pending.continuation.resume(returning: line)
+        } catch {
+            failAllPendingRequests(error)
         }
     }
 
-    private func finishPendingRead(_ result: Result<Data, Error>) {
-        guard let pendingRead else { return }
-        self.pendingRead = nil
-        switch result {
-        case .success(let line):
-            pendingRead.continuation.resume(returning: line)
-        case .failure(let error):
-            pendingRead.continuation.resume(throwing: error)
-        }
+    private func cancelRequest(id: Int) {
+        guard let pending = pendingRequests.removeValue(forKey: id) else { return }
+        pending.timeoutTask.cancel()
+        pending.continuation.resume(throwing: CancellationError())
     }
 
-    private func cancelPendingRead(id: UUID) {
-        guard let pendingRead, pendingRead.id == id else { return }
-        self.pendingRead = nil
-        pendingRead.continuation.resume(throwing: CancellationError())
+    private func failAllPendingRequests(_ error: Error) {
+        let pending = pendingRequests
+        pendingRequests.removeAll()
+        for request in pending.values {
+            request.timeoutTask.cancel()
+            request.continuation.resume(throwing: error)
+        }
     }
 
     private func resetAfterTimeout(_ message: String) {
         closeProcess()
         process = nil
         readBuffer = Data()
-        queuedLines = []
         streamError = nil
         state = "error"
         error = message
@@ -649,7 +622,7 @@ private actor MCPStdioClient {
         }
         input = nil
         output = nil
-        finishPendingRead(.failure(MCPStdioError.closed))
+        failAllPendingRequests(MCPStdioError.closed)
     }
 
     private func parseMessageLine(_ line: Data) throws -> [String: Any] {
@@ -701,6 +674,11 @@ private actor MCPStdioClient {
         }
         return nil
     }
+}
+
+private struct PendingRequest {
+    let continuation: CheckedContinuation<Data, Error>
+    let timeoutTask: Task<Void, Never>
 }
 
 private enum MCPStdioError: Error, CustomStringConvertible {

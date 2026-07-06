@@ -269,6 +269,60 @@ final class MCPTests: XCTestCase {
         await manager.shutdown()
     }
 
+    func testMCPStdioConcurrentCallsRouteOutOfOrderReplies() async throws {
+        let manager = try makeFakeMCPManager(mode: "out-of-order", timeoutMs: 800)
+        await manager.connectAll()
+
+        async let slow = manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("slow")])
+        )
+        async let fast = manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("fast")])
+        )
+
+        let results = await (slow, fast)
+
+        XCTAssertEqual(Self.textContent(results.0), "slow")
+        XCTAssertEqual(Self.textContent(results.1), "fast")
+        XCTAssertFalse(results.0.isError)
+        XCTAssertFalse(results.1.isError)
+        await manager.shutdown()
+    }
+
+    func testMCPStdioConcurrentFastCallCompletesWhileOtherCallTimesOut() async throws {
+        let manager = try makeFakeMCPManager(mode: "hang-one-call", timeoutMs: 150)
+        await manager.connectAll()
+
+        async let hung = manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("hang")])
+        )
+        async let fast = manager.execute(
+            toolName: "fake__echo",
+            arguments: .object(["message": .string("fast")])
+        )
+
+        let results = await (hung, fast)
+
+        XCTAssertTrue(results.0.isError)
+        XCTAssertEqual(results.0.errorMessage, "tool failed: timeout after 150ms")
+        XCTAssertFalse(results.1.isError)
+        XCTAssertEqual(Self.textContent(results.1), "fast")
+        await manager.shutdown()
+    }
+
+    private static func textContent(_ result: MCPToolExecutionResult) -> String? {
+        guard case .array(let content) = result.content,
+            case .object(let first)? = content.first,
+            case .string(let text)? = first["text"]
+        else {
+            return nil
+        }
+        return text
+    }
+
     private func makeFakeMCPManager(mode: String = "echo", timeoutMs: Int = 30_000, markerURL: URL? = nil) throws -> MCPManager {
         let scriptURL = try fakeMCPServerScriptURL()
         var args = [scriptURL.path, mode]
@@ -298,10 +352,12 @@ final class MCPTests: XCTestCase {
         import json
         import os
         import sys
+        import threading
         import time
 
         mode = sys.argv[1] if len(sys.argv) > 1 else "echo"
         marker_path = sys.argv[2] if len(sys.argv) > 2 else None
+        write_lock = threading.Lock()
 
         def read_message():
             line = sys.stdin.buffer.readline()
@@ -311,8 +367,24 @@ final class MCPTests: XCTestCase {
 
         def write_message(message):
             body = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
-            sys.stdout.buffer.write(body)
-            sys.stdout.buffer.flush()
+            with write_lock:
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+
+        def write_tool_response(request_id, arguments):
+            if mode == "out-of-order":
+                time.sleep(0.2 if arguments.get("message") == "slow" else 0.02)
+            if mode == "hang-one-call" and arguments.get("message") == "hang":
+                while True:
+                    time.sleep(1)
+            write_message({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": arguments.get("message", "")}],
+                    "isError": False
+                }
+            })
 
         while True:
             message = read_message()
@@ -359,6 +431,10 @@ final class MCPTests: XCTestCase {
                         marker.write("hung")
                     while True:
                         time.sleep(1)
+                if mode in ("out-of-order", "hang-one-call"):
+                    thread = threading.Thread(target=write_tool_response, args=(request_id, arguments), daemon=True)
+                    thread.start()
+                    continue
                 write_message({
                     "jsonrpc": "2.0",
                     "id": request_id,
