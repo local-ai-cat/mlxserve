@@ -18,6 +18,15 @@ final class ThinkingParserTests: XCTestCase {
         XCTAssertEqual(result.content, "answer")
     }
 
+    func testExtractThinkingRoutesHarmonyCommentaryAndUnknownChannelsToReasoning() {
+        let result = extractThinking(
+            "<|channel|>commentary to=functions.lookup<|message|>{}<|call|><|start|>assistant<|channel|>invented<|message|>hidden<|end|><|start|>assistant<|channel|>final<|message|>answer<|return|>"
+        )
+
+        XCTAssertEqual(result.reasoning, "{}hidden")
+        XCTAssertEqual(result.content, "answer")
+    }
+
     func testExtractThinkingPassesThroughTextWithoutThinkTags() {
         let result = extractThinking("just answer")
 
@@ -93,13 +102,16 @@ final class ThinkingParserTests: XCTestCase {
         XCTAssertEqual(final.content, "")
     }
 
-    func testStreamingParserRoutesHarmonyCommentaryToContent() {
+    func testStreamingParserRoutesHarmonyCommentaryAndUnknownChannelsToReasoning() {
         var parser = ThinkingParser()
 
-        let delta = parser.feed("<|channel|>commentary to=functions.lookup<|message|>{}<|call|>")
+        let commentary = parser.feed("<|channel|>commentary to=functions.lookup<|message|>{}<|call|>")
+        let unknown = parser.feed("<|start|>assistant<|channel|>invented<|message|>hidden<|end|>")
 
-        XCTAssertEqual(delta.reasoning, "")
-        XCTAssertEqual(delta.content, "{}")
+        XCTAssertEqual(commentary.reasoning, "{}")
+        XCTAssertEqual(commentary.content, "")
+        XCTAssertEqual(unknown.reasoning, "hidden")
+        XCTAssertEqual(unknown.content, "")
     }
 
     func testStreamingParserRecoversMalformedOpenOnFinish() {

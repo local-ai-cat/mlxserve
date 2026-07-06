@@ -214,14 +214,12 @@ private func parseHarmonyChannels(_ text: String) -> (reasoning: String, content
         let body = String(text[bodyStart..<bodyEnd])
 
         switch channel {
-        case "analysis":
+        case "analysis", "commentary":
             reasoning += body
         case "final":
             content += body
         default:
-            // Harmony commentary carries tool-call payloads. Keep it on the content side so
-            // existing downstream tool-call buffering can see it instead of dropping it.
-            content += body
+            reasoning += body
         }
 
         if let boundary = firstHarmonyBoundary(in: text, from: bodyStart) {
