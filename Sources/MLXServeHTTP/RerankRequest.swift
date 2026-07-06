@@ -32,19 +32,22 @@ public struct OpenAIRerankRequest: Sendable, Equatable {
     public let documents: [OpenAIRerankText]
     public let topN: Int?
     public let returnDocuments: Bool
+    public let maxChunksPerDoc: Int?
 
     public init(
         model: String,
         query: OpenAIRerankText,
         documents: [OpenAIRerankText],
         topN: Int? = nil,
-        returnDocuments: Bool = true
+        returnDocuments: Bool = true,
+        maxChunksPerDoc: Int? = nil
     ) {
         self.model = model
         self.query = query
         self.documents = documents
         self.topN = topN
         self.returnDocuments = returnDocuments
+        self.maxChunksPerDoc = maxChunksPerDoc
     }
 
     public static func parse(_ body: Data) throws -> OpenAIRerankRequest {
@@ -66,17 +69,15 @@ public struct OpenAIRerankRequest: Sendable, Equatable {
         }
 
         let topN = openAIIntValue(object["top_n"])
-        if let topN, topN <= 0 {
-            throw OpenAIServerError.invalidJSON
-        }
-
         let returnDocuments = object["return_documents"] as? Bool ?? true
+        let maxChunksPerDoc = openAIIntValue(object["max_chunks_per_doc"])
         return OpenAIRerankRequest(
             model: model,
             query: query,
             documents: documents,
             topN: topN,
-            returnDocuments: returnDocuments
+            returnDocuments: returnDocuments,
+            maxChunksPerDoc: maxChunksPerDoc
         )
     }
 
@@ -123,4 +124,12 @@ public struct OpenAIRerankResult: Sendable, Equatable {
 public protocol OpenAIRerankBackend: Sendable {
     var rerankModels: [OpenAIModelInfo] { get }
     func rerank(_ request: OpenAIRerankRequest) async throws -> OpenAIRerankResult
+}
+
+public func applyRerankTopN(_ indices: [Int], topN: Int?) -> [Int] {
+    guard let topN, topN < indices.count else {
+        return indices
+    }
+    let count = topN >= 0 ? topN : max(indices.count + topN, 0)
+    return Array(indices.prefix(count))
 }

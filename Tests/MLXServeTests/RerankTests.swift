@@ -34,7 +34,8 @@ final class RerankTests: XCTestCase {
                   "query": {"text": "capital of France"},
                   "documents": [{"text": "Paris", "title": "France"}, {"text": "Berlin"}],
                   "top_n": 1,
-                  "return_documents": false
+                  "return_documents": false,
+                  "max_chunks_per_doc": 4
                 }
                 """.utf8
             )
@@ -44,6 +45,29 @@ final class RerankTests: XCTestCase {
         XCTAssertEqual(request.documents[0], .object(["text": .string("Paris"), "title": .string("France")]))
         XCTAssertEqual(request.topN, 1)
         XCTAssertFalse(request.returnDocuments)
+        XCTAssertEqual(request.maxChunksPerDoc, 4)
+    }
+
+    func testRerankTopNMatchesReferenceSlicingForZeroAndNegativeValues() async throws {
+        let backend = FakeRerankBackend(scores: [0.2, 0.9, 0.5])
+        let request = OpenAIRerankRequest(
+            model: "rerank-model",
+            query: .string("capital"),
+            documents: [.string("weak"), .string("best"), .string("middle")],
+            topN: 0
+        )
+        let empty = try await backend.rerank(request)
+        XCTAssertEqual(empty.indices, [])
+
+        let negative = try await backend.rerank(
+            OpenAIRerankRequest(
+                model: "rerank-model",
+                query: .string("capital"),
+                documents: request.documents,
+                topN: -1
+            )
+        )
+        XCTAssertEqual(negative.indices, [1, 2])
     }
 
     func testRerankObjectDocumentsPreserveJSONValues() throws {
@@ -153,6 +177,20 @@ final class RerankTests: XCTestCase {
         XCTAssertTrue(NativeRerankBackend.isRerankModelDirectory(directory))
     }
 
+    func testRerankModelDiscoveryAcceptsExplicitRerankerArchitecturesWithoutNameHint() throws {
+        let jina = try temporaryModelDirectory(
+            name: "jina-v3",
+            config: ["architectures": ["JinaForRanking"]]
+        )
+        let sequenceClassifier = try temporaryModelDirectory(
+            name: "modernbert-classifier",
+            config: ["architectures": ["ModernBertForSequenceClassification"]]
+        )
+
+        XCTAssertTrue(NativeRerankBackend.isRerankModelDirectory(jina))
+        XCTAssertTrue(NativeRerankBackend.isRerankModelDirectory(sequenceClassifier))
+    }
+
     func testNativeRerankCacheStateEvictsPreviousModelBeforeDifferentLoad() throws {
         var state = NativeRerankCacheState()
 
@@ -233,7 +271,7 @@ private struct FakeRerankBackend: OpenAIRerankBackend {
             }
             return scores[$0] > scores[$1]
         }
-        let indices = request.topN.map { Array(sortedIndices.prefix($0)) } ?? sortedIndices
+        let indices = applyRerankTopN(sortedIndices, topN: request.topN)
         return OpenAIRerankResult(scores: scores, indices: indices, totalTokens: 42)
     }
 }

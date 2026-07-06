@@ -32,20 +32,29 @@ final class NativeRerankBackend: OpenAIRerankBackend, @unchecked Sendable {
 
     static func isRerankModelDirectory(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
-        guard name.contains("rerank") || name.contains("reranker") else {
-            return false
-        }
+        let hasRerankNameHint = name.contains("rerank") || name.contains("reranker")
         guard
             let data = try? Data(contentsOf: url.appendingPathComponent("config.json")),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return true
+            return hasRerankNameHint
         }
 
         let modelType = (object["model_type"] as? String)?.lowercased() ?? ""
         let architectures = (object["architectures"] as? [String] ?? []).map { $0.lowercased() }
-        return modelType.contains("qwen")
-            || architectures.contains(where: { $0.contains("sequenceclassification") || $0.contains("causallm") })
+        if architectures.contains(where: { architecture in
+            architecture.contains("sequenceclassification")
+                || architecture == "jinaforranking"
+                || architecture == "bertforsequenceclassification"
+                || architecture == "qwen3forsequenceclassification"
+        }) {
+            return true
+        }
+        return hasRerankNameHint
+            && (modelType.contains("qwen")
+                || architectures.contains(where: {
+                    $0.contains("causallm") || $0 == "qwen3vlforconditionalgeneration"
+                }))
     }
 }
 
@@ -168,8 +177,7 @@ private enum NativeRerankScorer {
                 }
                 return scores[$0] > scores[$1]
             }
-            let topIndices = request.topN.map { Array(sortedIndices.prefix(min($0, sortedIndices.count))) }
-                ?? sortedIndices
+            let topIndices = applyRerankTopN(sortedIndices, topN: request.topN)
             return OpenAIRerankResult(scores: scores, indices: topIndices, totalTokens: totalTokens)
         }
     }
