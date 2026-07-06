@@ -280,8 +280,8 @@ private struct RegexParser {
         if consume(".") {
             return .predicate(.anyCharacter)
         }
-        if consume("^") || consume("$") {
-            return .empty
+        if current == "^" || current == "$" {
+            throw RegexGrammarError.unsupported(Self.anchorUnsupportedMessage)
         }
         if consume("\\") {
             return .predicate(try parseEscape(inClass: false))
@@ -293,7 +293,10 @@ private struct RegexParser {
     }
 
     private mutating func parseCharacterClass() throws -> RegexCharacterPredicate {
-        let inverted = consume("^")
+        if current == "^" {
+            throw RegexGrammarError.unsupported(Self.anchorUnsupportedMessage)
+        }
+        let inverted = false
         var ranges: [ClosedRange<Unicode.Scalar>] = []
         var previous: Unicode.Scalar?
 
@@ -320,6 +323,9 @@ private struct RegexParser {
     }
 
     private mutating func parseClassScalar() throws -> Unicode.Scalar {
+        if current == "^" || current == "$" {
+            throw RegexGrammarError.unsupported(Self.anchorUnsupportedMessage)
+        }
         if consume("\\") {
             let predicate = try parseEscape(inClass: true)
             guard predicate.ranges.count == 1,
@@ -366,10 +372,10 @@ private struct RegexParser {
         case "t":
             return try .literal("\t")
         default:
-            guard !inClass || character != "-" else {
-                return try .literal("-")
+            if Self.escapedLiteralMetacharacters.contains(character) {
+                return try .literal(character)
             }
-            return try .literal(character)
+            throw RegexGrammarError.unsupported("unsupported regex escape '\\\(character)'")
         }
     }
 
@@ -411,6 +417,13 @@ private struct RegexParser {
     private func scalar(_ character: Character) -> Unicode.Scalar {
         String(character).unicodeScalars.first!
     }
+
+    private static let anchorUnsupportedMessage =
+        "regex anchors (^ and $) are unsupported because constrained decode is implicitly anchored"
+
+    private static let escapedLiteralMetacharacters = Set<Character>(
+        [".", "\\", "(", ")", "[", "]", "{", "}", "*", "+", "?", "|", "^", "$", "-"]
+    )
 
     private var isAtEnd: Bool {
         index >= pattern.count

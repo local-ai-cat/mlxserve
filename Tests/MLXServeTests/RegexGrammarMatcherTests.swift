@@ -1,5 +1,6 @@
 import MLX
 @testable import MLXServe
+@testable import MLXServeHTTP
 import XCTest
 
 final class RegexGrammarMatcherTests: XCTestCase {
@@ -39,6 +40,37 @@ final class RegexGrammarMatcherTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? RegexGrammarError, .unsupported("regex character class range is reversed"))
         }
+    }
+
+    func testRegexRejectsAnchorsBecauseDecodeIsImplicitlyAnchored() {
+        assertUnsupportedRegex(
+            pattern: "a$b",
+            message: "regex anchors (^ and $) are unsupported because constrained decode is implicitly anchored"
+        )
+        assertUnsupportedRegex(
+            pattern: "^ab",
+            message: "regex anchors (^ and $) are unsupported because constrained decode is implicitly anchored"
+        )
+        assertUnsupportedRegex(
+            pattern: "[^A]",
+            message: "regex anchors (^ and $) are unsupported because constrained decode is implicitly anchored"
+        )
+    }
+
+    func testRegexRejectsUnknownEscapes() {
+        assertUnsupportedRegex(
+            pattern: "\\D",
+            message: "unsupported regex escape '\\D'"
+        )
+        assertUnsupportedRegex(
+            pattern: "\\q",
+            message: "unsupported regex escape '\\q'"
+        )
+    }
+
+    func testRegexSupportedEscapesStillParse() throws {
+        _ = try RegexGrammarConfiguration(tokens: Self.tokens, pattern: "\\d\\w\\s\\.\\\\\\n\\t\\r")
+        _ = try RegexGrammarConfiguration(tokens: Self.tokens, pattern: "\\$\\^\\[\\]\\{\\}\\(\\)\\*\\+\\?\\|\\-")
     }
 
     func testRegexMaskConstrainsGreedyArgmaxWhenCandidateIsInvalid() throws {
@@ -115,5 +147,23 @@ final class RegexGrammarMatcherTests: XCTestCase {
 
     private static func id(_ text: String) -> Int {
         tokenTable.first { $0.0 == text }!.1
+    }
+
+    private func assertUnsupportedRegex(
+        pattern: String,
+        message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try RegexGrammarConfiguration(tokens: Self.tokens, pattern: pattern),
+            file: file,
+            line: line
+        ) { error in
+            XCTAssertEqual(error as? RegexGrammarError, .unsupported(message), file: file, line: line)
+            let httpError = OpenAIServerError.invalidStructuredOutput(String(describing: error))
+            XCTAssertEqual(httpError.httpStatus, 400, file: file, line: line)
+            XCTAssertEqual(httpError.description, message, file: file, line: line)
+        }
     }
 }
