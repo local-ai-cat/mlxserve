@@ -64,6 +64,24 @@ rows so aggregate status memory does not double count the shared working set.
   truly parallel), fuse: confidence pick → ROVER voting → LLM fusion via the
   server's constrained-JSON decode. Post-hoc (raw-first recordings) before live.
 
+## Surface bindings (ruling 2026-07-06)
+
+Engine selection is **per app surface**, layered ABOVE the registry:
+
+- **Registry layer (headless — never changes for this):** always the full
+  multi-engine catalog. API callers and services name `engineID:model`
+  explicitly or pass capability preferences and get candidate resolution +
+  fallback. No pinning lives here — a surface config can never remove options
+  from the headless API.
+- **Surface-binding layer (app-side):** each surface (translate-live,
+  translate-conversation, transcribe-file, global transcription, studio tap, …)
+  gets a `SurfaceEngineConfig` — a pinned `engineID` or a preference set
+  ("stream-capable, prefer ANE"). Backend/settings storage first; UI exposure
+  later is a per-surface picker reading the same config. At call time the
+  binding resolves to registry preferences — sugar over `resolveCandidates`,
+  never a parallel path. Translate screens are the motivating case: they need
+  specific engines per screen without affecting any other consumer.
+
 ## Out of scope, permanently
 
 Capture. Mic ownership, AVAudioSession, permissions stay app-side. The registry's
