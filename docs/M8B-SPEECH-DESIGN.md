@@ -60,24 +60,31 @@ rows so aggregate status memory does not double count the shared working set.
   tests. `/v1/audio/transcriptions` stops 501ing when an adapter is registered.
 - **M8b-2:** pool citizenship (`audio_stt`), Parakeet adapter (wraps the app's
   FluidAudio engine at cat-integration), `models/status` integration.
-- **M8b-3 — scheduling & "batching" (ruling 2026-07-06):** audio batching is
-  SCHEDULING, not token batching — Whisper-class/ANE engines can't merge audios
-  into one forward pass (fixed-shape CoreML), so short-while-long comes from
-  the scheduler. Three mechanisms, layered:
-  1. **Window-quantum scheduler** — the pipeline turn gate becomes a priority
-     queue whose quantum is ONE decode window (~30s audio, ~1-2s ANE wall),
-     not one request. Long jobs yield between windows (the sliding-window
-     `trimmedSeconds` machinery already knows how to resume); interactive jobs
-     jump the queue. Interactive latency = current window, not whole file.
-  2. **Priority classes** — every request carries QoS (`interactive` |
-     `background`); surface bindings map to it naturally; HTTP gains a
-     `priority` param on `/v1/audio/transcriptions`.
-  3. **Busy-aware resolution** — adapters expose queue-depth/busy to
-     `resolveCandidates`; interactive jobs route to an idle engine on other
-     silicon (Parakeet/SpeechAnalyzer) instead of waiting. Same signal M8c
-     consensus needs.
-  Per-adapter contract additions: `maxConcurrentSessions` (multi-instance
-  within the pool memory budget), `preemptionQuantum`, `supportsTrueBatch`
+- **M8b-3 — parallelism & "batching" (ruling 2026-07-06, revised same day):**
+  audio batching is PLACEMENT first, scheduling last — Whisper-class/ANE
+  engines can't merge audios into one forward pass (fixed-shape CoreML), and
+  the user ruled AGAINST queue-jumping as the primary mechanism: run things
+  genuinely in parallel instead. Mechanism order:
+  1. **Multi-instance scale-out (primary)** — a busy engine spins up / reuses
+     a second instance of the same model, memory-budget permitting (instances
+     are pool citizens; LRU counts each). Instances get **compute-unit
+     placement**: CoreML lets an instance pin `.cpuAndNeuralEngine` vs
+     `.cpuAndGPU`, so whisper×2 runs ANE+GPU concurrently — parallel, not
+     contending. Short-while-long = both just run.
+  2. **Cross-engine busy-aware routing** — adapters expose queue-depth/busy to
+     `resolveCandidates`; a short job routes to an idle engine on other
+     silicon (whisper + Parakeet/CoreML) when the preferred one is grinding.
+     Same signal M8c consensus needs.
+  3. **Window-quantum yield (constrained fallback ONLY)** — when the memory
+     budget forbids another instance AND every capable engine is busy, long
+     jobs yield between decode windows (the sliding-window `trimmedSeconds`
+     machinery already resumes) so a short job isn't stuck behind a 2h file.
+     Not the design centerpiece; the escape hatch.
+  **Priority classes** (`interactive` | `background`, HTTP param, surface
+  bindings map to it) inform PLACEMENT — background jobs take non-preferred
+  silicon and never trigger scale-out beyond budget — rather than queue
+  position. Per-adapter contract additions: `maxConcurrentSessions`,
+  `computeUnitPlacement`, `preemptionQuantum` (fallback), `supportsTrueBatch`
   (MLX-ASR on GPU later — the only lane where real batch inference exists).
 - **M8c:** consensus dispatcher — fan one input to N adapters (ANE+GPU+CPU run
   truly parallel), fuse: confidence pick → ROVER voting → LLM fusion via the
