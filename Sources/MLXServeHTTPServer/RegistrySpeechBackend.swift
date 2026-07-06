@@ -8,7 +8,7 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
     private let registry: SpeechEngineRegistry
     private let modelsLock = NSLock()
     private var cachedModels: [OpenAIModelInfo]
-    private var loadedModelIDs: Set<String> = []
+    private var loadedModelKeys: Set<String> = []
 
     init(registry: SpeechEngineRegistry) async {
         self.registry = registry
@@ -86,7 +86,7 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
         for adapter in adapters {
             let footprint = await adapter.loadedFootprint()
             for model in await adapter.availableModels() {
-                let loaded = isLoaded(model.id)
+                let loaded = isLoaded(engineID: model.engineID, modelID: model.id)
                 statuses.append(
                     OpenAIModelRuntimeStatus(
                         id: model.id,
@@ -125,7 +125,7 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
         for adapter in candidates {
             do {
                 try await adapter.loadModel(modelID)
-                markLoaded(modelID)
+                markLoaded(engineID: adapter.engineID, modelID: modelID)
                 return OpenAIModelLifecycleResult(modelID: id, message: "Loaded: \(id)")
             } catch {
                 lastError = error
@@ -148,27 +148,31 @@ final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendabl
 
         for adapter in candidates {
             await adapter.unloadModel(modelID)
+            markUnloaded(engineID: adapter.engineID, modelID: modelID)
         }
-        markUnloaded(modelID)
         return OpenAIModelLifecycleResult(modelID: id)
     }
 
-    private func isLoaded(_ modelID: String) -> Bool {
+    private func isLoaded(engineID: String, modelID: String) -> Bool {
         modelsLock.lock()
         defer { modelsLock.unlock() }
-        return loadedModelIDs.contains(modelID)
+        return loadedModelKeys.contains(modelKey(engineID: engineID, modelID: modelID))
     }
 
-    private func markLoaded(_ modelID: String) {
+    private func markLoaded(engineID: String, modelID: String) {
         modelsLock.lock()
-        loadedModelIDs.insert(modelID)
+        loadedModelKeys.insert(modelKey(engineID: engineID, modelID: modelID))
         modelsLock.unlock()
     }
 
-    private func markUnloaded(_ modelID: String) {
+    private func markUnloaded(engineID: String, modelID: String) {
         modelsLock.lock()
-        loadedModelIDs.remove(modelID)
+        loadedModelKeys.remove(modelKey(engineID: engineID, modelID: modelID))
         modelsLock.unlock()
+    }
+
+    private func modelKey(engineID: String, modelID: String) -> String {
+        "\(engineID):\(modelID)"
     }
 
     private static func httpError(

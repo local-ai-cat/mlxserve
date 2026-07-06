@@ -410,6 +410,36 @@ final class RegistrySpeechBackendTests: XCTestCase {
         XCTAssertFalse(loadedAfterUnload)
     }
 
+    func testSpeechLifecycleTracksDuplicateModelIDsPerAdapter() async throws {
+        let registry = SpeechEngineRegistry()
+        let first = FakeSpeechAdapter(
+            engineID: "first",
+            silicon: .ane,
+            modelIDs: ["shared"],
+            footprintBytes: 10
+        )
+        let second = FakeSpeechAdapter(
+            engineID: "second",
+            silicon: .cpu,
+            modelIDs: ["shared"],
+            footprintBytes: 20
+        )
+        await registry.register(first)
+        await registry.register(second)
+        let backend = await RegistrySpeechBackend(registry: registry)
+
+        _ = try await backend.loadModel("second:shared")
+        let statuses = await backend.speechModelStatuses()
+        let loaded = statuses.filter { $0.loaded }
+        let firstLoadCalls = await first.loadCallsForTest("shared")
+        let secondLoadCalls = await second.loadCallsForTest("shared")
+
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded.first?.modelPath, "speech://second/shared")
+        XCTAssertEqual(firstLoadCalls, 0)
+        XCTAssertEqual(secondLoadCalls, 1)
+    }
+
     func testUnknownSpeechLifecycleModelMapsTo404() async throws {
         let adapter = FakeSpeechAdapter(engineID: "whisperkit", silicon: .ane, modelIDs: ["tiny"])
         let server = try await makeServer(speechAdapter: adapter)
