@@ -18,6 +18,8 @@ final class CompletionsTests: XCTestCase {
                   "repetition_penalty": 1.2,
                   "presence_penalty": 0.5,
                   "frequency_penalty": 0.6,
+                  "min_tokens": 6,
+                  "logit_bias": {"7": 4.25},
                   "stop": "END",
                   "seed": 1234,
                   "stream": true,
@@ -37,6 +39,8 @@ final class CompletionsTests: XCTestCase {
         XCTAssertEqual(request.repetitionPenalty, 1.2, accuracy: 0.0001)
         XCTAssertEqual(request.presencePenalty, 0.5, accuracy: 0.0001)
         XCTAssertEqual(request.frequencyPenalty, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(request.minTokens, 6)
+        XCTAssertEqual(try XCTUnwrap(request.logitBias[7]), 4.25, accuracy: 0.0001)
         XCTAssertEqual(request.stop, ["END"])
         XCTAssertEqual(request.seed, 1234)
         XCTAssertTrue(request.stream)
@@ -65,6 +69,8 @@ final class CompletionsTests: XCTestCase {
         XCTAssertEqual(request.repetitionPenalty, 1)
         XCTAssertEqual(request.presencePenalty, 0)
         XCTAssertEqual(request.frequencyPenalty, 0)
+        XCTAssertEqual(request.minTokens, 0)
+        XCTAssertTrue(request.logitBias.isEmpty)
         XCTAssertEqual(request.stop, ["END", "STOP"])
         XCTAssertNil(request.seed)
         XCTAssertFalse(request.stream)

@@ -178,6 +178,8 @@ final class OpenAIServerTests: XCTestCase {
                   "xtc_threshold": 0.4,
                   "presence_penalty": 0.5,
                   "frequency_penalty": 0.6,
+                  "min_tokens": 7,
+                  "logit_bias": {"42": 3.5, "99": -2},
                   "stop": ["END", "STOP"],
                   "seed": 1234,
                   "stream": true,
@@ -208,6 +210,9 @@ final class OpenAIServerTests: XCTestCase {
         XCTAssertEqual(request.xtcThreshold, 0.4, accuracy: 0.0001)
         XCTAssertEqual(request.presencePenalty, 0.5, accuracy: 0.0001)
         XCTAssertEqual(request.frequencyPenalty, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(request.minTokens, 7)
+        XCTAssertEqual(try XCTUnwrap(request.logitBias[42]), 3.5, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(request.logitBias[99]), -2, accuracy: 0.0001)
         XCTAssertEqual(request.stop, ["END", "STOP"])
         XCTAssertEqual(request.seed, 1234)
         XCTAssertTrue(request.stream)

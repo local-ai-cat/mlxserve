@@ -138,6 +138,9 @@ public struct SamplingParameters: Sendable, Equatable {
     public var repetitionPenalty: Float
     public var presencePenalty: Float
     public var frequencyPenalty: Float
+    public var minTokens: Int
+    public var logitBias: [Int: Float]
+    public var eosTokenIds: Set<Int>
     public var xtcProbability: Float
     public var xtcThreshold: Float
     public var xtcSpecialTokens: [Int]
@@ -157,6 +160,9 @@ public struct SamplingParameters: Sendable, Equatable {
         repetitionPenalty: Float = 1,
         presencePenalty: Float = 0,
         frequencyPenalty: Float = 0,
+        minTokens: Int = 0,
+        logitBias: [Int: Float] = [:],
+        eosTokenIds: Set<Int> = [],
         xtcProbability: Float = 0,
         xtcThreshold: Float = 0.1,
         xtcSpecialTokens: [Int] = [],
@@ -175,6 +181,9 @@ public struct SamplingParameters: Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
+        self.minTokens = max(0, minTokens)
+        self.logitBias = logitBias
+        self.eosTokenIds = eosTokenIds
         self.xtcProbability = xtcProbability
         self.xtcThreshold = xtcThreshold
         self.xtcSpecialTokens = xtcSpecialTokens
@@ -246,6 +255,7 @@ public enum TokenSampler {
             }
             thinkingBudgetState?.deferForcedToken()
         }
+        logits = applyLogitsProcessors(logits, parameters: parameters, generatedTokens: generatedTokens)
         if let allowedSequences = parameters.allowedSequences,
             let allowedTokenIDs = allowedNextTokenIDs(
                 allowedSequences: allowedSequences,
@@ -329,6 +339,9 @@ public enum TokenSampler {
             return false
         }
         if let gbnfGrammarMatcher, !gbnfGrammarMatcher.accepts(tokenID: tokenID) {
+            return false
+        }
+        if generatedTokens.count < parameters.minTokens && parameters.eosTokenIds.contains(tokenID) {
             return false
         }
         return true
@@ -467,6 +480,52 @@ public enum TokenSampler {
         }
 
         return result
+    }
+
+    private static func applyLogitsProcessors(
+        _ logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokens: [Int]
+    ) -> MLXArray {
+        var result = logits
+        if result.dtype == .bfloat16 && (!parameters.logitBias.isEmpty || shouldApplyMinTokens(parameters, generatedTokens)) {
+            result = result.asType(.float32)
+        }
+        result = applyLogitBias(result, logitBias: parameters.logitBias)
+        if shouldApplyMinTokens(parameters, generatedTokens) {
+            result = maskTokens(result, tokenIDs: Array(parameters.eosTokenIds), value: -Float.infinity)
+        }
+        return result
+    }
+
+    private static func shouldApplyMinTokens(
+        _ parameters: SamplingParameters,
+        _ generatedTokens: [Int]
+    ) -> Bool {
+        parameters.minTokens > 0
+            && generatedTokens.count < parameters.minTokens
+            && !parameters.eosTokenIds.isEmpty
+    }
+
+    private static func applyLogitBias(_ logits: MLXArray, logitBias: [Int: Float]) -> MLXArray {
+        guard !logitBias.isEmpty else { return logits }
+        let vocabularySize = logits.dim(-1)
+        let validTokenIDs = logitBias.keys.filter { $0 >= 0 && $0 < vocabularySize }.sorted()
+        guard !validTokenIDs.isEmpty else { return logits }
+
+        let indices = MLXArray(validTokenIDs.map(Int32.init)).asType(.uint32)
+        let biases = MLXArray(validTokenIDs.map { logitBias[$0] ?? 0 })
+        return putAlong(logits, indices, values: logits[indices] + biases, axis: -1)
+    }
+
+    private static func maskTokens(_ logits: MLXArray, tokenIDs: [Int], value: Float) -> MLXArray {
+        let vocabularySize = logits.dim(-1)
+        let validTokenIDs = tokenIDs.filter { $0 >= 0 && $0 < vocabularySize }.sorted()
+        guard !validTokenIDs.isEmpty else { return logits }
+
+        let indices = MLXArray(validTokenIDs.map(Int32.init)).asType(.uint32)
+        let values = MLXArray(Array(repeating: value, count: validTokenIDs.count))
+        return putAlong(logits, indices, values: values, axis: -1)
     }
 
     private static func tokenCounts(_ tokens: [Int]) -> [Int: Int] {

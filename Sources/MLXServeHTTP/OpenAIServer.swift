@@ -98,6 +98,8 @@ public struct OpenAIChatRequest: Sendable {
     public let xtcThreshold: Float
     public let presencePenalty: Float
     public let frequencyPenalty: Float
+    public let minTokens: Int
+    public let logitBias: [Int: Float]
     public let stop: [String]
     public let seed: Int?
     public let stream: Bool
@@ -123,6 +125,8 @@ public struct OpenAIChatRequest: Sendable {
         xtcThreshold: Float = 0.1,
         presencePenalty: Float = 0,
         frequencyPenalty: Float = 0,
+        minTokens: Int = 0,
+        logitBias: [Int: Float] = [:],
         stop: [String] = [],
         seed: Int? = nil,
         stream: Bool = false,
@@ -147,6 +151,8 @@ public struct OpenAIChatRequest: Sendable {
         self.xtcThreshold = xtcThreshold
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
+        self.minTokens = max(0, minTokens)
+        self.logitBias = logitBias
         self.stop = stop
         self.seed = seed
         self.stream = stream
@@ -198,6 +204,8 @@ public extension OpenAIChatRequest {
             xtcThreshold: xtcThreshold,
             presencePenalty: presencePenalty,
             frequencyPenalty: frequencyPenalty,
+            minTokens: minTokens,
+            logitBias: logitBias,
             stop: stop,
             seed: seed,
             stream: stream,
@@ -1526,6 +1534,8 @@ public extension OpenAIChatRequest {
             xtcThreshold: floatValue(object["xtc_threshold"]) ?? 0.1,
             presencePenalty: floatValue(object["presence_penalty"]) ?? 0,
             frequencyPenalty: floatValue(object["frequency_penalty"]) ?? 0,
+            minTokens: intValue(object["min_tokens"]) ?? 0,
+            logitBias: try openAILogitBias(object["logit_bias"]),
             stop: try stopValues(object["stop"]),
             seed: intValue(object["seed"]),
             stream: object["stream"] as? Bool ?? false,

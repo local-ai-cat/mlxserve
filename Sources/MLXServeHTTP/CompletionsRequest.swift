@@ -25,6 +25,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
     public let repetitionPenalty: Float
     public let presencePenalty: Float
     public let frequencyPenalty: Float
+    public let minTokens: Int
+    public let logitBias: [Int: Float]
     public let stop: [String]
     public let seed: Int?
     public let stream: Bool
@@ -42,6 +44,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         repetitionPenalty: Float = 1,
         presencePenalty: Float = 0,
         frequencyPenalty: Float = 0,
+        minTokens: Int = 0,
+        logitBias: [Int: Float] = [:],
         stop: [String] = [],
         seed: Int? = nil,
         stream: Bool = false,
@@ -58,6 +62,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
+        self.minTokens = max(0, minTokens)
+        self.logitBias = logitBias
         self.stop = stop
         self.seed = seed
         self.stream = stream
@@ -77,6 +83,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             repetitionPenalty: repetitionPenalty,
             presencePenalty: presencePenalty,
             frequencyPenalty: frequencyPenalty,
+            minTokens: minTokens,
+            logitBias: logitBias,
             stop: stop,
             seed: seed,
             stream: stream,
@@ -114,6 +122,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             repetitionPenalty: openAIFloatValue(object["repetition_penalty"]) ?? 1,
             presencePenalty: openAIFloatValue(object["presence_penalty"]) ?? 0,
             frequencyPenalty: openAIFloatValue(object["frequency_penalty"]) ?? 0,
+            minTokens: openAIIntValue(object["min_tokens"]) ?? 0,
+            logitBias: try openAILogitBias(object["logit_bias"]),
             stop: try openAIStringArray(object["stop"]),
             seed: openAIIntValue(object["seed"]),
             stream: object["stream"] as? Bool ?? false,
@@ -162,4 +172,20 @@ func openAIStringArray(_ value: Any?) throws -> [String] {
         return strings
     }
     throw OpenAIServerError.invalidJSON
+}
+
+func openAILogitBias(_ value: Any?) throws -> [Int: Float] {
+    guard let value else { return [:] }
+    guard let rawBias = value as? [String: Any] else {
+        throw OpenAIServerError.invalidJSON
+    }
+
+    var result: [Int: Float] = [:]
+    for (tokenID, rawValue) in rawBias {
+        guard let tokenID = Int(tokenID), let bias = openAIFloatValue(rawValue) else {
+            throw OpenAIServerError.invalidJSON
+        }
+        result[tokenID] = bias
+    }
+    return result
 }

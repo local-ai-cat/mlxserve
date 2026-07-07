@@ -171,6 +171,7 @@ public actor Scheduler {
             var prepared: PreparedBatchRow?
             do {
                 var sampling = request.sampling
+                sampling.eosTokenIds.formUnion(request.eosTokenIds)
                 if !request.eosTokenIds.isEmpty {
                     sampling.xtcSpecialTokens = Array(Set(sampling.xtcSpecialTokens).union(request.eosTokenIds))
                 }

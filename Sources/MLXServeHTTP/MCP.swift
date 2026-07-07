@@ -309,6 +309,8 @@ public func openAIChatRequestByReplacingTools(
         xtcThreshold: request.xtcThreshold,
         presencePenalty: request.presencePenalty,
         frequencyPenalty: request.frequencyPenalty,
+        minTokens: request.minTokens,
+        logitBias: request.logitBias,
         stop: request.stop,
         seed: request.seed,
         stream: request.stream,
