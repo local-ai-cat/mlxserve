@@ -405,6 +405,38 @@ public final class ContinuousBatchGenerator {
         state = output.state
 
         let logits = output.logits[0..., -1, 0...]
+        let nextTokens = batchedSample(from: logits) ?? sampleRows(from: logits)
+
+        asyncEval(nextTokens)
+        eval(currentTokens, logits)
+        currentTokens = nextTokens
+
+        let tokenIds = nextTokens.asArray(Int.self)
+        for row in generatedTokenHistory.indices {
+            recordGeneratedToken(tokenIds[row], row: row)
+        }
+        return rowUIDs.enumerated().map { row, uid in
+            Response(uid: uid, token: tokenIds[row])
+        }
+    }
+
+    private func batchedSample(from logits: MLXArray) -> MLXArray? {
+        guard jsonGrammarMatchers.allSatisfy({ $0 == nil }),
+            regexGrammarMatchers.allSatisfy({ $0 == nil }),
+            gbnfGrammarMatchers.allSatisfy({ $0 == nil }),
+            thinkingBudgetStates.allSatisfy({ $0 == nil })
+        else {
+            return nil
+        }
+        return TokenSampler.sampleBatch(
+            logits: logits,
+            parameters: samplers,
+            generatedTokenHistories: generatedTokenHistory,
+            randomStates: randomStates
+        )
+    }
+
+    private func sampleRows(from logits: MLXArray) -> MLXArray {
         var sampledRows: [MLXArray] = []
         sampledRows.reserveCapacity(rowUIDs.count)
         for row in 0 ..< rowUIDs.count {
@@ -425,19 +457,7 @@ public final class ContinuousBatchGenerator {
             )
             sampledRows.append(token)
         }
-        let nextTokens = concatenated(sampledRows, axis: 0)
-
-        asyncEval(nextTokens)
-        eval(currentTokens, logits)
-        currentTokens = nextTokens
-
-        let tokenIds = nextTokens.asArray(Int.self)
-        for row in generatedTokenHistory.indices {
-            recordGeneratedToken(tokenIds[row], row: row)
-        }
-        return rowUIDs.enumerated().map { row, uid in
-            Response(uid: uid, token: tokenIds[row])
-        }
+        return concatenated(sampledRows, axis: 0)
     }
 
     private func speculativeNext() -> [Response]? {

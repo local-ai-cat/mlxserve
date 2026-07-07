@@ -208,6 +208,61 @@ public struct SamplingParameters: Sendable, Equatable {
 }
 
 public enum TokenSampler {
+    static func sampleBatch(
+        logits: MLXArray,
+        parameters: [SamplingParameters],
+        generatedTokenHistories: [[Int]],
+        randomStates: [MLXRandom.RandomState?]
+    ) -> MLXArray? {
+        guard logits.shape.count == 2,
+            !parameters.isEmpty,
+            parameters.count == generatedTokenHistories.count,
+            parameters.count == randomStates.count,
+            let sharedParameters = sharedBatchParameters(
+                parameters,
+                randomStates: randomStates
+            )
+        else {
+            return nil
+        }
+
+        var logits = applyBatchedLogitsProcessors(
+            logits,
+            parameters: sharedParameters,
+            generatedTokenHistories: generatedTokenHistories
+        )
+        if sharedParameters.temperature == 0 && !sharedParameters.hasSamplingFiltersOrPenalties {
+            return argMax(logits, axis: -1).asType(.int32).reshaped([parameters.count])
+        }
+
+        if logits.dtype == .bfloat16 {
+            logits = logits.asType(.float32)
+        }
+        logits = applyBatchedPenalties(
+            logits,
+            parameters: sharedParameters,
+            generatedTokenHistories: generatedTokenHistories
+        )
+
+        if sharedParameters.temperature == 0 {
+            return argMax(logits, axis: -1).asType(.int32).reshaped([parameters.count])
+        }
+
+        var logprobs = logits - logSumExp(logits, axis: -1, keepDims: true)
+        if sharedParameters.topP > 0 && sharedParameters.topP < 1 {
+            logprobs = applyTopP(logprobs, topP: sharedParameters.topP)
+        }
+        if sharedParameters.minP > 0 {
+            logprobs = applyMinP(logprobs, minP: sharedParameters.minP)
+        }
+        if sharedParameters.topK > 0 {
+            logprobs = applyTopK(logprobs, topK: sharedParameters.topK)
+        }
+
+        let scaled = logprobs / MLXArray(sharedParameters.temperature)
+        return MLXRandom.categorical(scaled, axis: -1).asType(.int32).reshaped([parameters.count])
+    }
+
     /// Samples from raw pre-softmax logits; penalties must be applied in logit space.
     public static func sample(
         logits: MLXArray,
@@ -266,6 +321,9 @@ public enum TokenSampler {
         precomputedGrammarMasks: PrecomputedGrammarMasks?
     ) -> MLXArray {
         var logits = logits
+        if logits.shape.count > 1 {
+            logits = logits.reshaped([logits.dim(-1)])
+        }
         if let forcedTokenID = thinkingBudgetState?.nextForcedTokenID() {
             if acceptsForcedToken(
                 forcedTokenID,
@@ -525,6 +583,29 @@ public enum TokenSampler {
         return result
     }
 
+    private static func applyBatchedLogitsProcessors(
+        _ logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokenHistories: [[Int]]
+    ) -> MLXArray {
+        var result = logits
+        if result.dtype == .bfloat16 && (!parameters.logitBias.isEmpty || shouldApplyMinTokens(
+            parameters,
+            generatedTokenHistories
+        )) {
+            result = result.asType(.float32)
+        }
+        result = applyBatchedLogitBias(result, logitBias: parameters.logitBias)
+        if shouldApplyMinTokens(parameters, generatedTokenHistories) {
+            result = applyBatchedMinTokensMask(
+                result,
+                parameters: parameters,
+                generatedTokenHistories: generatedTokenHistories
+            )
+        }
+        return result
+    }
+
     private static func shouldApplyMinTokens(
         _ parameters: SamplingParameters,
         _ generatedTokens: [Int]
@@ -532,6 +613,15 @@ public enum TokenSampler {
         parameters.minTokens > 0
             && generatedTokens.count < parameters.minTokens
             && !parameters.eosTokenIds.isEmpty
+    }
+
+    private static func shouldApplyMinTokens(
+        _ parameters: SamplingParameters,
+        _ generatedTokenHistories: [[Int]]
+    ) -> Bool {
+        parameters.minTokens > 0
+            && !parameters.eosTokenIds.isEmpty
+            && generatedTokenHistories.contains { $0.count < parameters.minTokens }
     }
 
     private static func applyLogitBias(_ logits: MLXArray, logitBias: [Int: Float]) -> MLXArray {
@@ -545,6 +635,23 @@ public enum TokenSampler {
         return putAlong(logits, indices, values: logits[indices] + biases, axis: -1)
     }
 
+    private static func applyBatchedLogitBias(_ logits: MLXArray, logitBias: [Int: Float]) -> MLXArray {
+        guard !logitBias.isEmpty else { return logits }
+        let batchSize = logits.dim(0)
+        let vocabularySize = logits.dim(-1)
+        var biases = [Float](repeating: 0, count: batchSize * vocabularySize)
+        let validTokenIDs = logitBias.keys.filter { $0 >= 0 && $0 < vocabularySize }
+        guard !validTokenIDs.isEmpty else { return logits }
+
+        for row in 0 ..< batchSize {
+            let base = row * vocabularySize
+            for tokenID in validTokenIDs {
+                biases[base + tokenID] = logitBias[tokenID] ?? 0
+            }
+        }
+        return logits + MLXArray(biases).reshaped([batchSize, vocabularySize])
+    }
+
     private static func maskTokens(_ logits: MLXArray, tokenIDs: [Int], value: Float) -> MLXArray {
         let vocabularySize = logits.dim(-1)
         let validTokenIDs = tokenIDs.filter { $0 >= 0 && $0 < vocabularySize }.sorted()
@@ -555,12 +662,109 @@ public enum TokenSampler {
         return putAlong(logits, indices, values: values, axis: -1)
     }
 
+    private static func applyBatchedMinTokensMask(
+        _ logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokenHistories: [[Int]]
+    ) -> MLXArray {
+        let batchSize = generatedTokenHistories.count
+        let vocabularySize = logits.dim(-1)
+        var mask = [Float](repeating: 0, count: batchSize * vocabularySize)
+        for row in generatedTokenHistories.indices where generatedTokenHistories[row].count < parameters.minTokens {
+            for tokenID in parameters.eosTokenIds where tokenID >= 0 && tokenID < vocabularySize {
+                mask[row * vocabularySize + tokenID] = 1
+            }
+        }
+        let maskArray = MLXArray(mask).reshaped([batchSize, vocabularySize])
+        return MLX.where(maskArray .> MLXArray(Float(0)), MLXArray(-Float.infinity), logits)
+    }
+
     private static func tokenCounts(_ tokens: [Int]) -> [Int: Int] {
         var counts: [Int: Int] = [:]
         for token in tokens {
             counts[token, default: 0] += 1
         }
         return counts
+    }
+
+    private static func applyBatchedPenalties(
+        _ logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokenHistories: [[Int]]
+    ) -> MLXArray {
+        guard !generatedTokenHistories.allSatisfy(\.isEmpty) else {
+            return logits
+        }
+
+        let counts = batchedTokenCounts(
+            generatedTokenHistories,
+            vocabularySize: logits.dim(-1)
+        )
+        let seen = counts .> MLXArray(Float(0))
+        var result = logits
+
+        if parameters.repetitionPenalty != 1 {
+            result = MLX.where(
+                seen,
+                MLX.where(
+                    result .< 0,
+                    result * parameters.repetitionPenalty,
+                    result / parameters.repetitionPenalty
+                ),
+                result
+            )
+        }
+        if parameters.presencePenalty != 0 {
+            result = result - MLX.where(seen, MLXArray(parameters.presencePenalty), MLXArray(Float(0)))
+        }
+        if parameters.frequencyPenalty != 0 {
+            result = result - counts * parameters.frequencyPenalty
+        }
+        return result
+    }
+
+    private static func batchedTokenCounts(
+        _ generatedTokenHistories: [[Int]],
+        vocabularySize: Int
+    ) -> MLXArray {
+        var counts = [Float](repeating: 0, count: generatedTokenHistories.count * vocabularySize)
+        for row in generatedTokenHistories.indices {
+            let base = row * vocabularySize
+            for tokenID in generatedTokenHistories[row] where tokenID >= 0 && tokenID < vocabularySize {
+                counts[base + tokenID] += 1
+            }
+        }
+        return MLXArray(counts).reshaped([generatedTokenHistories.count, vocabularySize])
+    }
+
+    private static func sharedBatchParameters(
+        _ parameters: [SamplingParameters],
+        randomStates: [MLXRandom.RandomState?]
+    ) -> SamplingParameters? {
+        var reference = parameters[0]
+        reference.seed = nil
+        guard canBatch(reference) else { return nil }
+        if reference.temperature > 0 && randomStates.contains(where: { $0 != nil }) {
+            return nil
+        }
+
+        for parameter in parameters {
+            var candidate = parameter
+            candidate.seed = nil
+            guard candidate == reference, canBatch(candidate) else {
+                return nil
+            }
+        }
+        return reference
+    }
+
+    private static func canBatch(_ parameters: SamplingParameters) -> Bool {
+        parameters.allowedSequences == nil
+            && parameters.jsonGrammar == nil
+            && parameters.regexGrammar == nil
+            && parameters.gbnfGrammar == nil
+            && parameters.thinkingBudget == nil
+            && parameters.xtcProbability == 0
     }
 
     private static func applyTopP(_ logprobs: MLXArray, topP: Float) -> MLXArray {
@@ -612,7 +816,12 @@ public enum TokenSampler {
             return logprobs
         }
 
-        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[topK...]
+        let partitioned = argPartition(-logprobs, kth: topK - 1, axis: -1)
+        let maskIndices = if logprobs.shape.count == 1 {
+            partitioned[topK...]
+        } else {
+            partitioned[0..., topK...]
+        }
         return putAlong(logprobs, maskIndices, values: MLXArray(-Float.infinity), axis: -1)
     }
 }
