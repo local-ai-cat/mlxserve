@@ -42,6 +42,31 @@ final class ToolCallParserTests: XCTestCase {
         ])
     }
 
+    func testFunctionCallTagQwenCoder() {
+        // Qwen2.5-Coder wraps the Hermes payload in <function_call> instead.
+        let result = parseToolCalls(
+            from: "<function_call>\n  {\"name\": \"get_weather\", \"arguments\": {\"city\": \"London\", \"unit\": \"celsius\"}}\n</function_call>",
+            idGenerator: idGenerator()
+        )
+
+        XCTAssertEqual(result.content, "")
+        XCTAssertEqual(result.toolCalls, [
+            ParsedToolCall(id: "call_0", name: "get_weather", arguments: #"{"city":"London","unit":"celsius"}"#)
+        ])
+    }
+
+    func testFunctionCallTagWithLeadingProse() {
+        let result = parseToolCalls(
+            from: #"On it. <function_call>{"name":"lookup","arguments":{"q":"x"}}</function_call>"#,
+            idGenerator: idGenerator()
+        )
+
+        XCTAssertEqual(result.content, "On it.")
+        XCTAssertEqual(result.toolCalls, [
+            ParsedToolCall(id: "call_0", name: "lookup", arguments: #"{"q":"x"}"#)
+        ])
+    }
+
     func testBareJSONObject() {
         let result = parseToolCalls(
             from: #"{"name":"lookup","arguments":{"query":"swift"}}"#,

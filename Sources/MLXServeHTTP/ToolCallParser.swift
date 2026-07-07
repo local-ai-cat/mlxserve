@@ -2,6 +2,10 @@ import Foundation
 
 private let toolCallOpenTag = "<tool_call>"
 private let toolCallCloseTag = "</tool_call>"
+// Qwen2.5-Coder emits the same `{name, arguments}` payload as Hermes but wraps
+// it in `<function_call>…</function_call>` instead of `<tool_call>`.
+private let functionCallOpenTag = "<function_call>"
+private let functionCallCloseTag = "</function_call>"
 private let functionOpenTagPrefix = "<function="
 private let functionCloseTag = "</function>"
 private let parameterOpenTagPrefix = "<parameter="
@@ -38,7 +42,14 @@ public func parseToolCalls(
     idGenerator: () -> String = { "call_" + String(UUID().uuidString.prefix(8)).lowercased() }
 ) -> ToolCallParseResult {
     if text.contains(toolCallOpenTag) {
-        return parseTaggedToolCalls(from: text, idGenerator: idGenerator)
+        return parseTaggedToolCalls(
+            from: text, openTag: toolCallOpenTag, closeTag: toolCallCloseTag, idGenerator: idGenerator
+        )
+    }
+    if text.contains(functionCallOpenTag) {
+        return parseTaggedToolCalls(
+            from: text, openTag: functionCallOpenTag, closeTag: functionCallCloseTag, idGenerator: idGenerator
+        )
     }
 
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -74,14 +85,16 @@ public func parseToolCalls(
 
 private func parseTaggedToolCalls(
     from text: String,
+    openTag: String,
+    closeTag: String,
     idGenerator: () -> String
 ) -> ToolCallParseResult {
     var cursor = text.startIndex
     var contentParts: [String] = []
     var toolCalls: [ParsedToolCall] = []
 
-    while let openRange = text[cursor...].range(of: toolCallOpenTag) {
-        guard let closeRange = text[openRange.upperBound...].range(of: toolCallCloseTag) else {
+    while let openRange = text[cursor...].range(of: openTag) {
+        guard let closeRange = text[openRange.upperBound...].range(of: closeTag) else {
             contentParts.append(String(text[cursor...]))
             cursor = text.endIndex
             break
