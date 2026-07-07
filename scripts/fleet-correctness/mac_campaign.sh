@@ -1,11 +1,12 @@
 #!/bin/zsh
 set -u
-SC=/private/tmp/claude-501/-Users-timapple-Documents-Github-Local-AI-Chat/facce3fb-9875-4380-9d3c-dfcf1e7f799d/scratchpad
-BIN=~/Documents/Github/mlxserve-native/.build/release/mlxserve-http
-MODELS=/Users/timapple/Library/Caches/models
-PORT=11500
-RESULTS="$SC/mac-campaign-results.log"
-SRVLOG="$SC/mac-campaign-server.log"
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h:h}"
+BIN="${MLXSERVE_HTTP_BIN:-$REPO_ROOT/.build/release/mlxserve-http}"
+MODELS="${MLXSERVE_MODEL_DIR:-/Users/timapple/Library/Caches/models}"
+PORT="${MLXSERVE_FLEET_PORT:-11500}"
+RESULTS="${MLXSERVE_FLEET_RESULTS:-$SCRIPT_DIR/mac-campaign-results.log}"
+SRVLOG="${MLXSERVE_FLEET_SERVER_LOG:-$SCRIPT_DIR/mac-campaign-server.log}"
 : > "$RESULTS"
 
 # Models smallest -> largest (bare leaf ids as the server discovers them).
@@ -48,7 +49,7 @@ for m in $MODEL_LIST; do
     sleep 3
   done
   echo "--- $m (free ${FREE}%) ---" | tee -a "$RESULTS"
-  python3 "$SC/correctness_check.py" "http://127.0.0.1:$PORT" "$m" 600 2>&1 | tee -a "$RESULTS"
+  python3 "$SCRIPT_DIR/correctness_check.py" "http://127.0.0.1:$PORT" "$m" 600 2>&1 | tee -a "$RESULTS"
 done
 
 echo "=== CAMPAIGN DONE ===" | tee -a "$RESULTS"

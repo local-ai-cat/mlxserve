@@ -206,7 +206,8 @@ public enum TokenSampler {
         generatedTokens: [Int] = [],
         jsonGrammarMatcher: JSONGrammarMatcher? = nil,
         regexGrammarMatcher: RegexGrammarMatcher? = nil,
-        gbnfGrammarMatcher: GBNFGrammarMatcher? = nil
+        gbnfGrammarMatcher: GBNFGrammarMatcher? = nil,
+        randomState: MLXRandom.RandomState? = nil
     ) -> MLXArray {
         var noThinkingBudgetState: ThinkingBudgetState?
         return sample(
@@ -216,6 +217,7 @@ public enum TokenSampler {
             jsonGrammarMatcher: jsonGrammarMatcher,
             regexGrammarMatcher: regexGrammarMatcher,
             gbnfGrammarMatcher: gbnfGrammarMatcher,
+            randomState: randomState,
             thinkingBudgetState: &noThinkingBudgetState
         )
     }
@@ -227,6 +229,7 @@ public enum TokenSampler {
         jsonGrammarMatcher: JSONGrammarMatcher? = nil,
         regexGrammarMatcher: RegexGrammarMatcher? = nil,
         gbnfGrammarMatcher: GBNFGrammarMatcher? = nil,
+        randomState: MLXRandom.RandomState? = nil,
         thinkingBudgetState: inout ThinkingBudgetState?
     ) -> MLXArray {
         var logits = logits
@@ -297,7 +300,8 @@ public enum TokenSampler {
         return sampleUnconstrained(
             logits: logits,
             parameters: parameters,
-            generatedTokens: generatedTokens
+            generatedTokens: generatedTokens,
+            randomState: randomState
         )
     }
 
@@ -333,7 +337,8 @@ public enum TokenSampler {
     private static func sampleUnconstrained(
         logits: MLXArray,
         parameters: SamplingParameters,
-        generatedTokens: [Int]
+        generatedTokens: [Int],
+        randomState: MLXRandom.RandomState?
     ) -> MLXArray {
         var logits = logits
         if parameters.temperature == 0 && !parameters.hasSamplingFiltersOrPenalties {
@@ -361,7 +366,8 @@ public enum TokenSampler {
                 logprobs,
                 probability: parameters.xtcProbability,
                 threshold: parameters.xtcThreshold,
-                specialTokens: parameters.xtcSpecialTokens
+                specialTokens: parameters.xtcSpecialTokens,
+                randomState: randomState
             )
         }
         if parameters.topK > 0 {
@@ -369,6 +375,9 @@ public enum TokenSampler {
         }
 
         let scaled = logprobs / MLXArray(parameters.temperature)
+        if let randomState {
+            return MLXRandom.categorical(scaled, axis: -1, key: randomState).asType(.int32).reshaped([1])
+        }
         return MLXRandom.categorical(scaled, axis: -1).asType(.int32).reshaped([1])
     }
 
@@ -487,7 +496,8 @@ public enum TokenSampler {
         _ logprobs: MLXArray,
         probability: Float,
         threshold: Float,
-        specialTokens: [Int]
+        specialTokens: [Int],
+        randomState: MLXRandom.RandomState?
     ) -> MLXArray {
         let threshold = max(0, min(threshold, 0.5))
         let probability = max(0, min(probability, 1))
@@ -501,7 +511,12 @@ public enum TokenSampler {
             let values = MLXArray(Array(repeating: false, count: validSpecialTokens.count))
             mask = putAlong(mask, indices, values: values, axis: -1)
         }
-        let shouldApply = MLXRandom.uniform(0 ..< 1) .<= probability
+        let shouldApply =
+            if let randomState {
+                MLXRandom.uniform(0 ..< 1, key: randomState) .<= probability
+            } else {
+                MLXRandom.uniform(0 ..< 1) .<= probability
+            }
         return MLX.where(shouldApply, MLX.where(mask, MLXArray(-Float.infinity), logprobs), logprobs)
     }
 

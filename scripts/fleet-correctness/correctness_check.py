@@ -72,7 +72,7 @@ try:
     check("json-schema", jok, f"finish={j['finish']} content={j['content'][:40]!r}")
 
     # 4. stop fired
-    s = chat([{"role": "user", "content": "Write three lowercase color words, then STOP, then no more text."}], 256,
+    s = chat([{"role": "user", "content": "Repeat exactly this text and nothing else: red green blue STOP"}], 128,
              seed=13, stop=["STOP"])
     check("stop", s["finish"] == "stop", f"finish={s['finish']}")
 

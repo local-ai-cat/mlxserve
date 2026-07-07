@@ -111,6 +111,7 @@ public final class ContinuousBatchGenerator {
     private var currentTokens = MLXArray([Int32]())
     private var rowUIDs: [String] = []
     private var samplers: [SamplingParameters] = []
+    private var randomStates: [MLXRandom.RandomState?] = []
     private var jsonGrammarMatchers: [JSONGrammarMatcher?] = []
     private var regexGrammarMatchers: [RegexGrammarMatcher?] = []
     private var gbnfGrammarMatchers: [GBNFGrammarMatcher?] = []
@@ -147,7 +148,12 @@ public final class ContinuousBatchGenerator {
             if tokens.tokens.dim(0) == 1 {
                 let output = model(tokens[text: .newAxis], cache: rowCache, state: nil)
                 eval(rowCache)
-                let firstToken = sampledToken(from: output.logits, sampling: sampling)
+                let randomState = Self.randomState(for: sampling.seed)
+                let firstToken = sampledToken(
+                    from: output.logits,
+                    sampling: sampling,
+                    randomState: randomState
+                )
                 let tokenID = firstToken.token.item(Int.self)
                 try insert(
                     uid: uid,
@@ -155,7 +161,8 @@ public final class ContinuousBatchGenerator {
                     lastToken: firstToken.token,
                     sampling: sampling,
                     generatedTokens: [tokenID],
-                    thinkingBudgetState: firstToken.thinkingBudgetState
+                    thinkingBudgetState: firstToken.thinkingBudgetState,
+                    randomState: randomState
                 )
                 return Response(uid: uid, token: tokenID)
             }
@@ -163,7 +170,12 @@ public final class ContinuousBatchGenerator {
             try insert(uid: uid, cache: rowCache, lastToken: lastToken, sampling: sampling)
             return nil
         case .logits(let output):
-            let firstToken = sampledToken(from: output.logits, sampling: sampling)
+            let randomState = Self.randomState(for: sampling.seed)
+            let firstToken = sampledToken(
+                from: output.logits,
+                sampling: sampling,
+                randomState: randomState
+            )
             let tokenID = firstToken.token.item(Int.self)
             try insert(
                 uid: uid,
@@ -171,7 +183,8 @@ public final class ContinuousBatchGenerator {
                 lastToken: firstToken.token,
                 sampling: sampling,
                 generatedTokens: [tokenID],
-                thinkingBudgetState: firstToken.thinkingBudgetState
+                thinkingBudgetState: firstToken.thinkingBudgetState,
+                randomState: randomState
             )
             return Response(uid: uid, token: tokenID)
         }
@@ -183,16 +196,11 @@ public final class ContinuousBatchGenerator {
         lastToken: MLXArray,
         sampling: SamplingParameters,
         generatedTokens: [Int] = [],
-        thinkingBudgetState initialThinkingBudgetState: ThinkingBudgetState? = nil
+        thinkingBudgetState initialThinkingBudgetState: ThinkingBudgetState? = nil,
+        randomState initialRandomState: MLXRandom.RandomState? = nil
     ) throws {
         precondition(!rowUIDs.contains(uid), "duplicate batch uid '\(uid)'")
         precondition(!rowCache.isEmpty, "continuous batching requires a non-empty KV cache")
-
-        if let seed = sampling.seed {
-            // MLXRandom.seed mutates global RNG state. In mixed batches, the last inserted
-            // seeded request determines subsequent stochastic draws for all rows.
-            MLXRandom.seed(UInt64(bitPattern: Int64(seed)))
-        }
 
         if cache.isEmpty {
             cache = try rowCache.map { try BatchLayerCache.adoptSingle($0) }
@@ -215,6 +223,7 @@ public final class ContinuousBatchGenerator {
 
         rowUIDs.append(uid)
         samplers.append(sampling)
+        randomStates.append(initialRandomState ?? Self.randomState(for: sampling.seed))
         let matcher = sampling.jsonGrammar?.makeMatcher()
         let regexMatcher = sampling.regexGrammar?.makeMatcher()
         let gbnfMatcher = sampling.gbnfGrammar?.makeMatcher()
@@ -253,6 +262,7 @@ public final class ContinuousBatchGenerator {
             cache.removeAll()
             rowUIDs.removeAll()
             samplers.removeAll()
+            randomStates.removeAll()
             jsonGrammarMatchers.removeAll()
             regexGrammarMatchers.removeAll()
             gbnfGrammarMatchers.removeAll()
@@ -270,6 +280,7 @@ public final class ContinuousBatchGenerator {
         currentTokens = currentTokens.take(rowIndices, axis: 0)
         rowUIDs = rows.map { rowUIDs[$0] }
         samplers = rows.map { samplers[$0] }
+        randomStates = rows.map { randomStates[$0] }
         jsonGrammarMatchers = rows.map { jsonGrammarMatchers[$0] }
         regexGrammarMatchers = rows.map { regexGrammarMatchers[$0] }
         gbnfGrammarMatchers = rows.map { gbnfGrammarMatchers[$0] }
@@ -300,6 +311,7 @@ public final class ContinuousBatchGenerator {
                 jsonGrammarMatcher: jsonGrammarMatchers[row],
                 regexGrammarMatcher: regexGrammarMatchers[row],
                 gbnfGrammarMatcher: gbnfGrammarMatchers[row],
+                randomState: randomStates[row],
                 thinkingBudgetState: &thinkingBudgetStates[row]
             )
             sampledRows.append(token)
@@ -350,7 +362,8 @@ public final class ContinuousBatchGenerator {
 
     private func sampledToken(
         from logits: MLXArray,
-        sampling: SamplingParameters
+        sampling: SamplingParameters,
+        randomState: MLXRandom.RandomState?
     ) -> PreparedSampledToken {
         let nextTokenLogits = logits[0..., -1, 0...]
         let matcher = sampling.jsonGrammar?.makeMatcher()
@@ -364,6 +377,7 @@ public final class ContinuousBatchGenerator {
             jsonGrammarMatcher: matcher,
             regexGrammarMatcher: regexMatcher,
             gbnfGrammarMatcher: gbnfMatcher,
+            randomState: randomState,
             thinkingBudgetState: &thinkingBudgetState
         )
         let tokenID = token.item(Int.self)
@@ -378,6 +392,10 @@ public final class ContinuousBatchGenerator {
         }
         thinkingBudgetState?.advance(tokenID: tokenID)
         return PreparedSampledToken(token: token, thinkingBudgetState: thinkingBudgetState)
+    }
+
+    private static func randomState(for seed: Int?) -> MLXRandom.RandomState? {
+        seed.map { MLXRandom.RandomState(seed: UInt64(bitPattern: Int64($0))) }
     }
 }
 
