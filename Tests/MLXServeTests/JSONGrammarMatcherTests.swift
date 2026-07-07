@@ -21,6 +21,20 @@ final class JSONGrammarMatcherTests: XCTestCase {
         XCTAssertTrue(matcher.allowedTokenIDs().contains(Self.eosID))
     }
 
+    func testMaskSnapshotIsIsolatedFromMatcherAdvances() {
+        let configuration = JSONGrammarConfiguration(tokens: Self.tokens, schema: .jsonObject)
+        let matcher = configuration.makeMatcher()
+        let beforeAdvance = configuration.makeMatcher()
+        let afterAdvance = configuration.makeMatcher()
+        afterAdvance.advance(tokenID: Self.id("{"))
+        let snapshot = matcher.makeMaskSnapshot()
+
+        matcher.advance(tokenID: Self.id("{"))
+
+        XCTAssertEqual(Set(snapshot.allowedTokenIDs()), Set(beforeAdvance.allowedTokenIDs()))
+        XCTAssertEqual(Set(matcher.allowedTokenIDs()), Set(afterAdvance.allowedTokenIDs()))
+    }
+
     func testTruncatedUnicodeEscapeIsIncompleteNotInvalid() {
         let matcher = JSONGrammarConfiguration(tokens: Self.tokens, schema: .jsonObject)
             .makeMatcher()

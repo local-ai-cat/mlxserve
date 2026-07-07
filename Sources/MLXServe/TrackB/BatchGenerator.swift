@@ -146,6 +146,9 @@ public final class ContinuousBatchGenerator {
     private var jsonGrammarMatchers: [JSONGrammarMatcher?] = []
     private var regexGrammarMatchers: [RegexGrammarMatcher?] = []
     private var gbnfGrammarMatchers: [GBNFGrammarMatcher?] = []
+    private var jsonGrammarMasks: [AsyncGrammarMask<JSONGrammarMaskSnapshot>?] = []
+    private var regexGrammarMasks: [AsyncGrammarMask<RegexGrammarMaskSnapshot>?] = []
+    private var gbnfGrammarMasks: [AsyncGrammarMask<GBNFGrammarMaskSnapshot>?] = []
     private var thinkingBudgetStates: [ThinkingBudgetState?] = []
     private var generatedTokenHistory: [[Int]] = []
     private var speculativeTokenHistory: [[Int]] = []
@@ -298,6 +301,24 @@ public final class ContinuousBatchGenerator {
         jsonGrammarMatchers.append(matcher)
         regexGrammarMatchers.append(regexMatcher)
         gbnfGrammarMatchers.append(gbnfMatcher)
+        let jsonMask = matcher.map { matcher in
+            let mask = AsyncGrammarMask<JSONGrammarMaskSnapshot>()
+            mask.prepareCurrentState(from: matcher.makeMaskSnapshot())
+            return mask
+        }
+        let regexMask = regexMatcher.map { matcher in
+            let mask = AsyncGrammarMask<RegexGrammarMaskSnapshot>()
+            mask.prepareCurrentState(from: matcher.makeMaskSnapshot())
+            return mask
+        }
+        let gbnfMask = gbnfMatcher.map { matcher in
+            let mask = AsyncGrammarMask<GBNFGrammarMaskSnapshot>()
+            mask.prepareCurrentState(from: matcher.makeMaskSnapshot())
+            return mask
+        }
+        jsonGrammarMasks.append(jsonMask)
+        regexGrammarMasks.append(regexMask)
+        gbnfGrammarMasks.append(gbnfMask)
         thinkingBudgetStates.append(thinkingBudgetState)
         generatedTokenHistory.append(generatedTokens)
         speculativeTokenHistory.append(
@@ -330,6 +351,9 @@ public final class ContinuousBatchGenerator {
             jsonGrammarMatchers.removeAll()
             regexGrammarMatchers.removeAll()
             gbnfGrammarMatchers.removeAll()
+            jsonGrammarMasks.removeAll()
+            regexGrammarMasks.removeAll()
+            gbnfGrammarMasks.removeAll()
             thinkingBudgetStates.removeAll()
             generatedTokenHistory.removeAll()
             speculativeTokenHistory.removeAll()
@@ -350,6 +374,9 @@ public final class ContinuousBatchGenerator {
         jsonGrammarMatchers = rows.map { jsonGrammarMatchers[$0] }
         regexGrammarMatchers = rows.map { regexGrammarMatchers[$0] }
         gbnfGrammarMatchers = rows.map { gbnfGrammarMatchers[$0] }
+        jsonGrammarMasks = rows.map { jsonGrammarMasks[$0] }
+        regexGrammarMasks = rows.map { regexGrammarMasks[$0] }
+        gbnfGrammarMasks = rows.map { gbnfGrammarMasks[$0] }
         thinkingBudgetStates = rows.map { thinkingBudgetStates[$0] }
         generatedTokenHistory = rows.map { generatedTokenHistory[$0] }
         speculativeTokenHistory = rows.map { speculativeTokenHistory[$0] }
@@ -389,7 +416,12 @@ public final class ContinuousBatchGenerator {
                 regexGrammarMatcher: regexGrammarMatchers[row],
                 gbnfGrammarMatcher: gbnfGrammarMatchers[row],
                 randomState: randomStates[row],
-                thinkingBudgetState: &thinkingBudgetStates[row]
+                thinkingBudgetState: &thinkingBudgetStates[row],
+                precomputedGrammarMasks: PrecomputedGrammarMasks(
+                    jsonAllowedTokenIDs: jsonGrammarMasks[row]?.readyTokenIDs,
+                    regexAllowedTokenIDs: regexGrammarMasks[row]?.readyTokenIDs,
+                    gbnfAllowedTokenIDs: gbnfGrammarMasks[row]?.readyTokenIDs
+                )
             )
             sampledRows.append(token)
         }
@@ -540,12 +572,21 @@ public final class ContinuousBatchGenerator {
         speculativeTokenHistory[row].append(tokenID)
         if jsonGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
             jsonGrammarMatchers[row]?.advance(tokenID: tokenID)
+            if let matcher = jsonGrammarMatchers[row] {
+                jsonGrammarMasks[row]?.prepareAdvancedState(from: matcher.makeMaskSnapshot())
+            }
         }
         if regexGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
             regexGrammarMatchers[row]?.advance(tokenID: tokenID)
+            if let matcher = regexGrammarMatchers[row] {
+                regexGrammarMasks[row]?.prepareAdvancedState(from: matcher.makeMaskSnapshot())
+            }
         }
         if gbnfGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
             gbnfGrammarMatchers[row]?.advance(tokenID: tokenID)
+            if let matcher = gbnfGrammarMatchers[row] {
+                gbnfGrammarMasks[row]?.prepareAdvancedState(from: matcher.makeMaskSnapshot())
+            }
         }
         thinkingBudgetStates[row]?.advance(tokenID: tokenID)
     }

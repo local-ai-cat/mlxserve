@@ -92,6 +92,50 @@ public final class RegexGrammarMatcher {
         generatedText
     }
 
+    func makeMaskSnapshot() -> RegexGrammarMaskSnapshot {
+        RegexGrammarMaskSnapshot(
+            vocabulary: vocabulary,
+            nfa: nfa,
+            currentStates: currentStates
+        )
+    }
+
+    private func accepts(token: JSONGrammarToken) -> Bool {
+        if token.isEOS {
+            return isComplete
+        }
+        guard !token.text.isEmpty else {
+            return false
+        }
+        return nfa.isViable(nfa.advance(currentStates, over: token.text))
+    }
+}
+
+struct RegexGrammarMaskSnapshot: GrammarMaskSnapshot {
+    let vocabulary: JSONGrammarVocabulary
+    fileprivate let nfa: RegexNFA
+    let currentStates: Set<Int>
+
+    func allowedTokenIDs() -> [Int] {
+        var allowed: [Int] = []
+        for (firstCharacter, bucket) in vocabulary.tokensByFirstCharacter {
+            guard nfa.isViable(nfa.advance(currentStates, over: String(firstCharacter))) else {
+                continue
+            }
+            for token in bucket where accepts(token: token) {
+                allowed.append(token.id)
+            }
+        }
+        if isComplete {
+            allowed.append(contentsOf: vocabulary.eosTokenIDs)
+        }
+        return allowed
+    }
+
+    private var isComplete: Bool {
+        nfa.isAccepting(currentStates)
+    }
+
     private func accepts(token: JSONGrammarToken) -> Bool {
         if token.isEOS {
             return isComplete

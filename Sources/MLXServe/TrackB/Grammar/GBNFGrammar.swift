@@ -82,6 +82,14 @@ public final class GBNFGrammarMatcher {
         generatedText
     }
 
+    func makeMaskSnapshot() -> GBNFGrammarMaskSnapshot {
+        GBNFGrammarMaskSnapshot(
+            vocabulary: vocabulary,
+            machine: machine,
+            generatedText: generatedText
+        )
+    }
+
     private var completionState: GBNFValidationResult {
         if let memoizedCompletionState {
             return memoizedCompletionState
@@ -89,6 +97,41 @@ public final class GBNFGrammarMatcher {
         let state = machine.validate(generatedText)
         memoizedCompletionState = state
         return state
+    }
+
+    private func accepts(token: JSONGrammarToken) -> Bool {
+        if token.isEOS {
+            return isComplete
+        }
+        guard !token.text.isEmpty else {
+            return false
+        }
+        return machine.validate(generatedText + token.text).isAllowed
+    }
+}
+
+struct GBNFGrammarMaskSnapshot: GrammarMaskSnapshot {
+    let vocabulary: JSONGrammarVocabulary
+    fileprivate let machine: GBNFMachine
+    let generatedText: String
+
+    func allowedTokenIDs() -> [Int] {
+        var allowed: [Int] = []
+        for (firstCharacter, bucket) in vocabulary.tokensByFirstCharacter {
+            let probe = machine.validate(generatedText + String(firstCharacter))
+            guard probe.isAllowed else { continue }
+            for token in bucket where accepts(token: token) {
+                allowed.append(token.id)
+            }
+        }
+        if isComplete {
+            allowed.append(contentsOf: vocabulary.eosTokenIDs)
+        }
+        return allowed
+    }
+
+    private var isComplete: Bool {
+        machine.validate(generatedText) == .complete
     }
 
     private func accepts(token: JSONGrammarToken) -> Bool {

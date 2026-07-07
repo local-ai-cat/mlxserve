@@ -241,6 +241,30 @@ public enum TokenSampler {
         randomState: MLXRandom.RandomState? = nil,
         thinkingBudgetState: inout ThinkingBudgetState?
     ) -> MLXArray {
+        sample(
+            logits: logits,
+            parameters: parameters,
+            generatedTokens: generatedTokens,
+            jsonGrammarMatcher: jsonGrammarMatcher,
+            regexGrammarMatcher: regexGrammarMatcher,
+            gbnfGrammarMatcher: gbnfGrammarMatcher,
+            randomState: randomState,
+            thinkingBudgetState: &thinkingBudgetState,
+            precomputedGrammarMasks: nil
+        )
+    }
+
+    static func sample(
+        logits: MLXArray,
+        parameters: SamplingParameters,
+        generatedTokens: [Int] = [],
+        jsonGrammarMatcher: JSONGrammarMatcher? = nil,
+        regexGrammarMatcher: RegexGrammarMatcher? = nil,
+        gbnfGrammarMatcher: GBNFGrammarMatcher? = nil,
+        randomState: MLXRandom.RandomState? = nil,
+        thinkingBudgetState: inout ThinkingBudgetState?,
+        precomputedGrammarMasks: PrecomputedGrammarMasks?
+    ) -> MLXArray {
         var logits = logits
         if let forcedTokenID = thinkingBudgetState?.nextForcedTokenID() {
             if acceptsForcedToken(
@@ -280,7 +304,8 @@ public enum TokenSampler {
             }
             logits = applyAllowedTokenMask(
                 logits,
-                allowedTokenIDs: jsonGrammarMatcher.allowedTokenIDs()
+                allowedTokenIDs: precomputedGrammarMasks?.jsonAllowedTokenIDs
+                    ?? jsonGrammarMatcher.allowedTokenIDs()
             )
         }
         if let regexGrammarMatcher {
@@ -292,7 +317,8 @@ public enum TokenSampler {
             }
             logits = applyAllowedTokenMask(
                 logits,
-                allowedTokenIDs: regexGrammarMatcher.allowedTokenIDs()
+                allowedTokenIDs: precomputedGrammarMasks?.regexAllowedTokenIDs
+                    ?? regexGrammarMatcher.allowedTokenIDs()
             )
         }
         if let gbnfGrammarMatcher {
@@ -304,7 +330,8 @@ public enum TokenSampler {
             }
             logits = applyAllowedTokenMask(
                 logits,
-                allowedTokenIDs: gbnfGrammarMatcher.allowedTokenIDs()
+                allowedTokenIDs: precomputedGrammarMasks?.gbnfAllowedTokenIDs
+                    ?? gbnfGrammarMatcher.allowedTokenIDs()
             )
         }
         return sampleUnconstrained(

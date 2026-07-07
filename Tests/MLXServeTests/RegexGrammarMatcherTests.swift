@@ -20,6 +20,20 @@ final class RegexGrammarMatcherTests: XCTestCase {
         XCTAssertFalse(matcher.accepts(tokenID: Self.id("A")))
     }
 
+    func testMaskSnapshotIsIsolatedFromMatcherAdvances() throws {
+        let configuration = try RegexGrammarConfiguration(tokens: Self.tokens, pattern: "[A-Z]{2}\\d?")
+        let matcher = configuration.makeMatcher()
+        let beforeAdvance = configuration.makeMatcher()
+        let afterAdvance = configuration.makeMatcher()
+        afterAdvance.advance(tokenID: Self.id("AB"))
+        let snapshot = matcher.makeMaskSnapshot()
+
+        matcher.advance(tokenID: Self.id("AB"))
+
+        XCTAssertEqual(Set(snapshot.allowedTokenIDs()), Set(beforeAdvance.allowedTokenIDs()))
+        XCTAssertEqual(Set(matcher.allowedTokenIDs()), Set(afterAdvance.allowedTokenIDs()))
+    }
+
     func testRegexSupportsGroupsAlternationAndPlus() throws {
         let matcher = try RegexGrammarConfiguration(tokens: Self.tokens, pattern: "(cat|dog)+")
             .makeMatcher()

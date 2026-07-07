@@ -177,6 +177,14 @@ public final class JSONGrammarMatcher {
         generatedText
     }
 
+    func makeMaskSnapshot() -> JSONGrammarMaskSnapshot {
+        JSONGrammarMaskSnapshot(
+            vocabulary: vocabulary,
+            schema: schema,
+            generatedText: generatedText
+        )
+    }
+
     private var completionState: JSONPrefixValidationResult {
         if let memoizedCompletionState {
             return memoizedCompletionState
@@ -184,6 +192,44 @@ public final class JSONGrammarMatcher {
         let state = JSONPrefixValidator.validate(generatedText, schema: schema)
         memoizedCompletionState = state
         return state
+    }
+
+    private func accepts(token: JSONGrammarToken) -> Bool {
+        if token.isEOS {
+            return isComplete
+        }
+        guard !token.text.isEmpty else {
+            return false
+        }
+        return JSONPrefixValidator.validate(generatedText + token.text, schema: schema).isAllowed
+    }
+}
+
+struct JSONGrammarMaskSnapshot: GrammarMaskSnapshot {
+    let vocabulary: JSONGrammarVocabulary
+    let schema: JSONSchemaNode
+    let generatedText: String
+
+    func allowedTokenIDs() -> [Int] {
+        var allowed: [Int] = []
+        for (firstCharacter, bucket) in vocabulary.tokensByFirstCharacter {
+            let probe = JSONPrefixValidator.validate(
+                generatedText + String(firstCharacter),
+                schema: schema
+            )
+            guard probe.isAllowed else { continue }
+            for token in bucket where accepts(token: token) {
+                allowed.append(token.id)
+            }
+        }
+        if isComplete {
+            allowed.append(contentsOf: vocabulary.eosTokenIDs)
+        }
+        return allowed
+    }
+
+    private var isComplete: Bool {
+        JSONPrefixValidator.validate(generatedText, schema: schema) == .complete
     }
 
     private func accepts(token: JSONGrammarToken) -> Bool {

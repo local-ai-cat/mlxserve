@@ -19,6 +19,20 @@ final class GBNFGrammarMatcherTests: XCTestCase {
         XCTAssertTrue(matcher.allowedTokenIDs().contains(Self.eosID))
     }
 
+    func testMaskSnapshotIsIsolatedFromMatcherAdvances() throws {
+        let configuration = try Self.configuration()
+        let matcher = configuration.makeMatcher()
+        let beforeAdvance = configuration.makeMatcher()
+        let afterAdvance = configuration.makeMatcher()
+        afterAdvance.advance(tokenID: Self.id("12"))
+        let snapshot = matcher.makeMaskSnapshot()
+
+        matcher.advance(tokenID: Self.id("12"))
+
+        XCTAssertEqual(Set(snapshot.allowedTokenIDs()), Set(beforeAdvance.allowedTokenIDs()))
+        XCTAssertEqual(Set(matcher.allowedTokenIDs()), Set(afterAdvance.allowedTokenIDs()))
+    }
+
     func testArithmeticGrammarAllowsPrefixesAndGatesEOSUntilAcceptState() throws {
         let matcher = try Self.configuration().makeMatcher()
 
