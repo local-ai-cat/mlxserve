@@ -5,6 +5,38 @@ public protocol EnginePoolModelLoader: Sendable {
 
     func loadModel(id: String, modelURL: URL) async throws -> Engine
     func unloadModel(_ engine: Engine, id: String) async
+
+    /// Loads a model and, when the loader can measure it, reports the model's real
+    /// resident footprint. The pool then accounts for the model by measured bytes
+    /// instead of `estimatedSize`.
+    ///
+    /// The default forwards to ``loadModel(id:modelURL:)`` and reports no
+    /// measurement (`actualSizeBytes == nil`), so loaders that cannot measure —
+    /// and the pool's own unit-test fakes — keep the estimate-based accounting.
+    /// Loaders with access to a memory API (the MLX native loader) override this
+    /// to bracket the load with a memory snapshot. The pool serializes loads
+    /// behind its load gate, so a process-wide before/after delta is attributable
+    /// to this one load.
+    func loadModelMeasuringActualSize(id: String, modelURL: URL) async throws -> EnginePoolMeasuredLoad<Engine>
+}
+
+public extension EnginePoolModelLoader {
+    func loadModelMeasuringActualSize(id: String, modelURL: URL) async throws -> EnginePoolMeasuredLoad<Engine> {
+        EnginePoolMeasuredLoad(engine: try await loadModel(id: id, modelURL: modelURL))
+    }
+}
+
+/// A loaded engine paired with the real resident bytes it consumed, if the loader
+/// measured it. `actualSizeBytes == nil` means "unmeasured — fall back to the
+/// discovery-time estimate".
+public struct EnginePoolMeasuredLoad<Engine: Sendable>: Sendable {
+    public let engine: Engine
+    public let actualSizeBytes: Int64?
+
+    public init(engine: Engine, actualSizeBytes: Int64? = nil) {
+        self.engine = engine
+        self.actualSizeBytes = actualSizeBytes
+    }
 }
 
 public struct EnginePoolLease<Engine: Sendable>: Sendable {
@@ -222,6 +254,27 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
         return unloaded
     }
 
+    /// Unloads idle (loaded, unpinned, not-in-use, not-loading) models oldest-first
+    /// until at least `targetBytes` of accounted model memory is freed or no idle
+    /// victim remains. Returns the bytes freed, counted by measured `actualSize`
+    /// when known and `estimatedSize` otherwise — the same quantity
+    /// `currentModelMemory` tracks. This is the eviction step the live memory
+    /// watchdog drives; unlike `sweepIdleModels` it is age-agnostic and pressure-
+    /// driven rather than idle-timeout-driven.
+    @discardableResult
+    public func reclaimIdleModels(targetBytes: Int64) async -> Int64 {
+        guard targetBytes > 0 else { return 0 }
+
+        var freed: Int64 = 0
+        while freed < targetBytes {
+            guard let victim = findLRUVictim() else { break }
+            let victimMemory = entries[victim].map { $0.actualSize ?? $0.estimatedSize } ?? 0
+            guard await unloadLoadedModel(victim) else { break }
+            freed += victimMemory
+        }
+        return freed
+    }
+
     public func status() -> EnginePoolStatus {
         let modelStatuses = entries.values
             .sorted { $0.modelID < $1.modelID }
@@ -360,10 +413,15 @@ public actor EnginePool<Loader: EnginePoolModelLoader> {
             entries[modelID] = loadingEntry
 
             do {
-                let engine = try await loader.loadModel(id: modelID, modelURL: loadingEntry.modelURL)
+                let measured = try await loader.loadModelMeasuringActualSize(
+                    id: modelID,
+                    modelURL: loadingEntry.modelURL
+                )
+                let engine = measured.engine
                 var loaded = entries[modelID] ?? loadingEntry
                 let leaseID = UUID()
                 loaded.engine = engine
+                loaded.actualSize = measured.actualSizeBytes
                 loaded.isLoading = false
                 loaded.lastAccess = now
                 if takeLease {

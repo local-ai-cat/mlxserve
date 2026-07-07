@@ -179,7 +179,102 @@ private struct BlockingUnloadFakeLoader: EnginePoolModelLoader {
     }
 }
 
+private struct MeasuringFakeLoader: EnginePoolModelLoader {
+    let state: FakeLoaderState
+    let measuredSizes: [String: Int64]
+
+    func loadModel(id: String, modelURL: URL) async throws -> FakeEngine {
+        await state.recordLoad(id)
+        return FakeEngine(id: id)
+    }
+
+    func loadModelMeasuringActualSize(
+        id: String,
+        modelURL: URL
+    ) async throws -> EnginePoolMeasuredLoad<FakeEngine> {
+        let engine = try await loadModel(id: id, modelURL: modelURL)
+        return EnginePoolMeasuredLoad(engine: engine, actualSizeBytes: measuredSizes[id])
+    }
+
+    func unloadModel(_ engine: FakeEngine, id: String) async {
+        await state.recordUnload(id)
+    }
+}
+
 final class EnginePoolTests: XCTestCase {
+    func testMeasuredActualSizeReplacesEstimateInAccounting() async throws {
+        var models: [String: DiscoveredModel] = [:]
+        models["a"] = DiscoveredModel(
+            id: "a",
+            modelURL: URL(fileURLWithPath: "/tmp/a", isDirectory: true),
+            estimatedSize: 100
+        )
+        let pool = EnginePool(
+            models: models,
+            loader: MeasuringFakeLoader(state: FakeLoaderState(), measuredSizes: ["a": 42])
+        )
+
+        try await pool.load("a")
+
+        let status = await pool.status()
+        XCTAssertEqual(status.models.first?.actualSize, 42)
+        XCTAssertEqual(status.models.first?.estimatedSize, 100)
+        XCTAssertEqual(status.currentModelMemory, 42)
+    }
+
+    func testUnmeasuredLoadFallsBackToEstimateInAccounting() async throws {
+        var models: [String: DiscoveredModel] = [:]
+        models["a"] = DiscoveredModel(
+            id: "a",
+            modelURL: URL(fileURLWithPath: "/tmp/a", isDirectory: true),
+            estimatedSize: 100
+        )
+        // measuredSizes has no entry for "a" -> reports nil -> pool uses estimate.
+        let pool = EnginePool(
+            models: models,
+            loader: MeasuringFakeLoader(state: FakeLoaderState(), measuredSizes: [:])
+        )
+
+        try await pool.load("a")
+
+        let status = await pool.status()
+        XCTAssertNil(status.models.first?.actualSize)
+        XCTAssertEqual(status.currentModelMemory, 100)
+    }
+
+    func testReclaimIdleModelsFreesOldestUnpinnedIdleFirst() async throws {
+        let state = FakeLoaderState()
+        let pool = makePool(["a": 30, "b": 40, "c": 50], state: state)
+        let start = Date(timeIntervalSince1970: 1_000)
+        try await pool.load("a", now: start)
+        try await pool.load("b", now: start.addingTimeInterval(10))
+        try await pool.load("c", now: start.addingTimeInterval(20))
+
+        // Ask for 50 bytes: should evict a (30) then b (40) = 70 >= 50, leaving c.
+        let freed = await pool.reclaimIdleModels(targetBytes: 50)
+
+        XCTAssertEqual(freed, 70)
+        let status = await pool.status()
+        XCTAssertEqual(loadedModelIDs(status), ["c"])
+        let unloaded = await state.unloadedIDs()
+        XCTAssertEqual(unloaded, ["a", "b"])
+    }
+
+    func testReclaimIdleModelsSkipsPinnedAndLeased() async throws {
+        let state = FakeLoaderState()
+        let pool = makePool(["a": 30, "b": 40], state: state)
+        try await pool.load("a")
+        try await pool.setPinned(true, for: "a")
+        let lease = try await pool.acquire("b")
+
+        let freed = await pool.reclaimIdleModels(targetBytes: 1_000)
+
+        XCTAssertEqual(freed, 0)
+        let status = await pool.status()
+        XCTAssertEqual(loadedModelIDs(status), ["a", "b"])
+        await pool.release(lease)
+    }
+
     func testOnDemandLoadTakesAndReleasesLease() async throws {
         let pool = makePool(["a": 10])
 

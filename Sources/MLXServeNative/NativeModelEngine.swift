@@ -471,6 +471,25 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         self.maxConcurrentRequests = maxConcurrentRequests
     }
 
+    /// Brackets the load with an MLX active-memory snapshot so the pool can
+    /// account for the model by its real resident footprint rather than the
+    /// discovery-time estimate. `Memory.activeMemory` counts live `MLXArray`
+    /// allocations (the model weights), distinct from the reclaimable cache pool
+    /// (`Memory.cacheMemory`). The pool serializes loads behind its load gate, so
+    /// this process-wide delta is attributable to this one load. A non-positive
+    /// delta (weights still lazy / mmapped, or a concurrent free) reports `nil`,
+    /// falling the pool back to the estimate.
+    public func loadModelMeasuringActualSize(
+        id: String,
+        modelURL: URL
+    ) async throws -> EnginePoolMeasuredLoad<NativeModelEngine> {
+        let activeBefore = Memory.activeMemory
+        let engine = try await loadModel(id: id, modelURL: modelURL)
+        let delta = Memory.activeMemory - activeBefore
+        let measured: Int64? = delta > 0 ? Int64(delta) : nil
+        return EnginePoolMeasuredLoad(engine: engine, actualSizeBytes: measured)
+    }
+
     public func loadModel(id: String, modelURL: URL) async throws -> NativeModelEngine {
         let modelType = try modelType(in: modelURL)
         let isVLM = try isVLMModelDirectory(modelURL, modelType: modelType)

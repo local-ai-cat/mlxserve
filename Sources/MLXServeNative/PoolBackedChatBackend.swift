@@ -19,22 +19,47 @@ where Loader.Engine == NativeModelEngine {
     private let embeddingsBackend: (any OpenAIEmbeddingsBackend)?
     private let rerankBackend: (any OpenAIRerankBackend)?
     private let speechBackend: (any AudioTranscriptionBackend)?
+    private let memoryWatchdog: MemoryWatchdog?
 
     public init(
         pool: EnginePool<Loader>,
         modelIDs: [String],
         embeddingsBackend: (any OpenAIEmbeddingsBackend)? = nil,
         rerankBackend: (any OpenAIRerankBackend)? = nil,
-        speechBackend: (any AudioTranscriptionBackend)? = nil
+        speechBackend: (any AudioTranscriptionBackend)? = nil,
+        memoryWatchdog: MemoryWatchdog? = nil
     ) {
         self.pool = pool
         self.embeddingsBackend = embeddingsBackend
         self.rerankBackend = rerankBackend
         self.speechBackend = speechBackend
+        self.memoryWatchdog = memoryWatchdog
         self.models = modelIDs.sorted().map { OpenAIModelInfo(id: $0, maxModelLength: nil) }
     }
 
+    /// Consult the live memory watchdog before touching the pool. `additionalBytes`
+    /// is 0 for requests against an already-loadable model — the pool's own
+    /// estimate-based admission still guards fresh model loads; the watchdog adds
+    /// the measured-pressure trim/evict/deny ladder on top. Throws a mapped
+    /// `OpenAIHTTPError` (507) when the ladder cannot make room.
+    private func admitOrThrow(additionalBytes: Int64 = 0) async throws {
+        guard let memoryWatchdog else { return }
+        do {
+            try await memoryWatchdog.checkAdmission(additionalBytes: additionalBytes)
+        } catch let error as MemoryWatchdogError {
+            switch error {
+            case .admissionDenied(_, let current, let ceiling):
+                throw OpenAIHTTPError(
+                    status: 507,
+                    message: "Insufficient memory: usage \(current) exceeds ceiling \(ceiling) after reclaim.",
+                    retryAfterSeconds: 1
+                )
+            }
+        }
+    }
+
     public func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
+        try await admitOrThrow()
         let ticket: EnginePoolQueueTicket
         do {
             ticket = try await pool.admitWaitingRequest()
@@ -60,6 +85,7 @@ where Loader.Engine == NativeModelEngine {
     }
 
     public func startCompletion(_ request: OpenAICompletionRequest) async throws -> OpenAIChatStream {
+        try await admitOrThrow()
         let ticket: EnginePoolQueueTicket
         do {
             ticket = try await pool.admitWaitingRequest()
@@ -145,6 +171,7 @@ where Loader.Engine == NativeModelEngine {
         {
             return try await registrySpeechBackend.loadModel(id)
         }
+        try await admitOrThrow()
         do {
             let result = try await pool.load(id)
             let message = result.alreadyLoaded ? "Already loaded: \(id)" : "Loaded: \(id)"

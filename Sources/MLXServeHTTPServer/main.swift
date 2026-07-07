@@ -73,12 +73,14 @@ struct MLXServeHTTPServerMain {
             speechBackend = nil
         }
 
+        let memoryWatchdog = makeMemoryWatchdog(ceilingBytes: effectiveCeiling.bytes, pool: pool)
         let backend = PoolBackedChatBackend(
             pool: pool,
             modelIDs: Array(discovered.keys),
             embeddingsBackend: embeddingBackend,
             rerankBackend: rerankBackend,
-            speechBackend: speechBackend
+            speechBackend: speechBackend,
+            memoryWatchdog: memoryWatchdog
         )
         let mcpManager: MCPManager?
         if let mcpConfigPath = config.mcpConfigPath {
@@ -96,6 +98,9 @@ struct MLXServeHTTPServerMain {
         )
         if config.idleTimeout != nil {
             startIdleSweep(pool: pool, interval: config.idleTimeout ?? 0)
+        }
+        if let memoryWatchdog {
+            startMemoryWatchdogPoll(watchdog: memoryWatchdog, interval: memoryWatchdogPollInterval)
         }
 
         try await server.start()
@@ -326,6 +331,42 @@ private func nonNegativeInt64(_ value: String) -> Int64? {
         return nil
     }
     return parsed
+}
+
+private let memoryWatchdogPollInterval: TimeInterval = 2
+
+/// Builds the live memory watchdog when a ceiling is configured. The usage sampler
+/// reads MLX's own accounting (active weights + reclaimable cache); the reclaimer's
+/// trim step clears the MLX cache pool and its evict step unloads idle pool models.
+private func makeMemoryWatchdog<Loader: EnginePoolModelLoader>(
+    ceilingBytes: Int64,
+    pool: EnginePool<Loader>
+) -> MemoryWatchdog? {
+    guard ceilingBytes > 0 else { return nil }
+    return MemoryWatchdog(
+        configuration: MemoryWatchdogConfiguration(ceilingBytes: ceilingBytes),
+        sampler: { Int64(Memory.activeMemory + Memory.cacheMemory) },
+        reclaimer: ClosureMemoryWatchdogReclaimer(
+            trimReclaimableCaches: { _ in
+                let before = Memory.cacheMemory
+                Memory.clearCache()
+                return Int64(max(0, before - Memory.cacheMemory))
+            },
+            evictIdleModels: { target in
+                await pool.reclaimIdleModels(targetBytes: target)
+            }
+        )
+    )
+}
+
+private func startMemoryWatchdogPoll(watchdog: MemoryWatchdog, interval: TimeInterval) {
+    let sleepNanoseconds = UInt64(max(interval, 1) * 1_000_000_000)
+    Task.detached {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: sleepNanoseconds)
+            _ = await watchdog.poll()
+        }
+    }
 }
 
 private func startIdleSweep<Loader: EnginePoolModelLoader>(
