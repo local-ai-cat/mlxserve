@@ -1,5 +1,6 @@
 @testable import MLXServe
 @testable import MLXServeHTTP
+@testable import MLXServeNative
 @testable import MLXServeHTTPServer
 import XCTest
 

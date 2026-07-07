@@ -5,6 +5,7 @@ import MLXHuggingFace
 import MLXLMCommon
 import MLXServe
 import MLXServeHTTP
+import MLXServeNative
 import MLXServeSpeech
 import MLXServeSpeechWhisperKit
 import Tokenizers

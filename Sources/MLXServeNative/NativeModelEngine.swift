@@ -9,7 +9,7 @@ import MLXServeHTTP
 import MLXVLM
 import Tokenizers
 
-final class NativeModelEngine: @unchecked Sendable {
+public final class NativeModelEngine: @unchecked Sendable {
     let modelID: String
 
     private let context: ModelContext
@@ -464,10 +464,14 @@ final class NativeModelEngine: @unchecked Sendable {
 // NOTE: Cross-model concurrent MLX eval is not process-serialized here. Each
 // model has its own scheduler; a process-wide MLX eval gate is a known follow-up
 // if native serving needs to mirror omlx's single executor more tightly.
-struct NativeModelLoader: EnginePoolModelLoader {
+public struct NativeModelLoader: EnginePoolModelLoader {
     let maxConcurrentRequests: Int
 
-    func loadModel(id: String, modelURL: URL) async throws -> NativeModelEngine {
+    public init(maxConcurrentRequests: Int) {
+        self.maxConcurrentRequests = maxConcurrentRequests
+    }
+
+    public func loadModel(id: String, modelURL: URL) async throws -> NativeModelEngine {
         let modelType = try modelType(in: modelURL)
         let isVLM = try isVLMModelDirectory(modelURL, modelType: modelType)
         let container =
@@ -492,7 +496,7 @@ struct NativeModelLoader: EnginePoolModelLoader {
         }
     }
 
-    func unloadModel(_ engine: NativeModelEngine, id: String) async {
+    public func unloadModel(_ engine: NativeModelEngine, id: String) async {
         Memory.clearCache()
     }
 

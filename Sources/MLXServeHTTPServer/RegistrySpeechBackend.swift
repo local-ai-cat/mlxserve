@@ -4,7 +4,7 @@ import MLXServeSpeech
 
 /// Serves `/v1/audio/transcriptions` from the speech engine registry — the
 /// route stops 501ing the moment any adapter is registered.
-final class RegistrySpeechBackend: AudioTranscriptionBackend, @unchecked Sendable {
+final class RegistrySpeechBackend: AudioTranscriptionBackend, SpeechModelLifecycleRouting, @unchecked Sendable {
     private let registry: SpeechEngineRegistry
     private let modelsLock = NSLock()
     private var cachedModels: [OpenAIModelInfo]

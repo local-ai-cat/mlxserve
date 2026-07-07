@@ -17,6 +17,13 @@ let package = Package(
             name: "MLXServeHTTP",
             targets: ["MLXServeHTTP"]
         ),
+        // The native MLX chat engine wired as an OpenAI-compatible backend,
+        // linkable in-process (e.g. by the iOS app) without the server executable
+        // or WhisperKit. This is what makes "embed the real engine" possible.
+        .library(
+            name: "MLXServeNative",
+            targets: ["MLXServeNative"]
+        ),
         .library(
             name: "MLXServeSpeech",
             targets: ["MLXServeSpeech"]
@@ -76,6 +83,19 @@ let package = Package(
             dependencies: []
         ),
         .target(
+            name: "MLXServeNative",
+            dependencies: [
+                "MLXServe",
+                "MLXServeHTTP",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ]
+        ),
+        .target(
             name: "MLXServeSpeech",
             dependencies: []
         ),
@@ -91,6 +111,7 @@ let package = Package(
             dependencies: [
                 "MLXServe",
                 "MLXServeHTTP",
+                "MLXServeNative",
                 "MLXServeSpeech",
                 "MLXServeSpeechWhisperKit",
                 .product(name: "MLX", package: "mlx-swift"),
@@ -107,6 +128,7 @@ let package = Package(
             dependencies: [
                 "MLXServe",
                 "MLXServeHTTP",
+                "MLXServeNative",
                 "MLXServeHTTPServer",
                 "MLXServeSpeech",
                 "MLXServeSpeechWhisperKit",

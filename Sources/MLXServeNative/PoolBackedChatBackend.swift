@@ -2,13 +2,13 @@ import Foundation
 import MLXServe
 import MLXServeHTTP
 
-final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, AudioTranscriptionBackend, AnthropicTokenCountingBackend, OpenAIHealthProviding, @unchecked Sendable
+public final class PoolBackedChatBackend<Loader: EnginePoolModelLoader>: OpenAIModelLifecycleBackend, OpenAICompletionBackend, OpenAIEmbeddingsBackend, OpenAIRerankBackend, AudioTranscriptionBackend, AnthropicTokenCountingBackend, OpenAIHealthProviding, @unchecked Sendable
 where Loader.Engine == NativeModelEngine {
-    let models: [OpenAIModelInfo]
-    var embeddingModels: [OpenAIModelInfo] { embeddingsBackend?.embeddingModels ?? [] }
-    var rerankModels: [OpenAIModelInfo] { rerankBackend?.rerankModels ?? [] }
-    var transcriptionModels: [OpenAIModelInfo] { speechBackend?.transcriptionModels ?? [] }
-    var healthInfo: OpenAIHealthInfo {
+    public let models: [OpenAIModelInfo]
+    public var embeddingModels: [OpenAIModelInfo] { embeddingsBackend?.embeddingModels ?? [] }
+    public var rerankModels: [OpenAIModelInfo] { rerankBackend?.rerankModels ?? [] }
+    public var transcriptionModels: [OpenAIModelInfo] { speechBackend?.transcriptionModels ?? [] }
+    public var healthInfo: OpenAIHealthInfo {
         OpenAIHealthInfo(
             defaultModel: models.first?.id,
             enginePool: OpenAIHealthEnginePool(modelCount: models.count, loadedCount: models.count)
@@ -20,7 +20,7 @@ where Loader.Engine == NativeModelEngine {
     private let rerankBackend: (any OpenAIRerankBackend)?
     private let speechBackend: (any AudioTranscriptionBackend)?
 
-    init(
+    public init(
         pool: EnginePool<Loader>,
         modelIDs: [String],
         embeddingsBackend: (any OpenAIEmbeddingsBackend)? = nil,
@@ -34,7 +34,7 @@ where Loader.Engine == NativeModelEngine {
         self.models = modelIDs.sorted().map { OpenAIModelInfo(id: $0, maxModelLength: nil) }
     }
 
-    func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
+    public func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
         let ticket: EnginePoolQueueTicket
         do {
             ticket = try await pool.admitWaitingRequest()
@@ -59,7 +59,7 @@ where Loader.Engine == NativeModelEngine {
         }
     }
 
-    func startCompletion(_ request: OpenAICompletionRequest) async throws -> OpenAIChatStream {
+    public func startCompletion(_ request: OpenAICompletionRequest) async throws -> OpenAIChatStream {
         let ticket: EnginePoolQueueTicket
         do {
             ticket = try await pool.admitWaitingRequest()
@@ -83,28 +83,28 @@ where Loader.Engine == NativeModelEngine {
         }
     }
 
-    func embed(_ request: OpenAIEmbeddingsRequest) async throws -> OpenAIEmbeddingsResult {
+    public func embed(_ request: OpenAIEmbeddingsRequest) async throws -> OpenAIEmbeddingsResult {
         guard let embeddingsBackend else {
             throw OpenAIHTTPError(status: 404, message: "embeddings backend unavailable")
         }
         return try await embeddingsBackend.embed(request)
     }
 
-    func rerank(_ request: OpenAIRerankRequest) async throws -> OpenAIRerankResult {
+    public func rerank(_ request: OpenAIRerankRequest) async throws -> OpenAIRerankResult {
         guard let rerankBackend else {
             throw OpenAIHTTPError(status: 404, message: "rerank backend unavailable")
         }
         return try await rerankBackend.rerank(request)
     }
 
-    func transcribe(_ request: AudioTranscriptionRequest) async throws -> AudioTranscriptionResult {
+    public func transcribe(_ request: AudioTranscriptionRequest) async throws -> AudioTranscriptionResult {
         guard let speechBackend else {
             throw OpenAIHTTPError(status: 501, message: "transcription backend not configured")
         }
         return try await speechBackend.transcribe(request)
     }
 
-    func countTokens(_ request: AnthropicCountTokensRequest) async throws -> AnthropicCountTokensResult {
+    public func countTokens(_ request: AnthropicCountTokensRequest) async throws -> AnthropicCountTokensResult {
         do {
             let lease = try await pool.acquire(request.model)
             do {
@@ -126,12 +126,12 @@ where Loader.Engine == NativeModelEngine {
         }
     }
 
-    func modelPoolStatus() async throws -> OpenAIModelPoolStatus {
+    public func modelPoolStatus() async throws -> OpenAIModelPoolStatus {
         let prefixMemory = (await pool.loadedEngines()).reduce(Int64(0)) { total, loaded in
             total + loaded.engine.prefixCacheStats().currentBytes
         }
         var status = OpenAIModelPoolStatus(await pool.status()).addingPrefixCacheMemory(prefixMemory)
-        if let speechBackend = speechBackend as? RegistrySpeechBackend {
+        if let speechBackend = speechBackend as? SpeechModelLifecycleRouting {
             let speechModels = await speechBackend.speechModelStatuses()
             let speechMemory = speechModels.compactMap(\.actualSize).reduce(Int64(0), +)
             status = status.appendingSpeechModels(speechModels, speechMemory: speechMemory)
@@ -139,8 +139,8 @@ where Loader.Engine == NativeModelEngine {
         return status
     }
 
-    func loadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
-        if let registrySpeechBackend = speechBackend as? RegistrySpeechBackend,
+    public func loadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        if let registrySpeechBackend = speechBackend as? SpeechModelLifecycleRouting,
             await shouldRouteSpeechLifecycle(id, speechBackend: registrySpeechBackend)
         {
             return try await registrySpeechBackend.loadModel(id)
@@ -154,8 +154,8 @@ where Loader.Engine == NativeModelEngine {
         }
     }
 
-    func unloadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
-        if let registrySpeechBackend = speechBackend as? RegistrySpeechBackend,
+    public func unloadModel(_ id: String) async throws -> OpenAIModelLifecycleResult {
+        if let registrySpeechBackend = speechBackend as? SpeechModelLifecycleRouting,
             await shouldRouteSpeechLifecycle(id, speechBackend: registrySpeechBackend)
         {
             return try await registrySpeechBackend.unloadModel(id)
@@ -172,7 +172,7 @@ where Loader.Engine == NativeModelEngine {
         models.contains { $0.id == id }
     }
 
-    private func shouldRouteSpeechLifecycle(_ id: String, speechBackend: RegistrySpeechBackend) async -> Bool {
+    private func shouldRouteSpeechLifecycle(_ id: String, speechBackend: SpeechModelLifecycleRouting) async -> Bool {
         if !isLLMModel(id) {
             return true
         }

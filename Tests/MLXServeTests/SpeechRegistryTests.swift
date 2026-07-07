@@ -1,6 +1,7 @@
 import Foundation
 @testable import MLXServe
 @testable import MLXServeHTTP
+@testable import MLXServeNative
 @testable import MLXServeHTTPServer
 @testable import MLXServeSpeech
 import XCTest
