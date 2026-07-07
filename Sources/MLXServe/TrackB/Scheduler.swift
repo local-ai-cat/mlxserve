@@ -29,6 +29,7 @@ public actor Scheduler {
         parameters: GenerateParameters,
         maxConcurrentRequests: Int,
         prefixStore: (any PrefixKVStore)? = nil,
+        cacheCapabilities: ModelCacheCapabilities = .default,
         serializedDecode: Bool = false
     ) {
         self.model = modelBox.model
@@ -38,7 +39,7 @@ public actor Scheduler {
         self.queueLimit = max(maxConcurrentRequests * 4, 32)
         self.prefixStore = prefixStore
         self.prefixCacheEnabled = prefixStore != nil
-            && !Self.usesWindowedKVCache(model: modelBox.model, parameters: parameters)
+            && !Self.usesWindowedKVCache(parameters: parameters, cacheCapabilities: cacheCapabilities)
         self.serializedDecode = serializedDecode
     }
 
@@ -511,35 +512,10 @@ public actor Scheduler {
     }
 
     private static func usesWindowedKVCache(
-        model: any LanguageModel,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        cacheCapabilities: ModelCacheCapabilities
     ) -> Bool {
-        usesWindowedKVCache(model.newCache(parameters: parameters))
-    }
-
-    private static func usesWindowedKVCache(_ caches: [any KVCache]) -> Bool {
-        caches.contains { cache in
-            cache.maxSize != nil || isKnownWindowedCacheType(cache)
-                || usesWindowedKVCache(nestedCaches(in: cache))
-        }
-    }
-
-    private static func nestedCaches(in cache: any KVCache) -> [any KVCache] {
-        Mirror(reflecting: cache).children.flatMap { child -> [any KVCache] in
-            if let caches = child.value as? [any KVCache] {
-                return caches
-            }
-            if let cache = child.value as? any KVCache {
-                return [cache]
-            }
-            return []
-        }
-    }
-
-    private static func isKnownWindowedCacheType(_ cache: any KVCache) -> Bool {
-        let cacheType = String(describing: type(of: cache))
-        return cacheType.localizedCaseInsensitiveContains("rotating")
-            || cacheType.localizedCaseInsensitiveContains("circular")
+        parameters.maxKVSize != nil || cacheCapabilities.usesWindowedKVCache
     }
 }
 

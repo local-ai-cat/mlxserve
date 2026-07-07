@@ -24,6 +24,7 @@ public final class NativeModelEngine: @unchecked Sendable {
         context: ModelContext,
         modelID: String,
         maxConcurrentRequests: Int,
+        cacheCapabilities: ModelCacheCapabilities,
         serializedDecode: Bool
     ) {
         self.context = context
@@ -35,6 +36,7 @@ public final class NativeModelEngine: @unchecked Sendable {
             parameters: parameters,
             maxConcurrentRequests: maxConcurrentRequests,
             prefixStore: prefixStore,
+            cacheCapabilities: cacheCapabilities,
             serializedDecode: serializedDecode
         )
         var eosTokenIds = context.configuration.eosTokenIds
@@ -491,7 +493,8 @@ public struct NativeModelLoader: EnginePoolModelLoader {
     }
 
     public func loadModel(id: String, modelURL: URL) async throws -> NativeModelEngine {
-        let modelType = try modelType(in: modelURL)
+        let modelConfiguration = try modelConfiguration(in: modelURL)
+        let modelType = modelConfiguration.modelType.lowercased()
         let isVLM = try isVLMModelDirectory(modelURL, modelType: modelType)
         let container =
             if isVLM {
@@ -510,6 +513,7 @@ public struct NativeModelLoader: EnginePoolModelLoader {
                 context: context,
                 modelID: id,
                 maxConcurrentRequests: maxConcurrentRequests,
+                cacheCapabilities: Self.cacheCapabilities(for: modelConfiguration),
                 serializedDecode: isVLM && Self.requiresSerializedDecode(modelType: modelType)
             )
         }
@@ -519,11 +523,14 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         Memory.clearCache()
     }
 
-    private func modelType(in modelURL: URL) throws -> String {
+    private func modelConfiguration(in modelURL: URL) throws -> ModelKindConfiguration {
         let configURL = modelURL.appending(component: "config.json")
         let configData = try Data(contentsOf: configURL)
-        let config = try JSONDecoder.json5().decode(ModelKindConfiguration.self, from: configData)
-        return config.modelType.lowercased()
+        return try JSONDecoder.json5().decode(ModelKindConfiguration.self, from: configData)
+    }
+
+    func cacheCapabilities(in modelURL: URL) throws -> ModelCacheCapabilities {
+        try Self.cacheCapabilities(for: modelConfiguration(in: modelURL))
     }
 
     private func isVLMModelDirectory(_ modelURL: URL, modelType: String) throws -> Bool {
@@ -541,6 +548,32 @@ public struct NativeModelLoader: EnginePoolModelLoader {
 
     private static func requiresSerializedDecode(modelType: String) -> Bool {
         scalarOffsetVLMModelTypes.contains(modelType.lowercased())
+    }
+
+    private static func cacheCapabilities(for configuration: ModelKindConfiguration) -> ModelCacheCapabilities {
+        ModelCacheCapabilities(
+            usesWindowedKVCache: usesWindowedKVCache(configuration: configuration)
+        )
+    }
+
+    private static func usesWindowedKVCache(configuration: ModelKindConfiguration) -> Bool {
+        let modelType = configuration.modelType.lowercased()
+        if windowedKVModelTypes.contains(modelType) {
+            return true
+        }
+        if configuration.useSlidingWindow == false {
+            return false
+        }
+        if let slidingWindow = configuration.slidingWindow, slidingWindow > 0 {
+            return true
+        }
+        if let attentionChunkSize = configuration.attentionChunkSize, attentionChunkSize > 0 {
+            return true
+        }
+        if configuration.layerTypes.contains(where: { $0.localizedCaseInsensitiveContains("sliding") }) {
+            return true
+        }
+        return false
     }
 
     private func processorClass(in modelURL: URL) -> String? {
@@ -573,9 +606,26 @@ public struct NativeModelLoader: EnginePoolModelLoader {
 
     private struct ModelKindConfiguration: Decodable {
         let modelType: String
+        let slidingWindow: Int?
+        let useSlidingWindow: Bool?
+        let attentionChunkSize: Int?
+        let layerTypes: [String]
 
-        enum CodingKeys: String, CodingKey {
+        enum CodingKeys: String, Swift.CodingKey {
             case modelType = "model_type"
+            case slidingWindow = "sliding_window"
+            case useSlidingWindow = "use_sliding_window"
+            case attentionChunkSize = "attention_chunk_size"
+            case layerTypes = "layer_types"
+        }
+
+        init(from decoder: Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.modelType = try container.decode(String.self, forKey: .modelType)
+            self.slidingWindow = try container.decodeIfPresent(Int.self, forKey: .slidingWindow)
+            self.useSlidingWindow = try container.decodeIfPresent(Bool.self, forKey: .useSlidingWindow)
+            self.attentionChunkSize = try container.decodeIfPresent(Int.self, forKey: .attentionChunkSize)
+            self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes) ?? []
         }
     }
 
@@ -619,6 +669,12 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         // GlmOcr builds scalar MRoPE position ids from cache.offset in
         // GlmOcr.swift:308, :356, and :383.
         "glm_ocr",
+    ]
+
+    private static let windowedKVModelTypes: Set<String> = [
+        "gemma3",
+        "gemma4",
+        "gpt_oss",
     ]
 
     private static let vlmProcessorClasses: Set<String> = [

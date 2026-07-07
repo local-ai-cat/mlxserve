@@ -9,6 +9,7 @@ public final class MLXServeEngine: @unchecked Sendable {
         parameters: GenerateParameters = GenerateParameters(),
         maxConcurrentRequests: Int,
         prefixStore: (any PrefixKVStore)? = nil,
+        cacheCapabilities: ModelCacheCapabilities = .default,
         serializedDecode: Bool = false
     ) {
         let scheduler = Scheduler(
@@ -16,6 +17,7 @@ public final class MLXServeEngine: @unchecked Sendable {
             parameters: parameters,
             maxConcurrentRequests: maxConcurrentRequests,
             prefixStore: prefixStore,
+            cacheCapabilities: cacheCapabilities,
             serializedDecode: serializedDecode
         )
         self.scheduler = scheduler
