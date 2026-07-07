@@ -72,8 +72,7 @@ public actor Scheduler {
         self.maxConcurrentRequests = maxConcurrentRequests
         self.queueLimit = max(maxConcurrentRequests * 4, 32)
         self.prefixStore = prefixStore
-        self.prefixCacheEnabled = prefixStore != nil
-            && !Self.usesWindowedKVCache(parameters: parameters, cacheCapabilities: cacheCapabilities)
+        self.prefixCacheEnabled = prefixStore != nil && !cacheCapabilities.usesWindowedKVCache
         self.serializedDecode = serializedDecode
         self.schedulerManagedTextPrefill = schedulerManagedTextPrefill
         self.pressurePolicy = pressurePolicy
@@ -724,12 +723,6 @@ public actor Scheduler {
         input.image == nil && input.video == nil && input.audio == nil
     }
 
-    private static func usesWindowedKVCache(
-        parameters: GenerateParameters,
-        cacheCapabilities: ModelCacheCapabilities
-    ) -> Bool {
-        parameters.maxKVSize != nil || cacheCapabilities.usesWindowedKVCache
-    }
 }
 
 private enum PreparedAdmission {

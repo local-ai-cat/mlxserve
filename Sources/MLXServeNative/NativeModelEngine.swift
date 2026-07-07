@@ -16,6 +16,7 @@ public final class NativeModelEngine: @unchecked Sendable {
     private let engine: MLXServeEngine
     private let parameters: GenerateParameters
     private let prefixStore: SessionPrefixKVStore
+    private let cacheCapabilities: ModelCacheCapabilities
     private let eosTokenIds: Set<Int>
     private let grammarVocabularyLock = NSLock()
     private var cachedGrammarVocabulary: JSONGrammarVocabulary?
@@ -31,6 +32,7 @@ public final class NativeModelEngine: @unchecked Sendable {
         self.context = context
         self.modelID = modelID
         self.parameters = GenerateParameters(maxTokens: 16, temperature: 0)
+        self.cacheCapabilities = cacheCapabilities
         self.prefixStore = SessionPrefixKVStore(maxBytes: Self.prefixCacheMaxBytes())
         self.engine = MLXServeEngine(
             model: context.model,
@@ -88,6 +90,20 @@ public final class NativeModelEngine: @unchecked Sendable {
     func countPromptTokens(for request: OpenAIChatRequest) async throws -> Int {
         let input = try await context.processor.prepare(input: try userInput(from: request))
         return try countPromptTokens(input)
+    }
+
+    func countPromptTokens(for request: OpenAICompletionRequest) async throws -> Int {
+        guard case .string(let prompt) = request.prompt else {
+            throw NativeModelEngineError.invalidPrompt
+        }
+        return context.tokenizer.encode(text: prompt, addSpecialTokens: true).count
+    }
+
+    func estimatedKVCacheBytes(promptTokens: Int, maxGeneratedTokens: Int) -> Int64 {
+        cacheCapabilities.kvCacheProfile?.estimatedBytes(
+            promptTokens: promptTokens,
+            maxGeneratedTokens: maxGeneratedTokens
+        ) ?? 0
     }
 
     private func makeStream(from mlxRequest: Request, promptTokens: Int) -> OpenAIChatStream {
@@ -561,7 +577,8 @@ public struct NativeModelLoader: EnginePoolModelLoader {
 
     private static func cacheCapabilities(for configuration: ModelKindConfiguration) -> ModelCacheCapabilities {
         ModelCacheCapabilities(
-            usesWindowedKVCache: usesWindowedKVCache(configuration: configuration)
+            usesWindowedKVCache: usesWindowedKVCache(configuration: configuration),
+            kvCacheProfile: configuration.kvCacheProfile
         )
     }
 
@@ -619,6 +636,7 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         let useSlidingWindow: Bool?
         let attentionChunkSize: Int?
         let layerTypes: [String]
+        let kvCacheProfile: ModelKVCacheProfile?
 
         enum CodingKeys: String, Swift.CodingKey {
             case modelType = "model_type"
@@ -626,6 +644,14 @@ public struct NativeModelLoader: EnginePoolModelLoader {
             case useSlidingWindow = "use_sliding_window"
             case attentionChunkSize = "attention_chunk_size"
             case layerTypes = "layer_types"
+            case hiddenLayerCount = "num_hidden_layers"
+            case attentionHeadCount = "num_attention_heads"
+            case keyValueHeadCount = "num_key_value_heads"
+            case headDimension = "head_dim"
+            case hiddenSize = "hidden_size"
+            case torchDType = "torch_dtype"
+            case dtype
+            case textConfig = "text_config"
         }
 
         init(from decoder: Swift.Decoder) throws {
@@ -635,6 +661,58 @@ public struct NativeModelLoader: EnginePoolModelLoader {
             self.useSlidingWindow = try container.decodeIfPresent(Bool.self, forKey: .useSlidingWindow)
             self.attentionChunkSize = try container.decodeIfPresent(Int.self, forKey: .attentionChunkSize)
             self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes) ?? []
+            let textConfig = try container.decodeIfPresent(TextConfiguration.self, forKey: .textConfig)
+            let hiddenLayerCount = try container.decodeIfPresent(Int.self, forKey: .hiddenLayerCount)
+                ?? textConfig?.hiddenLayerCount
+            let attentionHeadCount = try container.decodeIfPresent(Int.self, forKey: .attentionHeadCount)
+                ?? textConfig?.attentionHeadCount
+            let keyValueHeadCount = try container.decodeIfPresent(Int.self, forKey: .keyValueHeadCount)
+                ?? textConfig?.keyValueHeadCount
+            let headDimension = try container.decodeIfPresent(Int.self, forKey: .headDimension)
+                ?? textConfig?.headDimension
+            let hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize)
+                ?? textConfig?.hiddenSize
+            let dtype = try container.decodeIfPresent(String.self, forKey: .torchDType)
+                ?? container.decodeIfPresent(String.self, forKey: .dtype)
+                ?? textConfig?.dtype
+            self.kvCacheProfile = ModelKVCacheProfile(
+                hiddenLayerCount: hiddenLayerCount,
+                attentionHeadCount: attentionHeadCount,
+                keyValueHeadCount: keyValueHeadCount,
+                headDimension: headDimension,
+                hiddenSize: hiddenSize,
+                scalarByteCount: ModelKVCacheProfile.scalarByteCount(forDType: dtype)
+            )
+        }
+    }
+
+    private struct TextConfiguration: Decodable {
+        let hiddenLayerCount: Int?
+        let attentionHeadCount: Int?
+        let keyValueHeadCount: Int?
+        let headDimension: Int?
+        let hiddenSize: Int?
+        let dtype: String?
+
+        enum CodingKeys: String, Swift.CodingKey {
+            case hiddenLayerCount = "num_hidden_layers"
+            case attentionHeadCount = "num_attention_heads"
+            case keyValueHeadCount = "num_key_value_heads"
+            case headDimension = "head_dim"
+            case hiddenSize = "hidden_size"
+            case torchDType = "torch_dtype"
+            case dtype
+        }
+
+        init(from decoder: Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.hiddenLayerCount = try container.decodeIfPresent(Int.self, forKey: .hiddenLayerCount)
+            self.attentionHeadCount = try container.decodeIfPresent(Int.self, forKey: .attentionHeadCount)
+            self.keyValueHeadCount = try container.decodeIfPresent(Int.self, forKey: .keyValueHeadCount)
+            self.headDimension = try container.decodeIfPresent(Int.self, forKey: .headDimension)
+            self.hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize)
+            self.dtype = try container.decodeIfPresent(String.self, forKey: .torchDType)
+                ?? container.decodeIfPresent(String.self, forKey: .dtype)
         }
     }
 

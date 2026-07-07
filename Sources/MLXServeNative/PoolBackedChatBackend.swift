@@ -37,11 +37,9 @@ where Loader.Engine == NativeModelEngine {
         self.models = modelIDs.sorted().map { OpenAIModelInfo(id: $0, maxModelLength: nil) }
     }
 
-    /// Consult the live memory watchdog before touching the pool. `additionalBytes`
-    /// is 0 for requests against an already-loadable model — the pool's own
-    /// estimate-based admission still guards fresh model loads; the watchdog adds
-    /// the measured-pressure trim/evict/deny ladder on top. Throws a mapped
-    /// `OpenAIHTTPError` (507) when the ladder cannot make room.
+    /// Consult the live memory watchdog before starting generation. For text
+    /// requests, callers pass the projected KV cache footprint so the watchdog
+    /// reserves both prompt and generated-token growth before decode begins.
     private func admitOrThrow(additionalBytes: Int64 = 0) async throws {
         guard let memoryWatchdog else { return }
         do {
@@ -59,7 +57,6 @@ where Loader.Engine == NativeModelEngine {
     }
 
     public func startChatCompletion(_ request: OpenAIChatRequest) async throws -> OpenAIChatStream {
-        try await admitOrThrow()
         let ticket: EnginePoolQueueTicket
         do {
             ticket = try await pool.admitWaitingRequest()
@@ -71,6 +68,13 @@ where Loader.Engine == NativeModelEngine {
             let lease = try await pool.acquire(request.model)
             let stream: OpenAIChatStream
             do {
+                let promptTokens = try await lease.engine.countPromptTokens(for: request)
+                try await admitOrThrow(
+                    additionalBytes: lease.engine.estimatedKVCacheBytes(
+                        promptTokens: promptTokens,
+                        maxGeneratedTokens: request.maxTokens
+                    )
+                )
                 stream = try await lease.engine.startChatCompletion(request)
             } catch {
                 await pool.release(lease)
@@ -85,7 +89,6 @@ where Loader.Engine == NativeModelEngine {
     }
 
     public func startCompletion(_ request: OpenAICompletionRequest) async throws -> OpenAIChatStream {
-        try await admitOrThrow()
         let ticket: EnginePoolQueueTicket
         do {
             ticket = try await pool.admitWaitingRequest()
@@ -96,6 +99,13 @@ where Loader.Engine == NativeModelEngine {
             let lease = try await pool.acquire(request.model)
             let stream: OpenAIChatStream
             do {
+                let promptTokens = try await lease.engine.countPromptTokens(for: request)
+                try await admitOrThrow(
+                    additionalBytes: lease.engine.estimatedKVCacheBytes(
+                        promptTokens: promptTokens,
+                        maxGeneratedTokens: request.maxTokens
+                    )
+                )
                 stream = try await lease.engine.startCompletion(request)
             } catch {
                 await pool.release(lease)

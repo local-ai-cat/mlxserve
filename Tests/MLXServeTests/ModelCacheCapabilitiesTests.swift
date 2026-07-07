@@ -35,6 +35,21 @@ final class ModelCacheCapabilitiesTests: XCTestCase {
         XCTAssertEqual(store.stats.storeCount, 1)
     }
 
+    func testMaxKVSizeAloneDoesNotDisablePrefixCache() async throws {
+        let store = SessionPrefixKVStore()
+        let engine = MLXServeEngine(
+            model: FixedLogitPrefixModel(cacheFactory: Self.simpleCache),
+            parameters: GenerateParameters(maxTokens: 1, maxKVSize: 4, temperature: 0),
+            maxConcurrentRequests: 1,
+            prefixStore: store,
+            cacheCapabilities: ModelCacheCapabilities(usesWindowedKVCache: false)
+        )
+
+        _ = try await engine.generate([Self.request(uid: "max-kv-size")])
+
+        XCTAssertEqual(store.stats.storeCount, 1)
+    }
+
     func testNativeLoaderDerivesWindowedKVCapabilityFromModelConfig() throws {
         let loader = NativeModelLoader(maxConcurrentRequests: 1)
 
@@ -53,6 +68,53 @@ final class ModelCacheCapabilitiesTests: XCTestCase {
                 )
             ).usesWindowedKVCache
         )
+    }
+
+    func testNativeLoaderDerivesKVCacheProfileFromModelConfig() throws {
+        let loader = NativeModelLoader(maxConcurrentRequests: 1)
+
+        let capabilities = try loader.cacheCapabilities(
+            in: Self.modelDirectory(
+                configJSON: #"""
+                {
+                  "model_type": "qwen3",
+                  "num_hidden_layers": 32,
+                  "num_attention_heads": 32,
+                  "num_key_value_heads": 8,
+                  "head_dim": 128,
+                  "torch_dtype": "bfloat16"
+                }
+                """#
+            )
+        )
+
+        let profile = try XCTUnwrap(capabilities.kvCacheProfile)
+        XCTAssertEqual(profile.bytesPerToken, 131_072)
+        XCTAssertEqual(profile.estimatedBytes(promptTokens: 10, maxGeneratedTokens: 5), 1_966_080)
+    }
+
+    func testNativeLoaderDerivesKVCacheProfileFromNestedTextConfig() throws {
+        let loader = NativeModelLoader(maxConcurrentRequests: 1)
+
+        let capabilities = try loader.cacheCapabilities(
+            in: Self.modelDirectory(
+                configJSON: #"""
+                {
+                  "model_type": "qwen2_vl",
+                  "text_config": {
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "hidden_size": 32,
+                    "dtype": "float32"
+                  }
+                }
+                """#
+            )
+        )
+
+        let profile = try XCTUnwrap(capabilities.kvCacheProfile)
+        XCTAssertEqual(profile.bytesPerToken, 256)
     }
 
     private static func request(uid: String) -> Request {
