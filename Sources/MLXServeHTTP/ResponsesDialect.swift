@@ -137,6 +137,11 @@ public struct ResponsesStreamFormatter {
     private var reasoningText = ""
     private var outputText = ""
     private var bufferedContent = ""
+    // Undivided model output, retained so the family parser can recover tool
+    // calls that a model emits outside the visible content channel (e.g. gpt-oss
+    // harmony carries them in `commentary`, which the streaming split routes to
+    // reasoning).
+    private var rawText = ""
     private var completedToolCalls: [ParsedToolCall] = []
     private var reasoningStarted = false
     private var reasoningDone = false
@@ -177,13 +182,14 @@ public struct ResponsesStreamFormatter {
 
     public mutating func feed(_ chunk: OpenAIChatChunk) -> [ResponseSSEEvent] {
         completionTokens += 1
+        rawText += chunk.text
         return parserEvents(for: parser.feed(chunk.text))
     }
 
     public mutating func finishEvents() -> [ResponseSSEEvent] {
         var events = parserEvents(for: parser.finish())
         if toolsRequested {
-            let parsed = parseToolCalls(from: bufferedContent)
+            let parsed = streamingToolCallParse(model: model, rawText: rawText, bufferedContent: bufferedContent)
             completedToolCalls = parsed.toolCalls
             if !parsed.toolCalls.isEmpty {
                 if !parsed.content.isEmpty {
@@ -569,20 +575,23 @@ public func buildResponsesObject(
     completion: ResponsesBufferedCompletion,
     parsedToolCalls: ToolCallParseResult? = nil
 ) -> [String: Any] {
-    let extracted = extractThinking(completion.text)
+    let includeToolCalls = selectOpenAITools(tools: request.tools, toolChoice: request.toolChoice) != nil
+    let result = parseModelOutput(
+        completion.text,
+        model: request.model,
+        includeToolCalls: includeToolCalls
+    )
     let parsed = parsedToolCalls
-        ?? (selectOpenAITools(tools: request.tools, toolChoice: request.toolChoice) == nil
-            ? ToolCallParseResult(content: extracted.content, toolCalls: [])
-            : parseToolCalls(from: extracted.content))
-    let reasoningTokens = responsesEstimatedTokenCount(extracted.reasoning)
+        ?? ToolCallParseResult(content: result.content, toolCalls: result.toolCalls)
+    let reasoningTokens = responsesEstimatedTokenCount(result.reasoning)
     var output: [[String: Any]] = []
-    if !extracted.reasoning.isEmpty {
+    if !result.reasoning.isEmpty {
         output.append(
             [
                 "type": "reasoning",
                 "id": "\(id)_reasoning",
                 "summary": [],
-                "content": [["type": "reasoning_text", "text": extracted.reasoning]],
+                "content": [["type": "reasoning_text", "text": result.reasoning]],
             ]
         )
     }

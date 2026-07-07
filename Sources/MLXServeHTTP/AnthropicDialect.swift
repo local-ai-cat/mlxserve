@@ -240,6 +240,10 @@ public struct AnthropicStreamFormatter {
     private var stopSequence: String?
     private let toolsRequested: Bool
     private var bufferedContent = ""
+    // Undivided model output (post stop-sequence trim), retained so the family
+    // parser can recover tool calls emitted outside the visible content channel
+    // (e.g. gpt-oss harmony `commentary`).
+    private var rawText = ""
 
     public init(
         id: String,
@@ -293,6 +297,7 @@ public struct AnthropicStreamFormatter {
             stopSequence = stopMatch.stopSequence ?? stopSequences.first
         }
 
+        rawText += stopMatch.text
         return parserEvents(for: thinkingParser.feed(stopMatch.text))
     }
 
@@ -306,12 +311,13 @@ public struct AnthropicStreamFormatter {
                 stoppedByTextStop = true
                 stopSequence = stopMatch.stopSequence ?? stopSequences.first
             }
+            rawText += stopMatch.text
             events.append(contentsOf: parserEvents(for: thinkingParser.feed(stopMatch.text)))
         }
 
         events.append(contentsOf: parserEvents(for: thinkingParser.finish()))
         if toolsRequested {
-            let parsed = parseToolCalls(from: bufferedContent)
+            let parsed = streamingToolCallParse(model: model, rawText: rawText, bufferedContent: bufferedContent)
             if !parsed.toolCalls.isEmpty {
                 if let activeBlock {
                     events.append(blockStop(index: activeBlock.index))
@@ -471,13 +477,15 @@ public func buildAnthropicMessageResponse(
     promptTokens: Int,
     id: String = "msg_\(UUID().uuidString.prefix(8))"
 ) -> [String: Any] {
-    let extracted = extractThinking(completion.text)
-    let parsed = request.tools == nil
-        ? ToolCallParseResult(content: extracted.content, toolCalls: [])
-        : parseToolCalls(from: extracted.content)
+    let result = parseModelOutput(
+        completion.text,
+        model: request.model,
+        includeToolCalls: request.tools != nil
+    )
+    let parsed = ToolCallParseResult(content: result.content, toolCalls: result.toolCalls)
     var content: [[String: Any]] = []
-    if !extracted.reasoning.isEmpty {
-        content.append(["type": "thinking", "thinking": extracted.reasoning])
+    if !result.reasoning.isEmpty {
+        content.append(["type": "thinking", "thinking": result.reasoning])
     }
     if !parsed.content.isEmpty {
         content.append(["type": "text", "text": parsed.content])

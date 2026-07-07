@@ -857,20 +857,20 @@ public final class OpenAIServer: @unchecked Sendable {
             }
         }
 
-        let extracted = extractThinking(text)
-        let parsed = parseToolCalls(from: extracted.content)
+        let result = parseModelOutput(text, model: request.model)
+        let parsed = ToolCallParseResult(content: result.content, toolCalls: result.toolCalls)
         if parsed.toolCalls.isEmpty {
             try await sendParserDelta(
-                (extracted.reasoning, extracted.content),
+                (result.reasoning, result.content),
                 id: id,
                 created: created,
                 model: request.model,
                 connection: connection
             )
         } else {
-            if !extracted.reasoning.isEmpty {
+            if !result.reasoning.isEmpty {
                 try await sendParserDelta(
-                    (extracted.reasoning, ""),
+                    (result.reasoning, ""),
                     id: id,
                     created: created,
                     model: request.model,
@@ -997,13 +997,15 @@ public final class OpenAIServer: @unchecked Sendable {
             }
         }
 
-        let extracted = extractThinking(text)
-        let parsed = toolsRequested(request)
-            ? parseToolCalls(from: extracted.content)
-            : ToolCallParseResult(content: extracted.content, toolCalls: [])
+        let result = parseModelOutput(
+            text,
+            model: request.model,
+            includeToolCalls: toolsRequested(request)
+        )
+        let parsed = ToolCallParseResult(content: result.content, toolCalls: result.toolCalls)
         let message = buildAssistantMessageWithToolCalls(
-            content: extracted.content,
-            reasoning: extracted.reasoning,
+            content: result.content,
+            reasoning: result.reasoning,
             parsed: parsed
         )
         if !parsed.toolCalls.isEmpty {
