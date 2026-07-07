@@ -72,12 +72,23 @@ final class ToolOutputParserRegistryTests: XCTestCase {
         XCTAssertFalse(result.content.contains("<|tool_call>"))
     }
 
-    func testGemma4StrictJSONArgs() {
-        let text = #"<|tool_call>call:search{"query": "hello world"}<tool_call|>"#
+    func testGemma4MultipleArgsAndTurnEnd() {
+        // Real Gemma grammar: <|"|>-delimited strings + bare value, ended by <turn|>.
+        let text = "<|tool_call>call:get_weather{city:<|\"|>San Francisco<|\"|>,days:3}<turn|>"
         let result = parseModelOutput(text, model: "gemma-4-E4B-it", idGenerator: idGenerator())
 
         XCTAssertEqual(result.toolCalls, [
-            ParsedToolCall(id: "call_0", name: "search", arguments: #"{"query":"hello world"}"#)
+            ParsedToolCall(id: "call_0", name: "get_weather", arguments: #"{"city":"San Francisco","days":"3"}"#)
+        ])
+    }
+
+    func testGemma4BareFallbackCall() {
+        // Tier-2 fallback: bare `call:name{...}` with no <|tool_call> marker.
+        let text = "call:lookup{q:<|\"|>swift<|\"|>}"
+        let result = parseModelOutput(text, model: "gemma-4-E4B-it", idGenerator: idGenerator())
+
+        XCTAssertEqual(result.toolCalls, [
+            ParsedToolCall(id: "call_0", name: "lookup", arguments: #"{"q":"swift"}"#)
         ])
     }
 
@@ -123,16 +134,14 @@ final class ToolOutputParserRegistryTests: XCTestCase {
         ])
     }
 
-    func testDeepSeekV4DSMLToolCall() {
-        let text = "<｜DSML｜tool_calls>"
-            + "<｜DSML｜invoke name=\"get_weather\">"
-            + "<｜DSML｜parameter name=\"city\" string=\"true\">Seoul</｜DSML｜parameter>"
-            + "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>"
-            + "</｜DSML｜invoke></｜DSML｜tool_calls>"
-        let result = parseModelOutput(text, model: "deepseek-v4", idGenerator: idGenerator())
+    func testDeepSeekV31ToolCall() {
+        // V3.1 form: name<｜tool▁sep｜>{args}, no ```json fence.
+        let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+            + "{\"city\": \"Seoul\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        let result = parseModelOutput(text, model: "deepseek-v3.1", idGenerator: idGenerator())
 
         XCTAssertEqual(result.toolCalls, [
-            ParsedToolCall(id: "call_0", name: "get_weather", arguments: #"{"city":"Seoul","days":3}"#)
+            ParsedToolCall(id: "call_0", name: "get_weather", arguments: #"{"city":"Seoul"}"#)
         ])
     }
 
