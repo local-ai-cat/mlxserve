@@ -19,8 +19,10 @@ public actor Scheduler {
     private let prefixStore: (any PrefixKVStore)?
     private let prefixCacheEnabled: Bool
     private let serializedDecode: Bool
+    private let schedulerManagedTextPrefill: Bool
     private var waiting: [Request] = []
     private var running: [String: RunningRequest] = [:]
+    private var admissionInProgress: AdmissionInProgress?
     private var pendingCancellation: Set<String> = []
     private let collector = OutputCollector()
 
@@ -30,7 +32,8 @@ public actor Scheduler {
         maxConcurrentRequests: Int,
         prefixStore: (any PrefixKVStore)? = nil,
         cacheCapabilities: ModelCacheCapabilities = .default,
-        serializedDecode: Bool = false
+        serializedDecode: Bool = false,
+        schedulerManagedTextPrefill: Bool = true
     ) {
         self.model = modelBox.model
         self.parameters = parameters
@@ -41,21 +44,25 @@ public actor Scheduler {
         self.prefixCacheEnabled = prefixStore != nil
             && !Self.usesWindowedKVCache(parameters: parameters, cacheCapabilities: cacheCapabilities)
         self.serializedDecode = serializedDecode
+        self.schedulerManagedTextPrefill = schedulerManagedTextPrefill
     }
 
     public var isIdle: Bool {
-        waiting.isEmpty && running.isEmpty && generator.isEmpty
+        waiting.isEmpty && running.isEmpty && generator.isEmpty && admissionInProgress == nil
     }
 
     public var queueDepth: Int {
-        waiting.count + running.count
+        waiting.count + running.count + (admissionInProgress == nil ? 0 : 1)
     }
 
     public func submit(_ request: Request) throws {
         if queueDepth >= queueLimit {
             throw SchedulerError.queueFull(retryAfterSteps: max(1, queueDepth / max(1, maxConcurrentRequests)))
         }
-        if waiting.contains(where: { $0.uid == request.uid }) || running[request.uid] != nil {
+        if waiting.contains(where: { $0.uid == request.uid })
+            || running[request.uid] != nil
+            || admissionInProgress?.request.uid == request.uid
+        {
             throw SchedulerError.duplicateRequest(request.uid)
         }
         waiting.append(request)
@@ -67,6 +74,14 @@ public actor Scheduler {
             collector.record(Response(uid: uid, token: -1, finishReason: .cancelled))
             return
         }
+        if let admission = admissionInProgress, admission.request.uid == uid {
+            if let hit = admission.prefixHit {
+                prefixStore?.release(hit)
+            }
+            admissionInProgress = nil
+            collector.record(Response(uid: uid, token: -1, finishReason: .cancelled))
+            return
+        }
         if running[uid] != nil {
             pendingCancellation.insert(uid)
         }
@@ -74,7 +89,7 @@ public actor Scheduler {
 
     public func step() throws -> [Response] {
         var processed = applyPendingCancellation()
-        processed.append(contentsOf: admitWaiting())
+        processed.append(contentsOf: admitWaiting(allowPartialPrefill: !generator.isEmpty))
 
         guard !generator.isEmpty else { return processed }
 
@@ -132,7 +147,9 @@ public actor Scheduler {
             }
         }
 
-        processed.append(contentsOf: admitWaiting())
+        if generator.isEmpty {
+            processed.append(contentsOf: admitWaiting(allowPartialPrefill: false))
+        }
         return processed
     }
 
@@ -156,9 +173,9 @@ public actor Scheduler {
         collector.remove(uid: uid)
     }
 
-    private func admitWaiting() -> [Response] {
+    private func admitWaiting(allowPartialPrefill: Bool) -> [Response] {
         var admittedResponses: [Response] = []
-        while running.count < maxConcurrentRequests, !waiting.isEmpty {
+        while running.count < maxConcurrentRequests {
             // Some model architectures still derive RoPE position ids or
             // shared-KV offsets from scalar cache.offset. Their loaders pass
             // serializedDecode=true so mixed-offset rows are not admitted into
@@ -167,70 +184,69 @@ public actor Scheduler {
                 return admittedResponses
             }
 
-            let request = waiting[0]
-            var prepared: PreparedBatchRow?
-            do {
-                var sampling = request.sampling
-                sampling.eosTokenIds.formUnion(request.eosTokenIds)
-                if !request.eosTokenIds.isEmpty {
-                    sampling.xtcSpecialTokens = Array(Set(sampling.xtcSpecialTokens).union(request.eosTokenIds))
-                }
+            if admissionInProgress == nil {
+                guard !waiting.isEmpty else { return admittedResponses }
+                let request = waiting.removeFirst()
+                do {
+                    var sampling = request.sampling
+                    sampling.eosTokenIds.formUnion(request.eosTokenIds)
+                    if !request.eosTokenIds.isEmpty {
+                        sampling.xtcSpecialTokens = Array(Set(sampling.xtcSpecialTokens).union(request.eosTokenIds))
+                    }
 
-                let row = try prepareForInsert(request, sampling: sampling)
-                prepared = row
-
-                let initialTokenID = row.initialGeneratedToken?.tokenID
-                let generatedTokens = initialTokenID.map { [$0] } ?? []
-                let generatedTokenCount = initialTokenID == nil ? 0 : 1
-                let finishReason = initialTokenID.map { tokenID in
-                    self.finishReason(
-                        token: tokenID,
-                        generatedTokenCount: generatedTokenCount,
-                        request: request
-                    )
-                } ?? nil
-
-                if finishReason == nil {
-                    try generator.insert(
-                        uid: request.uid,
-                        cache: row.cache,
-                        lastToken: row.lastToken,
-                        sampling: sampling,
-                        generatedTokens: generatedTokens,
-                        thinkingBudgetState: row.initialGeneratedToken?.thinkingBudgetState
-                    )
-                    running[request.uid] = RunningRequest(
-                        request: request,
-                        promptTokens: row.promptTokens,
-                        prefixHit: row.prefixHit,
-                        generatedTokenCount: generatedTokenCount,
-                        promptCacheSnapshot: nil
-                    )
-                }
-
-                waiting.removeFirst()
-
-                if let initialTokenID {
+                    switch try prepareForInsert(request, sampling: sampling) {
+                    case .ready(let row):
+                        if let response = try completeAdmission(
+                            row,
+                            request: request,
+                            sampling: sampling
+                        ) {
+                            admittedResponses.append(response)
+                        }
+                        continue
+                    case .pending(let admission):
+                        admissionInProgress = admission
+                    }
+                } catch {
                     let response = Response(
                         uid: request.uid,
-                        token: initialTokenID,
-                        finishReason: finishReason
+                        token: -1,
+                        finishReason: .failed(String(describing: error))
+                    )
+                    collector.record(response)
+                    admittedResponses.append(response)
+                    continue
+                }
+            }
+
+            do {
+                guard let row = try advanceAdmission(allowPartialPrefill: allowPartialPrefill) else {
+                    return admittedResponses
+                }
+                guard let admission = admissionInProgress else { return admittedResponses }
+                if let response = try completeAdmission(
+                    row,
+                    request: admission.request,
+                    sampling: admission.sampling
+                ) {
+                    admittedResponses.append(response)
+                }
+                admissionInProgress = nil
+            } catch {
+                let request = admissionInProgress?.request
+                if let hit = admissionInProgress?.prefixHit {
+                    prefixStore?.release(hit)
+                }
+                admissionInProgress = nil
+                if let request {
+                    let response = Response(
+                        uid: request.uid,
+                        token: -1,
+                        finishReason: .failed(String(describing: error))
                     )
                     collector.record(response)
                     admittedResponses.append(response)
                 }
-            } catch {
-                if let hit = prepared?.prefixHit {
-                    prefixStore?.release(hit)
-                }
-                waiting.removeFirst()
-                let response = Response(
-                    uid: request.uid,
-                    token: -1,
-                    finishReason: .failed(String(describing: error))
-                )
-                collector.record(response)
-                admittedResponses.append(response)
                 continue
             }
         }
@@ -257,16 +273,99 @@ public actor Scheduler {
         return responses
     }
 
+    private func completeAdmission(
+        _ row: PreparedBatchRow,
+        request: Request,
+        sampling: SamplingParameters
+    ) throws -> Response? {
+        let initialTokenID = row.initialGeneratedToken?.tokenID
+        let generatedTokens = initialTokenID.map { [$0] } ?? []
+        let generatedTokenCount = initialTokenID == nil ? 0 : 1
+        let finishReason = initialTokenID.map { tokenID in
+            self.finishReason(
+                token: tokenID,
+                generatedTokenCount: generatedTokenCount,
+                request: request
+            )
+        } ?? nil
+
+        if finishReason == nil {
+            try generator.insert(
+                uid: request.uid,
+                cache: row.cache,
+                lastToken: row.lastToken,
+                sampling: sampling,
+                generatedTokens: generatedTokens,
+                thinkingBudgetState: row.initialGeneratedToken?.thinkingBudgetState
+            )
+            running[request.uid] = RunningRequest(
+                request: request,
+                promptTokens: row.promptTokens,
+                prefixHit: row.prefixHit,
+                generatedTokenCount: generatedTokenCount,
+                promptCacheSnapshot: nil
+            )
+        }
+
+        guard let initialTokenID else { return nil }
+        let response = Response(
+            uid: request.uid,
+            token: initialTokenID,
+            finishReason: finishReason
+        )
+        collector.record(response)
+        return response
+    }
+
+    private func advanceAdmission(allowPartialPrefill: Bool) throws -> PreparedBatchRow? {
+        guard var admission = admissionInProgress else { return nil }
+
+        let stepBudget = allowPartialPrefill ? max(1, parameters.prefillStepSize) : Int.max
+        var remainingBudget = stepBudget
+        while admission.nextPrefillIndex < admission.prefillRange.upperBound, remainingBudget > 0 {
+            let chunkLimit = allowPartialPrefill
+                ? min(max(1, parameters.prefillStepSize), remainingBudget)
+                : max(1, parameters.prefillStepSize)
+            let end = min(
+                admission.nextPrefillIndex + chunkLimit,
+                admission.prefillRange.upperBound
+            )
+            let input = LMInput.Text(
+                tokens: admission.promptTokensArray[admission.nextPrefillIndex ..< end]
+            )
+            let output = model(input[text: .newAxis], cache: admission.cache, state: admission.state)
+            admission.state = output.state
+            asyncEval(admission.cache)
+            remainingBudget -= end - admission.nextPrefillIndex
+            admission.nextPrefillIndex = end
+        }
+
+        if admission.nextPrefillIndex < admission.prefillRange.upperBound {
+            admissionInProgress = admission
+            return nil
+        }
+
+        eval(admission.cache)
+        return PreparedBatchRow(
+            cache: admission.cache,
+            lastToken: admission.promptTokensArray[admission.promptTokens.count - 1],
+            promptTokens: admission.storedPromptTokens,
+            prefixHit: admission.prefixHit,
+            initialGeneratedToken: nil
+        )
+    }
+
     private func prepareForInsert(_ request: Request, sampling: SamplingParameters) throws
-        -> PreparedBatchRow
+        -> PreparedAdmission
     {
         let rowCache = model.newCache(parameters: parameters)
         let prefixCacheEligible = isPrefixCacheEligible(request.input)
-        let canUseRawPrefixTokens = prefixCacheEnabled
+        let canUseRawTextTokens = schedulerManagedTextPrefill
             && prefixCacheEligible
             && request.input.text.tokens.ndim == 1
+            && request.input.text.mask == nil
         let promptText: LMInput.Text
-        if canUseRawPrefixTokens {
+        if canUseRawTextTokens {
             promptText = request.input.text
         } else {
             switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
@@ -274,13 +373,13 @@ public actor Scheduler {
                 promptText = tokens
             case .logits(let output):
                 let firstToken = sampledToken(from: output.logits, sampling: sampling)
-                return PreparedBatchRow(
+                return .ready(PreparedBatchRow(
                     cache: rowCache,
                     lastToken: firstToken.token,
                     promptTokens: [],
                     prefixHit: nil,
                     initialGeneratedToken: firstToken
-                )
+                ))
             }
         }
 
@@ -295,13 +394,13 @@ public actor Scheduler {
             let output = model(promptText[text: .newAxis], cache: rowCache, state: nil)
             eval(rowCache)
             let firstToken = sampledToken(from: output.logits, sampling: sampling)
-            return PreparedBatchRow(
+            return .ready(PreparedBatchRow(
                 cache: rowCache,
                 lastToken: firstToken.token,
                 promptTokens: [],
                 prefixHit: nil,
                 initialGeneratedToken: firstToken
-            )
+            ))
         }
 
         if prefixCacheEnabled,
@@ -316,6 +415,7 @@ public actor Scheduler {
                 }
                 return try prepareHitRow(
                     request: request,
+                    sampling: sampling,
                     promptTokens: promptTokens,
                     promptTokensArray: promptTokensArray,
                     hit: hit,
@@ -329,6 +429,7 @@ public actor Scheduler {
 
         return prefillMissRow(
             request: request,
+            sampling: sampling,
             promptTokens: promptTokens,
             promptTokensArray: promptTokensArray,
             storedPromptTokens: prefixCacheEligible ? promptTokens : [],
@@ -338,11 +439,12 @@ public actor Scheduler {
 
     private func prepareHitRow(
         request: Request,
+        sampling: SamplingParameters,
         promptTokens: [Int],
         promptTokensArray: MLXArray,
         hit: PrefixKVStoreHit,
         reconstructedCache: [KVCacheSimple]
-    ) throws -> PreparedBatchRow {
+    ) throws -> PreparedAdmission {
         let matched = hit.matchedTokenCount
         guard matched <= promptTokens.count else {
             throw SchedulerError.invalidPrefixHit
@@ -352,73 +454,49 @@ public actor Scheduler {
             for layerCache in reconstructedCache {
                 _ = layerCache.trim(1)
             }
-            return PreparedBatchRow(
+            return .ready(PreparedBatchRow(
                 cache: reconstructedCache,
                 lastToken: promptTokensArray[promptTokens.count - 1],
                 promptTokens: promptTokens,
                 prefixHit: hit,
                 initialGeneratedToken: nil
-            )
+            ))
         }
 
-        let remainingCount = promptTokens.count - matched
-        if remainingCount > 1 {
-            prefillTokenRange(
-                promptTokensArray,
-                range: matched ..< (promptTokens.count - 1),
-                cache: reconstructedCache
-            )
-        }
-
-        return PreparedBatchRow(
+        return .pending(AdmissionInProgress(
+            request: request,
+            sampling: sampling,
             cache: reconstructedCache,
-            lastToken: promptTokensArray[promptTokens.count - 1],
             promptTokens: promptTokens,
+            promptTokensArray: promptTokensArray,
+            storedPromptTokens: promptTokens,
             prefixHit: hit,
-            initialGeneratedToken: nil
-        )
+            prefillRange: matched ..< (promptTokens.count - 1),
+            nextPrefillIndex: matched,
+            state: nil
+        ))
     }
 
     private func prefillMissRow(
         request: Request,
+        sampling: SamplingParameters,
         promptTokens: [Int],
         promptTokensArray: MLXArray,
         storedPromptTokens: [Int],
         rowCache: [any KVCache]
-    ) -> PreparedBatchRow {
-        prefillTokenRange(
-            promptTokensArray,
-            range: 0 ..< (promptTokens.count - 1),
-            cache: rowCache
-        )
-
-        return PreparedBatchRow(
+    ) -> PreparedAdmission {
+        .pending(AdmissionInProgress(
+            request: request,
+            sampling: sampling,
             cache: rowCache,
-            lastToken: promptTokensArray[promptTokens.count - 1],
-            promptTokens: storedPromptTokens,
+            promptTokens: promptTokens,
+            promptTokensArray: promptTokensArray,
+            storedPromptTokens: storedPromptTokens,
             prefixHit: nil,
-            initialGeneratedToken: nil
-        )
-    }
-
-    private func prefillTokenRange(
-        _ tokens: MLXArray,
-        range: Range<Int>,
-        cache: [any KVCache]
-    ) {
-        guard !range.isEmpty else { return }
-        let stepSize = max(1, parameters.prefillStepSize)
-        var state: LMOutput.State?
-        var start = range.lowerBound
-        while start < range.upperBound {
-            let end = min(start + stepSize, range.upperBound)
-            let input = LMInput.Text(tokens: tokens[start ..< end])
-            let output = model(input[text: .newAxis], cache: cache, state: state)
-            state = output.state
-            asyncEval(cache)
-            start = end
-        }
-        eval(cache)
+            prefillRange: 0 ..< (promptTokens.count - 1),
+            nextPrefillIndex: 0,
+            state: nil
+        ))
     }
 
     private func promptCacheSnapshot(uid: String) -> [SerializedKVLayer]? {
@@ -518,6 +596,24 @@ public actor Scheduler {
     ) -> Bool {
         parameters.maxKVSize != nil || cacheCapabilities.usesWindowedKVCache
     }
+}
+
+private enum PreparedAdmission {
+    case ready(PreparedBatchRow)
+    case pending(AdmissionInProgress)
+}
+
+private struct AdmissionInProgress {
+    let request: Request
+    let sampling: SamplingParameters
+    let cache: [any KVCache]
+    let promptTokens: [Int]
+    let promptTokensArray: MLXArray
+    let storedPromptTokens: [Int]
+    let prefixHit: PrefixKVStoreHit?
+    let prefillRange: Range<Int>
+    var nextPrefillIndex: Int
+    var state: LMOutput.State?
 }
 
 private struct PreparedBatchRow {

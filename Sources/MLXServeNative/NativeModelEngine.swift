@@ -25,7 +25,8 @@ public final class NativeModelEngine: @unchecked Sendable {
         modelID: String,
         maxConcurrentRequests: Int,
         cacheCapabilities: ModelCacheCapabilities,
-        serializedDecode: Bool
+        serializedDecode: Bool,
+        schedulerManagedTextPrefill: Bool
     ) {
         self.context = context
         self.modelID = modelID
@@ -37,7 +38,8 @@ public final class NativeModelEngine: @unchecked Sendable {
             maxConcurrentRequests: maxConcurrentRequests,
             prefixStore: prefixStore,
             cacheCapabilities: cacheCapabilities,
-            serializedDecode: serializedDecode
+            serializedDecode: serializedDecode,
+            schedulerManagedTextPrefill: schedulerManagedTextPrefill
         )
         var eosTokenIds = context.configuration.eosTokenIds
         if let tokenizerEosTokenId = context.tokenizer.eosTokenId {
@@ -520,7 +522,8 @@ public struct NativeModelLoader: EnginePoolModelLoader {
                 modelID: id,
                 maxConcurrentRequests: maxConcurrentRequests,
                 cacheCapabilities: Self.cacheCapabilities(for: modelConfiguration),
-                serializedDecode: isVLM && Self.requiresSerializedDecode(modelType: modelType)
+                serializedDecode: isVLM && Self.requiresSerializedDecode(modelType: modelType),
+                schedulerManagedTextPrefill: !isVLM
             )
         }
     }
