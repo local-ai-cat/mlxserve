@@ -11,6 +11,28 @@ public final class LanguageModelBox: @unchecked Sendable {
 }
 
 public actor Scheduler {
+    public struct PressureSnapshot: Sendable, Equatable {
+        public let runningUIDs: [String]
+        public let waitingCount: Int
+        public let admissionInProgressUID: String?
+
+        public init(runningUIDs: [String], waitingCount: Int, admissionInProgressUID: String?) {
+            self.runningUIDs = runningUIDs
+            self.waitingCount = waitingCount
+            self.admissionInProgressUID = admissionInProgressUID
+        }
+    }
+
+    public struct PressurePolicy: Sendable {
+        public let shouldPreempt: @Sendable (PressureSnapshot) -> Bool
+
+        public init(shouldPreempt: @escaping @Sendable (PressureSnapshot) -> Bool) {
+            self.shouldPreempt = shouldPreempt
+        }
+
+        public static let disabled = PressurePolicy { _ in false }
+    }
+
     private let model: any LanguageModel
     private let parameters: GenerateParameters
     private let generator: ContinuousBatchGenerator
@@ -20,9 +42,12 @@ public actor Scheduler {
     private let prefixCacheEnabled: Bool
     private let serializedDecode: Bool
     private let schedulerManagedTextPrefill: Bool
+    private let pressurePolicy: PressurePolicy
     private var waiting: [Request] = []
     private var running: [String: RunningRequest] = [:]
     private var admissionInProgress: AdmissionInProgress?
+    private var resumeGeneratedTokens: [String: [Int]] = [:]
+    private var droppedStaleResponseCount = 0
     private var pendingCancellation: Set<String> = []
     private let collector = OutputCollector()
 
@@ -33,7 +58,8 @@ public actor Scheduler {
         prefixStore: (any PrefixKVStore)? = nil,
         cacheCapabilities: ModelCacheCapabilities = .default,
         serializedDecode: Bool = false,
-        schedulerManagedTextPrefill: Bool = true
+        schedulerManagedTextPrefill: Bool = true,
+        pressurePolicy: PressurePolicy = .disabled
     ) {
         self.model = modelBox.model
         self.parameters = parameters
@@ -45,6 +71,7 @@ public actor Scheduler {
             && !Self.usesWindowedKVCache(parameters: parameters, cacheCapabilities: cacheCapabilities)
         self.serializedDecode = serializedDecode
         self.schedulerManagedTextPrefill = schedulerManagedTextPrefill
+        self.pressurePolicy = pressurePolicy
     }
 
     public var isIdle: Bool {
@@ -71,6 +98,7 @@ public actor Scheduler {
     public func cancel(uid: String) {
         if let waitingIndex = waiting.firstIndex(where: { $0.uid == uid }) {
             waiting.remove(at: waitingIndex)
+            resumeGeneratedTokens.removeValue(forKey: uid)
             collector.record(Response(uid: uid, token: -1, finishReason: .cancelled))
             return
         }
@@ -79,6 +107,7 @@ public actor Scheduler {
                 prefixStore?.release(hit)
             }
             admissionInProgress = nil
+            resumeGeneratedTokens.removeValue(forKey: uid)
             collector.record(Response(uid: uid, token: -1, finishReason: .cancelled))
             return
         }
@@ -93,20 +122,22 @@ public actor Scheduler {
 
         guard !generator.isEmpty else { return processed }
 
+        if pressurePolicy.shouldPreempt(pressureSnapshot()),
+            preemptYoungestResumableRequest()
+        {
+            return processed
+        }
+
         let rawResponses = generator.next()
         var finishedUIDs: [String] = []
 
         for response in rawResponses {
-            guard var runningRequest = running[response.uid] else { continue }
-            runningRequest.generatedTokenCount += 1
-            if prefixCacheEnabled,
-                prefixStore != nil,
-                runningRequest.generatedTokenCount == 1,
-                runningRequest.promptCacheSnapshot == nil,
-                !runningRequest.promptTokens.isEmpty
-            {
-                runningRequest.promptCacheSnapshot = promptCacheSnapshot(uid: response.uid)
+            guard var runningRequest = running[response.uid] else {
+                droppedStaleResponseCount += 1
+                continue
             }
+            runningRequest.generatedTokens.append(response.token)
+            publishAvailablePrefixBlocks(uid: response.uid, runningRequest: &runningRequest)
 
             let finishReason: FinishReason?
             if runningRequest.request.eosTokenIds.contains(response.token) {
@@ -135,15 +166,17 @@ public actor Scheduler {
         if !finishedUIDs.isEmpty {
             Stream.gpu.synchronize()
             for uid in finishedUIDs {
+                if var finishedRequest = running[uid] {
+                    publishAvailablePrefixBlocks(uid: uid, runningRequest: &finishedRequest)
+                    running[uid] = finishedRequest
+                }
                 let finishedRequest = running[uid]
                 generator.remove(uid: uid)
                 if let hit = finishedRequest?.prefixHit {
                     prefixStore?.release(hit)
                 }
                 running.removeValue(forKey: uid)
-                if let finishedRequest {
-                    storePromptCache(from: finishedRequest)
-                }
+                resumeGeneratedTokens.removeValue(forKey: uid)
             }
         }
 
@@ -171,6 +204,10 @@ public actor Scheduler {
 
     public func discardResponses(for uid: String) {
         collector.remove(uid: uid)
+    }
+
+    public var droppedStaleResponses: Int {
+        droppedStaleResponseCount
     }
 
     private func admitWaiting(allowPartialPrefill: Bool) -> [Response] {
@@ -265,6 +302,7 @@ public actor Scheduler {
             }
             generator.remove(uid: uid)
             running.removeValue(forKey: uid)
+            resumeGeneratedTokens.removeValue(forKey: uid)
             let response = Response(uid: uid, token: -1, finishReason: .cancelled)
             collector.record(response)
             responses.append(response)
@@ -278,9 +316,10 @@ public actor Scheduler {
         request: Request,
         sampling: SamplingParameters
     ) throws -> Response? {
+        let seededGeneratedTokens = resumeGeneratedTokens.removeValue(forKey: request.uid) ?? []
         let initialTokenID = row.initialGeneratedToken?.tokenID
-        let generatedTokens = initialTokenID.map { [$0] } ?? []
-        let generatedTokenCount = initialTokenID == nil ? 0 : 1
+        let newlyGeneratedTokens = initialTokenID.map { [$0] } ?? []
+        let generatedTokenCount = seededGeneratedTokens.count + newlyGeneratedTokens.count
         let finishReason = initialTokenID.map { tokenID in
             self.finishReason(
                 token: tokenID,
@@ -290,20 +329,24 @@ public actor Scheduler {
         } ?? nil
 
         if finishReason == nil {
+            let generatorSeededTokens = seededGeneratedTokens + newlyGeneratedTokens
             try generator.insert(
                 uid: request.uid,
                 cache: row.cache,
                 lastToken: row.lastToken,
                 sampling: sampling,
-                generatedTokens: generatedTokens,
-                thinkingBudgetState: row.initialGeneratedToken?.thinkingBudgetState
+                generatedTokens: generatorSeededTokens,
+                thinkingBudgetState: seededGeneratedTokens.isEmpty
+                    ? row.initialGeneratedToken?.thinkingBudgetState
+                    : nil
             )
             running[request.uid] = RunningRequest(
                 request: request,
                 promptTokens: row.promptTokens,
                 prefixHit: row.prefixHit,
-                generatedTokenCount: generatedTokenCount,
-                promptCacheSnapshot: nil
+                generatedTokens: generatorSeededTokens,
+                generatedTokensIncludedInPrompt: seededGeneratedTokens.count,
+                cachedTokenCount: 0
             )
         }
 
@@ -499,7 +542,7 @@ public actor Scheduler {
         ))
     }
 
-    private func promptCacheSnapshot(uid: String) -> [SerializedKVLayer]? {
+    private func cacheSnapshot(uid: String) -> [SerializedKVLayer]? {
         guard let cache = generator.extractCache(uid: uid) else {
             return nil
         }
@@ -512,23 +555,95 @@ public actor Scheduler {
         }
     }
 
-    private func storePromptCache(from runningRequest: RunningRequest) {
+    private func publishAvailablePrefixBlocks(
+        uid: String,
+        runningRequest: inout RunningRequest
+    ) {
         guard prefixCacheEnabled,
             let prefixStore,
-            !runningRequest.promptTokens.isEmpty,
-            let snapshot = runningRequest.promptCacheSnapshot
+            !runningRequest.promptTokens.isEmpty
         else {
             return
         }
+
+        // The live KV cache has consumed the token from the previous step. The
+        // token sampled by the current step is now `currentTokens`, so it is not
+        // part of the cache snapshot until the next decode call.
+        let generatedTokensAfterPrompt = runningRequest.generatedTokens
+            .dropFirst(runningRequest.generatedTokensIncludedInPrompt)
+        let cachedGeneratedTokens = generatedTokensAfterPrompt.dropLast()
+        let availableTokens = runningRequest.promptTokens + cachedGeneratedTokens
+        guard availableTokens.count > runningRequest.cachedTokenCount,
+            let snapshot = cacheSnapshot(uid: uid)
+        else {
+            return
+        }
+
         do {
             try prefixStore.store(
-                tokens: runningRequest.promptTokens,
+                tokens: availableTokens,
                 sessionKey: runningRequest.request.cacheSession,
                 cache: snapshot
             )
+            runningRequest.cachedTokenCount = availableTokens.count
         } catch {
-            logCacheFailure("prompt cache store failed", error)
+            logCacheFailure("prefix cache store failed", error)
         }
+    }
+
+    private func preemptYoungestResumableRequest() -> Bool {
+        guard let uid = generator.uids.reversed().first(where: { uid in
+            guard let request = running[uid] else { return false }
+            return canResumeFromTokenPrompt(request)
+        }),
+            var runningRequest = running[uid]
+        else {
+            return false
+        }
+
+        publishAvailablePrefixBlocks(uid: uid, runningRequest: &runningRequest)
+        if let hit = runningRequest.prefixHit {
+            prefixStore?.release(hit)
+        }
+
+        let resumedTokens = currentContextTokens(for: runningRequest)
+        let resumedInput = LMInput(tokens: MLXArray(resumedTokens.map(Int32.init)))
+        let resumedRequest = Request(
+            uid: runningRequest.request.uid,
+            input: resumedInput,
+            maxTokens: runningRequest.request.maxTokens,
+            sampling: runningRequest.request.sampling,
+            eosTokenIds: runningRequest.request.eosTokenIds,
+            cacheSession: runningRequest.request.cacheSession
+        )
+
+        generator.remove(uid: uid)
+        running.removeValue(forKey: uid)
+        resumeGeneratedTokens[uid] = runningRequest.generatedTokens
+        waiting.insert(resumedRequest, at: 0)
+        return true
+    }
+
+    private func canResumeFromTokenPrompt(_ runningRequest: RunningRequest) -> Bool {
+        !runningRequest.promptTokens.isEmpty
+            && runningRequest.request.input.image == nil
+            && runningRequest.request.input.video == nil
+            && runningRequest.request.input.audio == nil
+            && runningRequest.request.input.text.tokens.ndim == 1
+            && runningRequest.request.input.text.mask == nil
+    }
+
+    private func currentContextTokens(for runningRequest: RunningRequest) -> [Int] {
+        runningRequest.promptTokens
+            + runningRequest.generatedTokens.dropFirst(runningRequest.generatedTokensIncludedInPrompt)
+    }
+
+    private func pressureSnapshot() -> PressureSnapshot {
+        PressureSnapshot(
+            runningUIDs: generator.uids,
+            waitingCount: waiting.count,
+            admissionInProgressUID: admissionInProgress?.request.uid
+        )
     }
 
     private func logCacheFailure(_ message: String, _ error: Error) {

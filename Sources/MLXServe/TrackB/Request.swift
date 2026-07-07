@@ -29,8 +29,13 @@ struct RunningRequest {
     let request: Request
     let promptTokens: [Int]
     let prefixHit: PrefixKVStoreHit?
-    var generatedTokenCount: Int
-    var promptCacheSnapshot: [SerializedKVLayer]?
+    var generatedTokens: [Int]
+    let generatedTokensIncludedInPrompt: Int
+    var cachedTokenCount: Int
+
+    var generatedTokenCount: Int {
+        generatedTokens.count
+    }
 }
 
 public enum SchedulerError: Error, Equatable {
