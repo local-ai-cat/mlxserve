@@ -6,6 +6,36 @@ public struct BatchDecodeStep {
     public let logits: MLXArray
 }
 
+public struct SpeculativeDecodingConfiguration: Sendable, Equatable {
+    public var enabled: Bool
+    public var maxProposalTokens: Int
+    public var maxSuffixTokens: Int
+    public var minContextTokens: Int
+
+    public init(
+        enabled: Bool = true,
+        maxProposalTokens: Int = 4,
+        maxSuffixTokens: Int = 16,
+        minContextTokens: Int = 8
+    ) {
+        self.enabled = enabled
+        self.maxProposalTokens = max(0, maxProposalTokens)
+        self.maxSuffixTokens = max(1, maxSuffixTokens)
+        self.minContextTokens = max(2, minContextTokens)
+    }
+
+    public static let disabled = SpeculativeDecodingConfiguration(enabled: false)
+}
+
+public struct SpeculativeDecodingStats: Sendable, Equatable {
+    public var proposedTokenCount: Int = 0
+    public var acceptedTokenCount: Int = 0
+    public var proposalBatchCount: Int = 0
+    public var rejectedBatchCount: Int = 0
+
+    public init() {}
+}
+
 public enum FinishReason: Sendable, Equatable {
     case stop
     case length
@@ -107,6 +137,7 @@ public final class StaticBatchGenerator {
 public final class ContinuousBatchGenerator {
     private let model: any LanguageModel
     private let parameters: GenerateParameters
+    private let speculativeDecoding: SpeculativeDecodingConfiguration
     private var cache: [BatchLayerCache] = []
     private var currentTokens = MLXArray([Int32]())
     private var rowUIDs: [String] = []
@@ -117,11 +148,19 @@ public final class ContinuousBatchGenerator {
     private var gbnfGrammarMatchers: [GBNFGrammarMatcher?] = []
     private var thinkingBudgetStates: [ThinkingBudgetState?] = []
     private var generatedTokenHistory: [[Int]] = []
+    private var speculativeTokenHistory: [[Int]] = []
+    private var maxGeneratedTokens: [Int?] = []
     private var state: LMOutput.State?
+    private var speculativeStats = SpeculativeDecodingStats()
 
-    public init(model: any LanguageModel, parameters: GenerateParameters) {
+    public init(
+        model: any LanguageModel,
+        parameters: GenerateParameters,
+        speculativeDecoding: SpeculativeDecodingConfiguration = SpeculativeDecodingConfiguration()
+    ) {
         self.model = model
         self.parameters = parameters
+        self.speculativeDecoding = speculativeDecoding
     }
 
     public var isEmpty: Bool {
@@ -136,11 +175,17 @@ public final class ContinuousBatchGenerator {
         rowUIDs
     }
 
+    public var speculationStats: SpeculativeDecodingStats {
+        speculativeStats
+    }
+
     @discardableResult
     public func insert(
         uid: String,
         input: LMInput,
-        sampling: SamplingParameters
+        sampling: SamplingParameters,
+        maxGeneratedTokens: Int? = nil,
+        speculativeContextTokens: [Int] = []
     ) throws -> Response? {
         let rowCache = model.newCache(parameters: parameters)
         switch try model.prepare(input, cache: rowCache, windowSize: parameters.prefillStepSize) {
@@ -161,13 +206,22 @@ public final class ContinuousBatchGenerator {
                     lastToken: firstToken.token,
                     sampling: sampling,
                     generatedTokens: [tokenID],
+                    maxGeneratedTokens: maxGeneratedTokens,
+                    speculativeContextTokens: speculativeContextTokens + [tokenID],
                     thinkingBudgetState: firstToken.thinkingBudgetState,
                     randomState: randomState
                 )
                 return Response(uid: uid, token: tokenID)
             }
             let lastToken = try prefillWithLastTokenWithheld(tokens, cache: rowCache)
-            try insert(uid: uid, cache: rowCache, lastToken: lastToken, sampling: sampling)
+            try insert(
+                uid: uid,
+                cache: rowCache,
+                lastToken: lastToken,
+                sampling: sampling,
+                maxGeneratedTokens: maxGeneratedTokens,
+                speculativeContextTokens: speculativeContextTokens
+            )
             return nil
         case .logits(let output):
             let randomState = Self.randomState(for: sampling.seed)
@@ -183,6 +237,8 @@ public final class ContinuousBatchGenerator {
                 lastToken: firstToken.token,
                 sampling: sampling,
                 generatedTokens: [tokenID],
+                maxGeneratedTokens: maxGeneratedTokens,
+                speculativeContextTokens: speculativeContextTokens + [tokenID],
                 thinkingBudgetState: firstToken.thinkingBudgetState,
                 randomState: randomState
             )
@@ -196,6 +252,8 @@ public final class ContinuousBatchGenerator {
         lastToken: MLXArray,
         sampling: SamplingParameters,
         generatedTokens: [Int] = [],
+        maxGeneratedTokens maxGeneratedTokenCount: Int? = nil,
+        speculativeContextTokens: [Int] = [],
         thinkingBudgetState initialThinkingBudgetState: ThinkingBudgetState? = nil,
         randomState initialRandomState: MLXRandom.RandomState? = nil
     ) throws {
@@ -242,6 +300,12 @@ public final class ContinuousBatchGenerator {
         gbnfGrammarMatchers.append(gbnfMatcher)
         thinkingBudgetStates.append(thinkingBudgetState)
         generatedTokenHistory.append(generatedTokens)
+        speculativeTokenHistory.append(
+            speculativeContextTokens.isEmpty
+                ? generatedTokens
+                : speculativeContextTokens
+        )
+        maxGeneratedTokens.append(maxGeneratedTokenCount)
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
@@ -268,6 +332,8 @@ public final class ContinuousBatchGenerator {
             gbnfGrammarMatchers.removeAll()
             thinkingBudgetStates.removeAll()
             generatedTokenHistory.removeAll()
+            speculativeTokenHistory.removeAll()
+            maxGeneratedTokens.removeAll()
             currentTokens = MLXArray([Int32]())
             state = nil
             return
@@ -286,11 +352,22 @@ public final class ContinuousBatchGenerator {
         gbnfGrammarMatchers = rows.map { gbnfGrammarMatchers[$0] }
         thinkingBudgetStates = rows.map { thinkingBudgetStates[$0] }
         generatedTokenHistory = rows.map { generatedTokenHistory[$0] }
+        speculativeTokenHistory = rows.map { speculativeTokenHistory[$0] }
+        maxGeneratedTokens = rows.map { maxGeneratedTokens[$0] }
         state = nil
         eval(currentTokens, cache.map(\.kvCache))
     }
 
     public func next() -> [Response] {
+        guard !rowUIDs.isEmpty else { return [] }
+        if let speculativeResponses = speculativeNext() {
+            return speculativeResponses
+        }
+
+        return decodeOneToken()
+    }
+
+    private func decodeOneToken() -> [Response] {
         guard !rowUIDs.isEmpty else { return [] }
 
         let output = model(
@@ -324,22 +401,153 @@ public final class ContinuousBatchGenerator {
 
         let tokenIds = nextTokens.asArray(Int.self)
         for row in generatedTokenHistory.indices {
-            let tokenID = tokenIds[row]
-            generatedTokenHistory[row].append(tokenID)
-            if jsonGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
-                jsonGrammarMatchers[row]?.advance(tokenID: tokenID)
-            }
-            if regexGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
-                regexGrammarMatchers[row]?.advance(tokenID: tokenID)
-            }
-            if gbnfGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
-                gbnfGrammarMatchers[row]?.advance(tokenID: tokenID)
-            }
-            thinkingBudgetStates[row]?.advance(tokenID: tokenID)
+            recordGeneratedToken(tokenIds[row], row: row)
         }
         return rowUIDs.enumerated().map { row, uid in
             Response(uid: uid, token: tokenIds[row])
         }
+    }
+
+    private func speculativeNext() -> [Response]? {
+        guard canSpeculate(row: 0),
+            let remainingTokenCount = remainingGeneratedTokenCount(row: 0),
+            remainingTokenCount > 1
+        else {
+            return nil
+        }
+
+        let proposalLimit = min(speculativeDecoding.maxProposalTokens, remainingTokenCount - 1)
+        guard proposalLimit > 0,
+            let proposedTokens = proposeSuffixTokens(
+                from: speculativeTokenHistory[0],
+                limit: proposalLimit
+            ),
+            !proposedTokens.isEmpty
+        else {
+            return nil
+        }
+
+        speculativeStats.proposalBatchCount += 1
+        speculativeStats.proposedTokenCount += proposedTokens.count
+
+        let verificationTokens = [currentTokens.item(Int.self)] + proposedTokens
+        let verificationInput = MLXArray(verificationTokens.map(Int32.init))[.newAxis, 0...]
+        let workingCache = cache.map { $0.copyLayer() }
+        let output = model(
+            LMInput.Text(tokens: verificationInput),
+            cache: workingCache.map(\.kvCache),
+            state: state
+        )
+
+        var acceptedTokens: [Int] = []
+        var generatedHistory = generatedTokenHistory[0]
+        var acceptedAllProposals = true
+        for position in 0 ..< verificationTokens.count {
+            let sampled = TokenSampler.sample(
+                logits: output.logits[0, position, 0...],
+                parameters: samplers[0],
+                generatedTokens: generatedHistory
+            ).item(Int.self)
+
+            if position < proposedTokens.count, sampled != proposedTokens[position] {
+                acceptedAllProposals = false
+                break
+            }
+
+            acceptedTokens.append(sampled)
+            generatedHistory.append(sampled)
+            if samplers[0].eosTokenIds.contains(sampled) {
+                break
+            }
+        }
+
+        guard acceptedAllProposals else {
+            speculativeStats.rejectedBatchCount += 1
+            return decodeOneToken()
+        }
+
+        cache = workingCache
+        state = output.state
+        let nextToken = acceptedTokens.last ?? proposedTokens.last ?? currentTokens.item(Int.self)
+        currentTokens = MLXArray([Int32(nextToken)])
+        asyncEval(currentTokens)
+        eval(output.logits, cache.map(\.kvCache))
+
+        for token in acceptedTokens {
+            recordGeneratedToken(token, row: 0)
+        }
+        speculativeStats.acceptedTokenCount += max(0, acceptedTokens.count - 1)
+
+        return acceptedTokens.map { Response(uid: rowUIDs[0], token: $0) }
+    }
+
+    private func canSpeculate(row: Int) -> Bool {
+        guard speculativeDecoding.enabled,
+            rowUIDs.count == 1,
+            row == 0,
+            speculativeDecoding.maxProposalTokens > 0,
+            speculativeTokenHistory[row].count >= speculativeDecoding.minContextTokens,
+            samplers[row].temperature == 0,
+            samplers[row].allowedSequences == nil,
+            samplers[row].jsonGrammar == nil,
+            samplers[row].regexGrammar == nil,
+            samplers[row].gbnfGrammar == nil,
+            samplers[row].thinkingBudget == nil,
+            randomStates[row] == nil
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func remainingGeneratedTokenCount(row: Int) -> Int? {
+        guard let maxGenerated = maxGeneratedTokens[row] else { return Int.max }
+        return max(0, maxGenerated - generatedTokenHistory[row].count)
+    }
+
+    private func proposeSuffixTokens(from context: [Int], limit: Int) -> [Int]? {
+        guard context.count >= speculativeDecoding.minContextTokens, limit > 0 else {
+            return nil
+        }
+
+        let maxSuffixLength = min(
+            speculativeDecoding.maxSuffixTokens,
+            context.count - 1
+        )
+        guard maxSuffixLength > 0 else { return nil }
+
+        for suffixLength in stride(from: maxSuffixLength, through: 1, by: -1) {
+            let suffixStart = context.count - suffixLength
+            let suffix = Array(context[suffixStart...])
+            guard suffixStart > 0 else { continue }
+
+            for candidateStart in stride(from: suffixStart - 1, through: 0, by: -1) {
+                let candidateEnd = candidateStart + suffixLength
+                guard candidateEnd <= suffixStart else { continue }
+                if Array(context[candidateStart ..< candidateEnd]) == suffix {
+                    let proposalStart = candidateEnd
+                    let proposalEnd = min(context.count, proposalStart + limit)
+                    guard proposalStart < proposalEnd else { continue }
+                    return Array(context[proposalStart ..< proposalEnd])
+                }
+            }
+        }
+        return nil
+    }
+
+    private func recordGeneratedToken(_ tokenID: Int, row: Int) {
+        generatedTokenHistory[row].append(tokenID)
+        speculativeTokenHistory[row].append(tokenID)
+        if jsonGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
+            jsonGrammarMatchers[row]?.advance(tokenID: tokenID)
+        }
+        if regexGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
+            regexGrammarMatchers[row]?.advance(tokenID: tokenID)
+        }
+        if gbnfGrammarMatchers[row]?.accepts(tokenID: tokenID) == true {
+            gbnfGrammarMatchers[row]?.advance(tokenID: tokenID)
+        }
+        thinkingBudgetStates[row]?.advance(tokenID: tokenID)
     }
 
     private func prefillWithLastTokenWithheld(

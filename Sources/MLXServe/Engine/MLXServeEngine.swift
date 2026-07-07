@@ -12,7 +12,8 @@ public final class MLXServeEngine: @unchecked Sendable {
         cacheCapabilities: ModelCacheCapabilities = .default,
         serializedDecode: Bool = false,
         schedulerManagedTextPrefill: Bool = true,
-        pressurePolicy: Scheduler.PressurePolicy = .disabled
+        pressurePolicy: Scheduler.PressurePolicy = .disabled,
+        speculativeDecoding: SpeculativeDecodingConfiguration = SpeculativeDecodingConfiguration()
     ) {
         let scheduler = Scheduler(
             modelBox: LanguageModelBox(model),
@@ -22,7 +23,8 @@ public final class MLXServeEngine: @unchecked Sendable {
             cacheCapabilities: cacheCapabilities,
             serializedDecode: serializedDecode,
             schedulerManagedTextPrefill: schedulerManagedTextPrefill,
-            pressurePolicy: pressurePolicy
+            pressurePolicy: pressurePolicy,
+            speculativeDecoding: speculativeDecoding
         )
         self.scheduler = scheduler
         self.streamDemux = EngineStreamDemux(scheduler: scheduler)

@@ -59,11 +59,16 @@ public actor Scheduler {
         cacheCapabilities: ModelCacheCapabilities = .default,
         serializedDecode: Bool = false,
         schedulerManagedTextPrefill: Bool = true,
-        pressurePolicy: PressurePolicy = .disabled
+        pressurePolicy: PressurePolicy = .disabled,
+        speculativeDecoding: SpeculativeDecodingConfiguration = SpeculativeDecodingConfiguration()
     ) {
         self.model = modelBox.model
         self.parameters = parameters
-        self.generator = ContinuousBatchGenerator(model: modelBox.model, parameters: parameters)
+        self.generator = ContinuousBatchGenerator(
+            model: modelBox.model,
+            parameters: parameters,
+            speculativeDecoding: speculativeDecoding
+        )
         self.maxConcurrentRequests = maxConcurrentRequests
         self.queueLimit = max(maxConcurrentRequests * 4, 32)
         self.prefixStore = prefixStore
@@ -130,6 +135,7 @@ public actor Scheduler {
 
         let rawResponses = generator.next()
         var finishedUIDs: [String] = []
+        var touchedUIDs: Set<String> = []
 
         for response in rawResponses {
             guard var runningRequest = running[response.uid] else {
@@ -137,7 +143,7 @@ public actor Scheduler {
                 continue
             }
             runningRequest.generatedTokens.append(response.token)
-            publishAvailablePrefixBlocks(uid: response.uid, runningRequest: &runningRequest)
+            touchedUIDs.insert(response.uid)
 
             let finishReason: FinishReason?
             if runningRequest.request.eosTokenIds.contains(response.token) {
@@ -160,6 +166,13 @@ public actor Scheduler {
 
             if finishReason != nil {
                 finishedUIDs.append(response.uid)
+            }
+        }
+
+        for uid in touchedUIDs where !finishedUIDs.contains(uid) {
+            if var runningRequest = running[uid] {
+                publishAvailablePrefixBlocks(uid: uid, runningRequest: &runningRequest)
+                running[uid] = runningRequest
             }
         }
 
@@ -208,6 +221,10 @@ public actor Scheduler {
 
     public var droppedStaleResponses: Int {
         droppedStaleResponseCount
+    }
+
+    public var speculativeDecodingStats: SpeculativeDecodingStats {
+        generator.speculationStats
     }
 
     private func admitWaiting(allowPartialPrefill: Bool) -> [Response] {
@@ -336,6 +353,8 @@ public actor Scheduler {
                 lastToken: row.lastToken,
                 sampling: sampling,
                 generatedTokens: generatorSeededTokens,
+                maxGeneratedTokens: request.maxTokens,
+                speculativeContextTokens: row.promptTokens + generatorSeededTokens,
                 thinkingBudgetState: seededGeneratedTokens.isEmpty
                     ? row.initialGeneratedToken?.thinkingBudgetState
                     : nil
