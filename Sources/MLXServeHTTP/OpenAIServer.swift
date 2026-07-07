@@ -632,6 +632,9 @@ public final class OpenAIServer: @unchecked Sendable {
         var lastToken: UInt64?
         var completionTokens = 0
         var finishReason = "length"
+        // Raw generated token ids captured before the thinking parser reshapes text,
+        // flushed on the terminal chunk delta for the migration-gate parity oracle.
+        var streamTokenIDs: [Int] = []
         // Stop matching runs on raw decoded model text before thinking tags are split,
         // matching omlx's output_text-level stop behavior.
         var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
@@ -659,6 +662,7 @@ public final class OpenAIServer: @unchecked Sendable {
                 }
                 lastToken = now
                 completionTokens += 1
+                streamTokenIDs.append(chunk.tokenID)
                 if let chunkFinishReason = chunk.finishReason {
                     finishReason = chunkFinishReason
                 }
@@ -729,7 +733,7 @@ public final class OpenAIServer: @unchecked Sendable {
                 "choices": [
                     [
                         "index": 0,
-                        "delta": [:],
+                        "delta": ["token_ids": streamTokenIDs],
                         "finish_reason": finishReason,
                     ]
                 ],
@@ -784,6 +788,9 @@ public final class OpenAIServer: @unchecked Sendable {
         var completionTokens = 0
         var finishReason = "length"
         var text = ""
+        // Raw generated token ids captured before the thinking parser reshapes text,
+        // flushed on the terminal chunk delta for the migration-gate parity oracle.
+        var streamTokenIDs: [Int] = []
         // Stop matching runs on raw decoded model text before thinking tags are split,
         // matching omlx's output_text-level stop behavior.
         var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
@@ -813,6 +820,7 @@ public final class OpenAIServer: @unchecked Sendable {
                 }
                 lastToken = now
                 completionTokens += 1
+                streamTokenIDs.append(chunk.tokenID)
                 if let chunkFinishReason = chunk.finishReason {
                     finishReason = chunkFinishReason
                 }
@@ -910,7 +918,7 @@ public final class OpenAIServer: @unchecked Sendable {
                 "choices": [
                     [
                         "index": 0,
-                        "delta": [:],
+                        "delta": ["token_ids": streamTokenIDs],
                         "finish_reason": finishReason,
                     ]
                 ],
@@ -953,6 +961,10 @@ public final class OpenAIServer: @unchecked Sendable {
         var completionTokens = 0
         var finishReason = "length"
         var text = ""
+        // Raw generated token ids, in order, for the migration-gate parity oracle.
+        // Captured before stop-sequence text trimming so the sequence stays aligned
+        // with completion_tokens and is identical across platforms running this engine.
+        var tokenIDs: [Int] = []
         // Stop matching runs on raw decoded model text before thinking tags are split,
         // matching omlx's output_text-level stop behavior.
         var stopMatcher = StreamingStopSequenceMatcher(stopSequences: request.stop)
@@ -965,6 +977,7 @@ public final class OpenAIServer: @unchecked Sendable {
             }
             lastToken = now
             completionTokens += 1
+            tokenIDs.append(chunk.tokenID)
             if let chunkFinishReason = chunk.finishReason {
                 finishReason = chunkFinishReason
             }
@@ -1012,6 +1025,7 @@ public final class OpenAIServer: @unchecked Sendable {
                         "index": 0,
                         "message": message,
                         "finish_reason": finishReason,
+                        "token_ids": tokenIDs,
                     ]
                 ],
                 "usage": usage(
