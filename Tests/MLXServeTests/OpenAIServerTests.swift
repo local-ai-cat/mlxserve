@@ -767,3 +767,35 @@ private extension OpenAIModelRuntimeStatus {
         )
     }
 }
+
+extension OpenAIServerTests {
+    /// Sustained-serving smoke: 300 fresh-connection requests must all succeed.
+    /// Context: untrack() must cancel() NWConnections — the daemon leaked one fd
+    /// per request without it and wedged at the 256-fd rlimit (~245 requests;
+    /// 5h soak 2026-07-08). The leak needs whatever reference the daemon holds
+    /// and does NOT reproduce in-process (ARC closes the fd on dealloc here), so
+    /// the true regression check is daemon-level: 300x /health then
+    /// `lsof -p <pid> | grep -c TCP` → must stay ~1 (was 301 pre-fix).
+    func testSustainedFreshConnectionsDoNotExhaustFileDescriptors() async throws {
+        let backend = FakePoolLifecycleBackend()
+        let server = try OpenAIServer(port: 0, backend: backend)
+        try await server.start()
+        defer { server.stop() }
+        let port = try XCTUnwrap(server.boundPort)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/health"))
+
+        for attempt in 1...300 {
+            // Ephemeral session per request forces a fresh TCP connection, the
+            // pattern that leaked. Reused keep-alive sessions would mask it.
+            let session = URLSession(configuration: .ephemeral)
+            defer { session.finishTasksAndInvalidate() }
+            let (_, response) = try await session.data(from: url)
+            let status = (response as? HTTPURLResponse)?.statusCode
+            XCTAssertEqual(
+                status, 200,
+                "request \(attempt) failed — fd-leak regression (pre-fix wedge was ~245)"
+            )
+            if status != 200 { return }
+        }
+    }
+}

@@ -423,6 +423,12 @@ public final class OpenAIServer: @unchecked Sendable {
         connectionsLock.lock()
         openConnections.removeValue(forKey: ObjectIdentifier(connection))
         connectionsLock.unlock()
+        // NWConnection keeps its file descriptor until cancel() is called, even
+        // after the peer closes (lsof shows the socket parked in (CLOSED)). This
+        // server is connection-per-request, so every handled connection ends
+        // here — without this cancel the process leaks one fd per request and
+        // wedges at the 256-fd rlimit (~245 requests served, then EMFILE).
+        connection.cancel()
     }
 
     public func waitForever() {
