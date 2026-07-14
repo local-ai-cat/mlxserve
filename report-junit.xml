@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="3.437" timestamp="2026-07-06T12:40:27.922910+01:00" hostname="timapple-m5"><testcase classname="tests.test_benchmark" name="test_prefix_cache_same_session_matches_fresh_output" time="3.427" /></testsuite></testsuites>

@@ -105,3 +105,20 @@ Verdicts: PASS = both serve, cells green · GAP = one side faulted (see detail) 
 | gemma-4-E4B-it-qat-4bit | 6.4 GB | PASS | .                                                                        [100%] | 18s | 2026-07-06 08:38 |
 | Qwen3-Coder-30B-A3B-Instruct-4bit | 16.0 GB | PASS | .                                                                        [100%] | 27s | 2026-07-06 08:38 |
 | Qwen3.6-35B-A3B-4bit | 32.3 GB | SKIP | preflight: free 73GB < needed 90GB | 0s | 2026-07-06 08:38 |
+| Qwen3-0.6B-4bit | 0.3 GB | PASS | .                                                                        [100%] | 11s | 2026-07-06 21:09 |
+| Llama-3.2-1B-Instruct-4bit | 0.7 GB | PASS | .                                                                        [100%] | 9s | 2026-07-06 21:10 |
+| Qwen3-1.7B-4bit | 0.9 GB | PASS | .                                                                        [100%] | 7s | 2026-07-06 21:10 |
+| DeepSeek-R1-Distill-Qwen-1.5B-4bit | 0.9 GB | PASS | .                                                                        [100%] | 9s | 2026-07-06 21:10 |
+| Qwen2-VL-2B-Instruct-4bit | 1.2 GB | PASS | .                                                                        [100%] | 11s | 2026-07-06 21:10 |
+| Llama-3.2-3B-Instruct-4bit | 1.7 GB | PASS | .                                                                        [100%] | 11s | 2026-07-06 21:11 |
+| Qwen3.5-4B-MLX-4bit | 2.9 GB | PASS | .                                                                        [100%] | 14s | 2026-07-06 21:11 |
+| Qwen2.5-Coder-7B-Instruct-4bit | 4.0 GB | PASS | .                                                                        [100%] | 19s | 2026-07-06 21:11 |
+| DeepSeek-R1-Distill-Qwen-7B-4bit | 4.0 GB | PASS | .                                                                        [100%] | 24s | 2026-07-06 21:12 |
+| gemma-4-E2B-it-qat-4bit | 4.1 GB | PASS | .                                                                        [100%] | 17s | 2026-07-06 21:12 |
+| gemma-4-E4B-it-qat-4bit | 6.4 GB | PASS | .                                                                        [100%] | 27s | 2026-07-06 21:13 |
+| Ornith-1.0-9B-6bit | 7.7 GB | PASS | .                                                                        [100%] | 15s | 2026-07-06 21:13 |
+| gpt-oss-20b-MXFP4-Q8 | 11.3 GB | PASS | .                                                                        [100%] | 24s | 2026-07-06 21:14 |
+| Qwen3.6-27B-4bit | 15.0 GB | PASS | .                                                                        [100%] | 28s | 2026-07-06 21:14 |
+| Qwen3.6-27B-MLX-4bit | 15.0 GB | PASS | .                                                                        [100%] | 38s | 2026-07-06 21:15 |
+| Qwen3-Coder-30B-A3B-Instruct-4bit | 16.0 GB | PASS | .                                                                        [100%] | 31s | 2026-07-06 21:15 |
+| Qwen3.6-35B-A3B-4bit | 32.3 GB | PASS | .                                                                        [100%] | 82s | 2026-07-06 21:17 |
