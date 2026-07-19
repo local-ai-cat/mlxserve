@@ -43,13 +43,14 @@ let package = Package(
     ],
     dependencies: [
         .package(
-            url: "https://github.com/atlas-open-sources/mlx-swift-lm.git",
-            revision: "098cf970a96c26dca1fb5b036abbf198c0b74ad4"
+            url: "https://github.com/ml-explore/mlx-swift-lm.git",
+            exact: "3.31.4"
         ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
-        // Same fork+revision as the Local AI Chat app pins — one URL per package
+        // Same URL+version as the Local AI Chat app pins — one URL per package
         // identity across the combined graph (SwiftPM escalates the mismatch to
-        // an error in future versions).
+        // an error in future versions). Moved off the atlas-open-sources fork to
+        // upstream 3.31.4 (2026-07-19): upstream now ships gemma4_unified natively.
         .package(url: "https://github.com/atlas-open-sources/swift-transformers", revision: "089cb3f02a1718b2943c7e7c4553876cd51a75d1"),
         // Pinned to main by revision: tagged releases (≤0.17) pin swift-transformers
         // <1.2 which conflicts with mlx-swift-lm's ≥1.3; main dropped the dep.
