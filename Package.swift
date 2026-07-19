@@ -46,7 +46,7 @@ let package = Package(
             url: "https://github.com/ml-explore/mlx-swift-lm.git",
             revision: "343cae3799054b2e138ebfb1ae8d7d0f6c6a4a5b"
         ),
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
         // Same URL+version as the Local AI Chat app pins — one URL per package
         // identity across the combined graph (SwiftPM escalates the mismatch to
         // an error in future versions). Moved off the atlas-open-sources fork to
