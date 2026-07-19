@@ -734,6 +734,10 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         "idefics3",
         "gemma3",
         "gemma4",
+        // Unified multimodal Gemma 4 (e.g. gemma-4-12B). Routes to the VLM
+        // Gemma4Unified, which has the language_model.* weight sanitizer; the
+        // LLM Gemma4Model expects flat model.layers.* and 500s with keyNotFound.
+        "gemma4_unified",
         "smolvlm",
         "fastvlm",
         "llava_qwen2",
@@ -752,6 +756,7 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         "qwen3_5",
         "qwen3_5_moe",
         "gemma4",
+        "gemma4_unified",
         "mistral3",
         // GlmOcr builds scalar MRoPE position ids from cache.offset in
         // GlmOcr.swift:308, :356, and :383.
@@ -761,6 +766,7 @@ public struct NativeModelLoader: EnginePoolModelLoader {
     private static let windowedKVModelTypes: Set<String> = [
         "gemma3",
         "gemma4",
+        "gemma4_unified",
         "gpt_oss",
     ]
 
@@ -772,6 +778,7 @@ public struct NativeModelLoader: EnginePoolModelLoader {
         "Idefics3Processor",
         "Gemma3Processor",
         "Gemma4Processor",
+        "Gemma4UnifiedProcessor",
         "SmolVLMProcessor",
         "FastVLMProcessor",
         "PixtralProcessor",
