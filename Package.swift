@@ -44,7 +44,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm.git",
-            exact: "3.31.4"
+            revision: "343cae3799054b2e138ebfb1ae8d7d0f6c6a4a5b"
         ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         // Same URL+version as the Local AI Chat app pins — one URL per package
