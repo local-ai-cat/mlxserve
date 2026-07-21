@@ -46,11 +46,18 @@ let package = Package(
         // predates the Gemma 4 loader fixes (#384/#390 build the KV-shared tail
         // without k_proj/v_proj; #408 loads shards by index). Verified 2026-07-21
         // that gemma-4-12B/E2B/E4B QAT all load and generate at this revision and
-        // fail to load before it. Repin to a tag once upstream cuts one that
-        // contains fd0f13b.
+        // fail to load before it.
+        //
+        // 68947cc, NOT upstream main. Everything from 631325f onward calls
+        // MLXArray.maskFill, which needs mlx-swift >= 0.31.5, whose manifest
+        // declares swift-tools 6.3.0 — unreadable by the Xcode the CI runners
+        // are on, so the whole graph fails to RESOLVE there. 68947cc is the last
+        // of the three Gemma fixes and sits before that commit, so it buys the
+        // fixes without the toolchain jump. Move forward once CI's Xcode is
+        // upgraded (that is Phil's call), not before.
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm.git",
-            revision: "fd0f13bcab1f8af78a57f91fbf250a7dfde74c9b"
+            revision: "68947ccdca79bcf7a26dc220f73caa060369513c"
         ),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         // Same URL+version as the Local AI Chat app pins — one URL per package
