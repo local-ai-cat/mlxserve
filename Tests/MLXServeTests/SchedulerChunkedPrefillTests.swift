@@ -129,7 +129,7 @@ private final class RecordingChunkedLanguageModel: Module, LanguageModel {
         super.init()
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(_ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int?) throws -> PrepareResult {
         .tokens(input.text)
     }
 
@@ -183,7 +183,7 @@ private final class PreparedLogitsLanguageModel: Module, LanguageModel {
         return prepareCalls
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(_ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int?) throws -> PrepareResult {
         lock.lock()
         prepareCalls += 1
         lock.unlock()

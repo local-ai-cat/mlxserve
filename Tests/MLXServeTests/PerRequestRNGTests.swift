@@ -86,7 +86,7 @@ private final class FixedLogitLanguageModel: Module, LanguageModel {
         super.init()
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(_ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int?) throws -> PrepareResult {
         .tokens(input.text)
     }
 

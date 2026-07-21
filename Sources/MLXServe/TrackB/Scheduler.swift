@@ -381,12 +381,16 @@ public actor Scheduler {
     private func advanceAdmission(allowPartialPrefill: Bool) throws -> PreparedBatchRow? {
         guard var admission = admissionInProgress else { return nil }
 
-        let stepBudget = allowPartialPrefill ? max(1, parameters.prefillStepSize) : Int.max
+        // `prefillStepSize` became optional upstream (nil = "no chunking"), but
+        // this scheduler needs a concrete chunk size; 512 was the non-optional
+        // default it was written against, so this preserves the prior behavior.
+        let prefillStep: Int = max(1, parameters.prefillStepSize ?? 512)
+        let stepBudget: Int = allowPartialPrefill ? prefillStep : Int.max
         var remainingBudget = stepBudget
         while admission.nextPrefillIndex < admission.prefillRange.upperBound, remainingBudget > 0 {
-            let chunkLimit = allowPartialPrefill
-                ? min(max(1, parameters.prefillStepSize), remainingBudget)
-                : max(1, parameters.prefillStepSize)
+            let chunkLimit: Int = allowPartialPrefill
+                ? min(prefillStep, remainingBudget)
+                : prefillStep
             let end = min(
                 admission.nextPrefillIndex + chunkLimit,
                 admission.prefillRange.upperBound
@@ -429,7 +433,11 @@ public actor Scheduler {
         if canUseRawTextTokens {
             promptText = request.input.text
         } else {
-            switch try model.prepare(request.input, cache: rowCache, windowSize: parameters.prefillStepSize) {
+            // state: nil — `rowCache` was just created above, so there is no
+            // prior model state to carry into the prefill.
+            switch try model.prepare(
+                request.input, cache: rowCache, state: nil,
+                windowSize: parameters.prefillStepSize) {
             case .tokens(let tokens):
                 promptText = tokens
             case .logits(let output):

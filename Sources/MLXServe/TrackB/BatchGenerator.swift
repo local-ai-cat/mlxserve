@@ -85,7 +85,10 @@ public final class StaticBatchGenerator {
         for input in inputs {
             let cache = model.newCache(parameters: parameters)
             let remaining: LMInput.Text
-            switch try model.prepare(input, cache: cache, windowSize: parameters.prefillStepSize) {
+            // state: nil — `cache` is fresh per input, so no prior model state.
+            switch try model.prepare(
+                input, cache: cache, state: nil,
+                windowSize: parameters.prefillStepSize) {
             case .tokens(let tokens):
                 remaining = tokens
             case .logits(let output):
@@ -191,7 +194,10 @@ public final class ContinuousBatchGenerator {
         speculativeContextTokens: [Int] = []
     ) throws -> Response? {
         let rowCache = model.newCache(parameters: parameters)
-        switch try model.prepare(input, cache: rowCache, windowSize: parameters.prefillStepSize) {
+        // state: nil — `rowCache` was just created above, so no prior state.
+        switch try model.prepare(
+            input, cache: rowCache, state: nil,
+            windowSize: parameters.prefillStepSize) {
         case .tokens(let tokens):
             if tokens.tokens.dim(0) == 1 {
                 let output = model(tokens[text: .newAxis], cache: rowCache, state: nil)
