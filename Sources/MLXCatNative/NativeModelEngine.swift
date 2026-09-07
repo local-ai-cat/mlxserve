@@ -162,6 +162,10 @@ public final class NativeModelEngine: @unchecked Sendable {
         let chunks = AsyncThrowingStream<OpenAIChatChunk, Error> { continuation in
             let task = Task {
                 do {
+                    // One detokenizer for the whole stream: a token can be a
+                    // fragment of a character, and `decode([token])` made every
+                    // fragment a U+FFFD (see StreamingTokenText).
+                    var streamText = StreamingTokenText(tokenizer: self.context.tokenizer)
                     for try await response in responseStream {
                         if case .failed(let message)? = response.finishReason {
                             throw NativeModelEngineError.generationFailed(message)
@@ -172,11 +176,11 @@ public final class NativeModelEngine: @unchecked Sendable {
                             }
                             continue
                         }
-                        let text = self.context.tokenizer.decode(
-                            tokenIds: [response.token],
-                            skipSpecialTokens: response.finishReason != nil
-                                && self.eosTokenIds.contains(response.token)
-                        )
+                        // The terminal EOS decodes to nothing, as it always did
+                        // (it was the one token decoded with specials skipped).
+                        let isTerminalEOS = response.finishReason != nil
+                            && self.eosTokenIds.contains(response.token)
+                        let text = isTerminalEOS ? "" : streamText.text(for: response.token)
                         continuation.yield(
                             OpenAIChatChunk(
                                 text: text,
